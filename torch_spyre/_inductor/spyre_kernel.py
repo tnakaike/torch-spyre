@@ -366,6 +366,15 @@ class SpyreKernelOpsHandler(DefaultHandler):
     ) -> tuple[RValue, ...]:
         raise NotImplementedError
 
+    def indirect_indexing(
+        self,
+        var: str,
+        size: Union[sympy.Expr, int],
+        check: bool = True,
+        wrap_neg: bool = True,
+    ) -> sympy.Symbol:
+        return torch._inductor.utils.sympy_index_symbol(str(var))
+
 
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]

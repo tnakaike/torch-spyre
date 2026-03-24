@@ -17,8 +17,19 @@ from collections.abc import Sequence
 from typing import Any
 import os
 import subprocess
+import tempfile
+from typing import Any, Union
 
+from torch._inductor.codecache import PyCodeCache
 from torch._inductor.runtime.runtime_utils import cache_dir
+from torch._inductor.runtime.triton_compat import (
+    ASTSource,
+    GPUTarget,
+    cc_warp_size,
+    triton,
+)
+
+from torch_spyre._C import convert_artifacts
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
@@ -64,3 +75,38 @@ class SpyreAsyncCompile:
 
     def wait(self, scope: dict[str, Any]) -> None:
         pass
+
+    def triton(self, kernel_name: str, source_code: str, device_str: str):
+        print("source_code={}".format(source_code))
+        cat = getattr(PyCodeCache.load(source_code), kernel_name)
+        cfg = cat.configs[0]
+        compile_meta = cat.triton_meta
+        compile_meta["device_type"] = cat.device_props.type
+        compile_meta["cc"] = cat.device_props.cc
+        compile_meta["constants"].update(cfg.kwargs)
+        compile_args = (
+            ASTSource(
+                cat.fn,
+                compile_meta["signature"],
+                compile_meta["constants"],
+                compile_meta["configs"][0],
+            ),
+        )
+        target = GPUTarget(
+            compile_meta["device_type"],
+            compile_meta["cc"],
+            cc_warp_size(compile_meta["cc"]),
+        )
+        options = {
+            "spyre_options": compile_meta["spyre_options"],
+        }
+        compile_kwargs = {
+            "target": target,
+            "options": options,
+        }
+
+        specs: list[Union[OpSpec | UnimplementedOp]] = compile_meta["spyre_options"][
+            "op_specs"
+        ]
+        _ = triton.compile(*compile_args, **compile_kwargs)
+        return self.sdsc(kernel_name, specs)
