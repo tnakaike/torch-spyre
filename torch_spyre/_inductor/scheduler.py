@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence, Union
+import os
+from typing import Any, Optional, Sequence, Union
 
 import sympy
 
@@ -27,12 +28,16 @@ from torch._inductor.scheduler import (
     BaseSchedulerNode,
     FusedSchedulerNode,
     SchedulerNode,
+    Scheduler,
 )
+from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
+from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.virtualized import V
 from torch._inductor.codecache import code_hash
 from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
+from .spyre_triton_kernel import SpyreTritonKernel
 from .pass_utils import iteration_space
 from .logging_utils import get_inductor_logger
 from .op_spec import LoopSpec
@@ -243,6 +248,13 @@ def build_loop_scheduler_nodes(
 
 
 class SuperDSCScheduling(BaseScheduling):
+    kernel_type: type[Any] = SpyreKernel
+    dsc_type: str = "sdsc"
+
+    def __init__(self, scheduler: Optional[Scheduler]):
+        super().__init__(scheduler)
+        self.triton_scheduling = TritonScheduling(scheduler)
+
     def group_fn(self, sizes):
         """
         Process the iteration sizes in case a transformation needs to be applied.
@@ -475,15 +487,18 @@ class SuperDSCScheduling(BaseScheduling):
         """
         Codegen kernel definition to go in output wrapper code
         """
+        if isinstance(kernel, SpyreTritonKernel):
+            return self.triton_scheduling.define_kernel(src_code, node_schedule, kernel)
+        
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             kernel_name = wrapper.src_to_kernel[src_code]
         else:
             fused_name = get_fused_kernel_name(node_schedule, "original_aten")
-            kernel_name = "_".join(["sdsc", fused_name, wrapper.next_kernel_suffix()])
+            kernel_name = "_".join([self.dsc_type, fused_name, wrapper.next_kernel_suffix()])
             wrapper.src_to_kernel[src_code] = kernel_name
             buf = IndentedBuffer()
-            buf.writeline(f"async_compile.sdsc('{kernel_name}',")
+            buf.writeline(f"async_compile.{self.dsc_type}('{kernel_name}',")
             with buf.indent():
                 buf.splice(f"{src_code}")
             buf.writeline(")")
@@ -492,3 +507,47 @@ class SuperDSCScheduling(BaseScheduling):
             wrapper.define_kernel(kernel_name, buf.getvalue(), metadata_comment)
 
         return kernel_name
+
+    def create_kernel_choices(  # type: ignore[override]
+        self,
+        kernel_features: SIMDKernelFeatures,
+        kernel_args: list[Any],
+        kernel_kwargs: dict[str, Any],
+    ) -> list[Any]:
+        """
+        Create kernel choices based on environment variables.
+        
+        - TORCH_SPYRE_TRITON_FORCE=1: Always use Triton kernel
+        - TORCH_SPYRE_TRITON=1: Try SpyreKernel first, fallback to Triton on error
+        - Default: Use SpyreKernel only
+        """
+        if os.getenv("TORCH_SPYRE_TRITON_FORCE") == "1":
+            print("Using SpyreTritonKernel (forced)")
+            self.triton_scheduling.kernel_type = SpyreTritonKernel  # type: ignore[assignment]
+            return self.triton_scheduling.create_kernel_choices(
+                kernel_features, kernel_args, kernel_kwargs
+            )
+        elif os.getenv("TORCH_SPYRE_TRITON") == "1":
+            try:
+                self.kernel_type = SpyreKernel
+                kernel = self.kernel_type(*kernel_args, **kernel_kwargs)
+                # Try to generate code with SpyreKernel
+                # Note: codegen_node_schedule_with_kernel is from SIMDScheduling
+                # Since we inherit from BaseScheduling, we use triton_scheduling for this
+                self.triton_scheduling.codegen_node_schedule_with_kernel(  # type: ignore[attr-defined]
+                    kernel_features.node_schedule, kernel
+                )
+            except Exception as e:
+                print(f"Using SpyreTritonKernel reason={e}")
+                self.triton_scheduling.kernel_type = SpyreTritonKernel  # type: ignore[assignment]
+                return self.triton_scheduling.create_kernel_choices(
+                    kernel_features, kernel_args, kernel_kwargs
+                )
+        print("Using SpyreKernel")
+        self.kernel_type = SpyreKernel
+        return [
+            self.kernel_type(
+                *kernel_args,
+                **kernel_kwargs,
+            )
+        ]
