@@ -18,7 +18,7 @@ import torch
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
-from typing import Callable, Optional
+from typing import Callable, Optional, Any
 
 
 @contextmanager
@@ -33,6 +33,49 @@ def spyre_data_types():
         yield
     finally:
         torch._prims_common._computation_dtype_map = saved
+
+
+@contextmanager
+def spyre_triton_heuristics(min_bytes: int = 128):
+    """
+    Context manager to patch Triton heuristics with Spyre-specific minimum block sizes.
+
+    Args:
+        min_bytes: Minimum bytes per block dimension (default: 128)
+    """
+    from torch_spyre._inductor.spyre_triton_kernel import (
+        patch_triton_config_with_min_blocks,
+    )
+    import sys
+
+    # Get the actual module from sys.modules
+    triton_heuristics_module = sys.modules.get(
+        "torch._inductor.runtime.triton_heuristics"
+    )
+    if triton_heuristics_module is None:
+        from torch._inductor.runtime import triton_heuristics as th_module
+
+        triton_heuristics_module = th_module
+
+    # Cast to Any to allow dynamic attribute access for monkey patching
+    triton_heuristics: Any = triton_heuristics_module
+
+    print(f"[SPYRE] Applying triton heuristics patches with min_bytes={min_bytes}")
+
+    try:
+        # Apply patches and get original functions
+        saved_funcs = patch_triton_config_with_min_blocks(min_bytes)
+        yield
+    finally:
+        # Restore original functions
+        print("[SPYRE] Restoring original triton heuristics")
+        triton_heuristics.triton_config = saved_funcs["triton_config"]
+        triton_heuristics.triton_config_tiled_reduction = saved_funcs[
+            "triton_config_tiled_reduction"
+        ]
+        triton_heuristics.match_target_block_product = saved_funcs[
+            "match_target_block_product"
+        ]
 
 
 @contextmanager

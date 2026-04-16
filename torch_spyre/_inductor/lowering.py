@@ -232,7 +232,7 @@ def ensure_default_handler(op_name):
         setattr(cls, op_name, method)
 
 
-@register_spyre_lowering(torch.ops.aten.mm.default)
+# @register_spyre_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
     x.realize()
     y.realize()
