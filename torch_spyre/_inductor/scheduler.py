@@ -247,13 +247,30 @@ def build_loop_scheduler_nodes(
     return result
 
 
+class SpyreTritonScheduling(TritonScheduling):
+    """
+    Spyre-specific Triton scheduling that uses SpyreTritonKernel.
+    """
+
+    def create_kernel_choices(  # type: ignore[override]
+        self,
+        kernel_features: SIMDKernelFeatures,
+        kernel_args: list[Any],
+        kernel_kwargs: dict[str, Any],
+    ) -> list[Any]:
+        self.kernel_type = SpyreTritonKernel  # type: ignore[assignment]
+        return super().create_kernel_choices(
+            kernel_features, kernel_args, kernel_kwargs
+        )
+
+
 class SuperDSCScheduling(BaseScheduling):
     kernel_type: type[Any] = SpyreKernel
     dsc_type: str = "sdsc"
 
     def __init__(self, scheduler: Optional[Scheduler]):
         super().__init__(scheduler)
-        self.triton_scheduling = TritonScheduling(scheduler)
+        self.triton_scheduling = SpyreTritonScheduling(scheduler)
 
     def group_fn(self, sizes):
         """
@@ -319,48 +336,59 @@ class SuperDSCScheduling(BaseScheduling):
         """
         Generate a kernel given a list of pre-fused nodes.
         """
-        if isinstance(node, CountedLoopSchedulerNode):
-            self._codegen_counted_loop(node)
-            return
+        # If TORCH_SPYRE_TRITON_FORCE=1, use Triton scheduling directly
+        if os.getenv("TORCH_SPYRE_TRITON_FORCE") == "1":
+            print("Using SpyreTritonKernel (forced)")
+            return self.triton_scheduling.codegen_node(node)
 
-        assert self.scheduler
-        nodes = [
-            node
-            for node in node.get_nodes()
-            if node.get_name() not in self.scheduler.removed_ops
-        ]
-        if len(nodes) == 0:
-            return
+        # Try SpyreKernel, fallback to Triton if TORCH_SPYRE_TRITON=1
+        try:
+            assert self.scheduler
+            nodes = [
+                node
+                for node in node.get_nodes()
+                if node.get_name() not in self.scheduler.removed_ops
+            ]
+            if len(nodes) == 0:
+                return
 
-        node_schedule = self.generate_node_schedule(nodes)
-        kernel = SpyreKernel()
-        with kernel:
-            for node in node_schedule:
-                var_ranges = iteration_space(node)
-                vars = list(var_ranges.keys())
-                index_vars = [
-                    vars[: len(node._body.iter_vars)],
-                    vars[len(node._body.iter_vars) :],
-                ]
-                node.codegen(index_vars)
+            node_schedule = self.generate_node_schedule(nodes)
+            kernel = SpyreKernel()
+            with kernel:
+                for node in node_schedule:
+                    var_ranges = iteration_space(node)
+                    vars = list(var_ranges.keys())
+                    index_vars = [
+                        vars[: len(node._body.iter_vars)],
+                        vars[len(node._body.iter_vars) :],
+                    ]
+                    node.codegen(index_vars)
 
-        with V.set_kernel_handler(kernel):
-            src_code = kernel.codegen_kernel()
-        kernel_name = self.define_kernel(src_code, node_schedule, kernel)
-        kernel.kernel_name = kernel_name
-        kernel.code_hash = code_hash(src_code)
+            with V.set_kernel_handler(kernel):
+                src_code = kernel.codegen_kernel()
+            kernel_name = self.define_kernel(src_code, node_schedule, kernel)
+            kernel.kernel_name = kernel_name
+            kernel.code_hash = code_hash(src_code)
 
-        with V.set_kernel_handler(kernel):
-            for node in node_schedule:
-                node.mark_run()
+            with V.set_kernel_handler(kernel):
+                for node in node_schedule:
+                    node.mark_run()
 
-        self.codegen_comment(node_schedule, kernel_name)
-        kernel.call_kernel(kernel.kernel_name)
+            self.codegen_comment(node_schedule, kernel_name)
+            kernel.call_kernel(kernel.kernel_name)
 
-        V.graph.removed_buffers |= kernel.removed_buffers
-        V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
+            V.graph.removed_buffers |= kernel.removed_buffers
+            V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
 
-        self.free_buffers_in_scheduler()
+            self.free_buffers_in_scheduler()
+        except Exception as e:
+            # If TORCH_SPYRE_TRITON=1, fallback to Triton scheduling
+            if os.getenv("TORCH_SPYRE_TRITON") == "1":
+                print(f"Using SpyreTritonKernel (fallback) reason={e}")
+                return self.triton_scheduling.codegen_node(node)
+            else:
+                # Re-raise the exception if fallback is not enabled
+                raise
 
     def _codegen_counted_loop(self, node: CountedLoopSchedulerNode) -> None:
         """Generate a kernel for a counted loop group."""
@@ -489,13 +517,15 @@ class SuperDSCScheduling(BaseScheduling):
         """
         if isinstance(kernel, SpyreTritonKernel):
             return self.triton_scheduling.define_kernel(src_code, node_schedule, kernel)
-        
+
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             kernel_name = wrapper.src_to_kernel[src_code]
         else:
             fused_name = get_fused_kernel_name(node_schedule, "original_aten")
-            kernel_name = "_".join([self.dsc_type, fused_name, wrapper.next_kernel_suffix()])
+            kernel_name = "_".join(
+                [self.dsc_type, fused_name, wrapper.next_kernel_suffix()]
+            )
             wrapper.src_to_kernel[src_code] = kernel_name
             buf = IndentedBuffer()
             buf.writeline(f"async_compile.{self.dsc_type}('{kernel_name}',")
@@ -516,7 +546,7 @@ class SuperDSCScheduling(BaseScheduling):
     ) -> list[Any]:
         """
         Create kernel choices based on environment variables.
-        
+
         - TORCH_SPYRE_TRITON_FORCE=1: Always use Triton kernel
         - TORCH_SPYRE_TRITON=1: Try SpyreKernel first, fallback to Triton on error
         - Default: Use SpyreKernel only
