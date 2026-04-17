@@ -1,5 +1,5 @@
 import sympy
-from typing import Optional, Any
+from typing import Optional, Any, Sequence
 import torch
 from torch._inductor.codegen.triton import TritonKernel, FixedTritonConfig
 from torch._inductor.virtualized import StoreMode, V
@@ -7,20 +7,96 @@ from torch._inductor.codegen.common import CSEVariable
 from torch._inductor.utils import IndentedBuffer, sympy_subs
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .spyre_kernel import (
-    UnimplementedOp,
-    DimensionInfo,
-    TensorAccess,
-    analyze_tensor_access,
-    create_op_spec,
-)
-from .pass_utils import (
-    map_dims_to_vars,
-    wildcard_symbol,
-)
+from .spyre_kernel import TensorAccess, UnimplementedOp
 from .op_spec import OpSpec, TensorArg
+from .views import compute_coordinates
+from .pass_utils import iteration_space, map_ir_splits_to_scheduler
+from .constants import SPYRE_FP32_OPS
 from .logging_utils import get_inductor_logger
+from torch_spyre._C import DataFormats
 import logging
+
+
+class SympyExpr:
+    """Wrapper for sympy expressions that serializes to sympify() calls"""
+
+    def __init__(self, expr: sympy.Expr):
+        self.expr = str(expr)
+
+    def __repr__(self):
+        return f"sympify('{self.expr}')"
+
+
+class IterationSpaceDict:
+    """Wrapper for iteration_space dict that serializes properly"""
+
+    def __init__(self, it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]]):
+        self.items = [
+            (SympyExpr(k), (SympyExpr(v[0]), v[1])) for k, v in it_space.items()
+        ]
+
+    def __repr__(self):
+        items_str = ", ".join(f"{k!r}: ({v[0]!r}, {v[1]})" for k, v in self.items)
+        return f"{{{items_str}}}"
+
+
+class TensorArgDict:
+    """Wrapper for TensorArg that serializes properly"""
+
+    def __init__(self, arg: TensorArg):
+        self.is_input = arg.is_input
+        self.arg_index = arg.arg_index
+        self.device_dtype = arg.device_dtype
+        self.device_size = arg.device_size
+        self.device_coordinates = [SympyExpr(e) for e in arg.device_coordinates]
+        self.allocation = arg.allocation
+
+    def __repr__(self):
+        coords_str = ", ".join(repr(c) for c in self.device_coordinates)
+        # Format device_dtype as DataFormats.ENUM_NAME instead of <DataFormats.ENUM_NAME: value>
+        dtype_str = f"DataFormats.{self.device_dtype.name}"
+        return (
+            f"TensorArg("
+            f"is_input={self.is_input}, "
+            f"arg_index={self.arg_index}, "
+            f"device_dtype={dtype_str}, "
+            f"device_size={self.device_size!r}, "
+            f"device_coordinates=[{coords_str}], "
+            f"allocation={self.allocation!r})"
+        )
+
+
+class OpSpecDict:
+    """Wrapper for OpSpec that serializes properly"""
+
+    def __init__(self, op_spec: OpSpec):
+        self.op = op_spec.op
+        self.is_reduction = op_spec.is_reduction
+        self.iteration_space = IterationSpaceDict(op_spec.iteration_space)
+        self.args = [TensorArgDict(arg) for arg in op_spec.args]
+        self.op_info = op_spec.op_info
+
+    def __repr__(self):
+        args_str = ", ".join(repr(arg) for arg in self.args)
+        return (
+            f"OpSpec("
+            f"op={self.op!r}, "
+            f"is_reduction={self.is_reduction}, "
+            f"iteration_space={self.iteration_space!r}, "
+            f"args=[{args_str}], "
+            f"op_info={self.op_info!r})"
+        )
+
+
+class UnimplementedOpDict:
+    """Wrapper for UnimplementedOp that serializes properly"""
+
+    def __init__(self, op: UnimplementedOp):
+        self.op = op.op
+
+    def __repr__(self):
+        return f"UnimplementedOp(op={self.op!r})"
+
 
 logger = get_inductor_logger("spyre_triton_kernel")
 
@@ -302,58 +378,144 @@ class SpyreTritonKernel(TritonKernel):
             **kwargs,
         )
         self.op_specs: list[OpSpec | UnimplementedOp] = []
-        self.di: list[DimensionInfo] = []
-        self.tensor_args: dict[str, TensorArg] = {}
+        self.spyre_kernel_args: list[tuple[str, TensorArg]] = []
+        # Track loaded tensor args to use in store
+        self.loaded_tensor_args: dict[str, TensorArg] = {}
 
     def codegen_kernel(self, name=None) -> str:
         original_code = super().codegen_kernel(name)
         code = IndentedBuffer()
         code.splice("from torch_spyre._inductor.op_spec import TensorArg, OpSpec")
+        code.splice("from torch_spyre._inductor.spyre_kernel import UnimplementedOp")
         code.splice("import torch")
         code.splice("from torch_spyre._C import DataFormats, SpyreTensorLayout")
+        code.splice("from sympy import sympify")
         return code.getvalue() + original_code
 
     def codegen_body(self):
-        self.triton_meta["spyre_options"] = {"op_specs": self.op_specs}
+        if self.triton_meta is not None:
+            # Convert op_specs to serializable format using wrapper classes
+            # These classes have __repr__ methods that generate proper sympify() calls
+            serializable_specs = []
+            for op_spec in self.op_specs:
+                if isinstance(op_spec, UnimplementedOp):
+                    serializable_specs.append(UnimplementedOpDict(op_spec))
+                else:
+                    serializable_specs.append(OpSpecDict(op_spec))
+
+            self.triton_meta["spyre_options"] = {"op_specs": serializable_specs}
         return super().codegen_body()
 
-    def derive_dim_info(self, access: TensorAccess) -> list[DimensionInfo]:
-        """
-        Return the iteration space implied by the tensor access
-        """
-        var_ranges = self.var_ranges()
-        if var_ranges:
-            dim_map = map_dims_to_vars(access.layout, access.index)
-            return [
-                DimensionInfo(dim_map[v], int(var_ranges.get(dim_map[v], 1)))
-                for v in sorted(dim_map)
-            ]
-        else:
-            return [DimensionInfo(wildcard_symbol(0), 1)]
-
     def create_tensor_arg(
-        self, is_input: bool, name: str, tensor: TensorAccess, di: list[DimensionInfo]
+        self, is_input: bool, name: str, tensor: TensorAccess
     ) -> TensorArg:
-        scales = analyze_tensor_access(di, tensor)
+        """Create a TensorArg following the same pattern as SpyreKernel"""
+        if self.current_node is None:
+            raise RuntimeError("current_node is None")
+
+        device_coords = compute_coordinates(
+            tensor.layout.device_layout.device_size,  # type: ignore[arg-type]
+            tensor.layout.device_layout.stride_map,  # type: ignore[arg-type]
+            var_ranges=iteration_space(self.current_node),
+            index=tensor.index,
+        )
         tensor_arg = TensorArg(
             is_input,
             -1,
-            tensor.layout.dtype,
-            scales,
+            tensor.layout.device_layout.device_dtype,
+            tensor.layout.device_layout.device_size,
+            device_coords,
             tensor.layout.allocation,
-            tensor.layout.device_layout,
         )
-        self.tensor_args[name] = tensor_arg
+        if not tensor.layout.allocation:
+            self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
 
+    def create_op_spec(
+        self,
+        op: str,
+        is_reduction: bool,
+        args: Sequence[TensorArg],
+        op_info: dict[str, Any],
+    ) -> OpSpec:
+        """Create an OpSpec following the same pattern as SpyreKernel"""
+        for arg in args:
+            if arg.device_dtype == DataFormats.IEEE_FP32 and op not in SPYRE_FP32_OPS:
+                raise Unsupported(f"{op} on {arg.device_dtype}")
+            elif arg.device_dtype not in [
+                DataFormats.IEEE_FP32,
+                DataFormats.SEN169_FP16,
+            ]:
+                raise Unsupported(f"operation on {arg.device_dtype}")
+
+        if self.current_node is None:
+            raise RuntimeError("current_node is None")
+
+        it_space = iteration_space(self.current_node)
+
+        ir_node = self.current_node.node  # ComputedBuffer
+        core_division: dict[sympy.Symbol, int] = {}
+        if hasattr(ir_node, "op_it_space_splits"):
+            core_division = map_ir_splits_to_scheduler(
+                ir_node.op_it_space_sizes,  # type: ignore[attr-defined]
+                ir_node.op_it_space_splits,  # type: ignore[attr-defined]
+                it_space,
+            )
+
+        it_space_extended = {
+            k: (v, core_division.get(k, 1)) for k, v in it_space.items()
+        }
+
+        return OpSpec(
+            op,
+            is_reduction,
+            it_space_extended,
+            args,
+            op_info,
+        )
+
+    def _create_index_from_iteration_space(self) -> sympy.Expr:
+        """
+        Create an index expression directly from iteration space variables.
+
+        This creates a linearized index from the iteration space (c0, c1, ...)
+        that can be used with compute_coordinates to get proper device coordinates.
+        """
+        if self.current_node is None:
+            raise RuntimeError("current_node is None")
+
+        # Get the iteration space which has the c0, c1, etc. variables
+        it_space = iteration_space(self.current_node)
+
+        # Create a linearized index from iteration space variables
+        # For a 2D iteration space {c0: 64, c1: 128}, create: c0 * 128 + c1
+        # This matches the row-major layout
+        iter_vars = sorted(it_space.keys(), key=lambda x: str(x))
+
+        if len(iter_vars) == 0:
+            return sympy.Integer(0)
+        elif len(iter_vars) == 1:
+            return iter_vars[0]
+        else:
+            # Build linearized index: c0 * size1 * size2 * ... + c1 * size2 * ... + c2 * ... + cn
+            index = sympy.Integer(0)
+            for i, var in enumerate(iter_vars):
+                stride = sympy.Integer(1)
+                # Calculate stride as product of all subsequent dimension sizes
+                for j in range(i + 1, len(iter_vars)):
+                    stride *= it_space[iter_vars[j]]
+                index += var * stride
+            return index
+
     def load(self, name: str, index: sympy.Expr):
-        """Codegen a load from an InputBuffer"""
-        var = self.args.input(name)
+        """Codegen a load from an InputBuffer and track the TensorAccess"""
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
+        if not layout.allocation:
+            _ = self.args.input(name)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -361,22 +523,42 @@ class SpyreTritonKernel(TritonKernel):
                 f"device_size={list(layout.device_layout.device_size)}"
             )
 
-        input = TensorAccess(name, index, layout).unsqueeze_if_sparse()
-        _ = self.create_tensor_arg(True, var, input, self.derive_dim_info(input))
+        # Create TensorArg for this load and store it
+        assert self.current_node is not None
+        iter_index = self._create_index_from_iteration_space()
+        tensor_access = TensorAccess(name, iter_index, layout)
+        tensor_arg = self.create_tensor_arg(True, name, tensor_access)
+        self.loaded_tensor_args[name] = tensor_arg
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"load: name={name} triton_index={index} iter_index={iter_index}"
+            )
 
         return super().load(name, index)
 
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
     ) -> None:
-        var = self.args.output(name)
+        """Store and create OpSpec following SpyreKernel pattern"""
+        _ = self.args.output(name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(name, index, layout).unsqueeze_if_sparse()
-        op_info = {}
+
+        # Create index from iteration space variables
+        # This is needed because compute_coordinates expects iteration space variables
+        iter_index = self._create_index_from_iteration_space()
+
+        dst = TensorAccess(name, iter_index, layout)
+        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
+        if real_dst_name != name:
+            # Skip allocating an output buffer; this name is an alias to another buffer
+            V.graph.removed_buffers.add(name)
+
+        op_info: dict[str, Any] = {}
         if hasattr(self.current_node, "op_dim_splits"):
             op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
         if hasattr(self.current_node, "n_cores_used"):
@@ -389,87 +571,29 @@ class SpyreTritonKernel(TritonKernel):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        _ = self.create_tensor_arg(False, var, dst, di=self.derive_dim_info(dst))
-        self.op_specs.append(
-            create_op_spec(
-                "add",
-                False,
-                dims=self.get_dimension_info(),
-                args=self.create_args(),
-                op_info=op_info,
-            )
-        )
+        # Create output TensorArg
+        output_tensor_arg = self.create_tensor_arg(False, real_dst_name, dst)
+
+        # Collect all tensor args in the order they appear in kernel arguments
+        # Get the actual argument list from the kernel
+        actuals = self.args.python_argdefs()[1]
+
+        # Build args list in the order of kernel arguments
+        args: list[TensorArg] = []
+        for arg_name in actuals:
+            if arg_name in self.loaded_tensor_args:
+                # Input argument - use the TensorArg created during load
+                tensor_arg = self.loaded_tensor_args[arg_name]
+                tensor_arg.arg_index = len(args)
+                args.append(tensor_arg)
+            elif arg_name == real_dst_name:
+                # Output argument
+                output_tensor_arg.arg_index = len(args)
+                args.append(output_tensor_arg)
+
+        # Create and store the OpSpec
+        # For Triton kernels, we use a generic operation name
+        op_spec = self.create_op_spec("add", False, args, op_info)
+        self.op_specs.append(op_spec)
 
         return super().store(name, index, value, mode)
-
-    def get_dimension_info(self) -> list[DimensionInfo]:
-        di: list[DimensionInfo] = []
-        if len(self.di) == 0:
-            var_ranges = self.var_ranges()
-            symbols = reversed(sorted(var_ranges.keys(), key=lambda x: str(x)))
-            for s in symbols:
-                di.append(DimensionInfo(s, int(var_ranges[s])))
-        return di
-
-    def create_args(self) -> list[TensorArg]:
-        args: list[TensorArg] = []
-        actuals = self.args.python_argdefs()[1]
-        print(f"create_args actuals={actuals} args={self.args}")
-        for index, name in enumerate(actuals):
-            if name.startswith("buf"):
-                var = self.args.output(name)
-            else:
-                var = self.args.input(name)
-            arg = self.tensor_args[var]
-            arg.arg_index = index
-            args.append(arg)
-        return args
-
-        # def reduction(
-        #     self,
-        #     dtype: torch.dtype,
-        #     src_dtype: torch.dtype,
-        #     reduction_type: str,
-        #     value: Union[CSEVariable, tuple[CSEVariable, ...]],
-        # ) -> Union[CSEVariable, tuple[CSEVariable, ...]]:
-        #     """
-        #     Override reduction to handle matmul and batchmatmul reduction types.
-        #
-        #     For matmul reductions, we translate them to the native matmul pattern:
-        #     pointwise multiply (ops.dot) followed by reduction("dot").
-        #     This generates proper tl.dot operations in Triton.
-        #     """
-        #     if reduction_type in [MATMUL_REDUCTION_OP, BATCH_MATMUL_OP]:
-        #         # Generate tl.dot directly for matmul operations
-        #         # Don't use parent's "dot" reduction as it's incompatible with our setup
-        #         if isinstance(value, tuple) and len(value) == 2:
-        #             from torch._inductor.codegen.triton import TritonCSEVariable
-        #             from torch.utils._sympy.value_ranges import ValueRanges
-        #
-        #             # For tl.dot, we need [M, K] @ [K, N]
-        #             # Both operands have shape [M, K]
-        #             # Use tl.trans for transpose (Triton's transpose function)
-        #
-        #             left_shape = value[0].shape
-        #             right_shape = value[1].shape
-        #
-        #             # Compute output shape
-        #             # [M, K] @ [K, M] -> [M, M]
-        #             if left_shape and right_shape and len(left_shape) >= 2:
-        #                 output_shape = (left_shape[0], right_shape[0])
-        #             else:
-        #                 output_shape = None
-        #
-        #             # Use tl.trans with dims=(1, 0) to transpose the 2D tensor
-        #             result = TritonCSEVariable(
-        #                 name=f"tl.dot({value[0]}, tl.trans({value[1]}, 1, 0))",
-        #                 bounds=ValueRanges.unknown(),
-        #                 dtype=dtype,
-        #                 shape=output_shape,
-        #             )
-        #             return result
-        #         else:
-        #             raise Unsupported(f"Unexpected value type for {reduction_type}: {type(value)}")
-        #
-        #     # For other reduction types, use the parent implementation
-        #     return super().reduction(dtype, src_dtype, reduction_type, value)  # type: ignore[arg-type]

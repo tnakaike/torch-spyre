@@ -167,10 +167,10 @@ def _autoload():
             device_custom_config=config,
         )
 
-        from torch._inductor import config
+        from torch._inductor import config as torch_config
 
-        # config.triton.use_block_ptr = True
-        # config.triton.prefer_nd_tiling = True
-        config.triton.native_matmul = True
+        # torch_config.triton.use_block_ptr = True
+        # torch_config.triton.prefer_nd_tiling = True
+        torch_config.triton.native_matmul = True
 
         _autoload._ran = True
