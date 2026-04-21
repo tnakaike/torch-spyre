@@ -36,15 +36,13 @@ def spyre_data_types():
 
 
 @contextmanager
-def spyre_triton_heuristics(min_bytes: int = 128):
+def spyre_triton_heuristics():
     """
-    Context manager to patch Triton heuristics with Spyre-specific minimum block sizes.
-
-    Args:
-        min_bytes: Minimum bytes per block dimension (default: 128)
+    Context manager to patch Triton heuristics with Spyre-specific core splitting
+    based on OpSpec iteration space via triton_opspec_map.
     """
-    from torch_spyre._inductor.spyre_triton_kernel import (
-        patch_triton_config_with_min_blocks,
+    from torch_spyre._inductor.spyre_triton_heuristics import (
+        patch_triton_config_for_spyre,
     )
     import sys
 
@@ -60,11 +58,11 @@ def spyre_triton_heuristics(min_bytes: int = 128):
     # Cast to Any to allow dynamic attribute access for monkey patching
     triton_heuristics: Any = triton_heuristics_module
 
-    print(f"[SPYRE] Applying triton heuristics patches with min_bytes={min_bytes}")
+    print("[SPYRE] Applying triton heuristics patches for Spyre core splitting")
 
     try:
         # Apply patches and get original functions
-        saved_funcs = patch_triton_config_with_min_blocks(min_bytes)
+        saved_funcs = patch_triton_config_for_spyre()
         yield
     finally:
         # Restore original functions
@@ -167,6 +165,7 @@ def enable_spyre_context(
 
     with (
         spyre_data_types(),
+        spyre_triton_heuristics(),
         enable_spyre_lowerings(),
         enable_spyre_decompositions(decomps=decomps) as spyre_context_decompositions,
         V.set_real_inputs(example_inputs),
