@@ -13,6 +13,7 @@
 # limitations under the License.
 
 BATCH_MATMUL_OP = "batchmatmul"
+DOT_REDUCTION_OP = "dot"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 

@@ -125,6 +125,7 @@ def patch_triton_config_for_spyre():
         triton_heuristics.triton_config_tiled_reduction
     )
     _original_match_target_block_product = triton_heuristics.match_target_block_product
+    _original_make_matmul_triton_config = triton_heuristics.make_matmul_triton_config
 
     def patched_triton_config(size_hints, x, y=None, z=None, num_warps=None, **kwargs):
         """Patched version that sets the block size for Spyre."""
@@ -242,6 +243,27 @@ def patch_triton_config_for_spyre():
 
         return block_sizes
 
+    def patched_make_matmul_triton_config(
+        sizes: dict[str, int], num_warps: int, num_stages: int
+    ):
+        """Patched version for matmul to set the block size for Spyre."""
+        logger.debug("patched_make_matmul_triton_config called")
+        logger.debug(f"  Input sizes: {sizes}")
+
+        # First get the original config
+        config = _original_make_matmul_triton_config(sizes, num_warps, num_stages)
+
+        # Get spyre_triton_block_size from V.graph
+        spyre_triton_block_size = get_spyre_triton_block_size()
+
+        # Apply Spyre block sizes
+        config.kwargs = set_spyre_triton_block_size(
+            config.kwargs, spyre_triton_block_size
+        )
+
+        logger.debug(f"  Updated config: {config.kwargs}")
+        return config
+
     # Apply patches
     triton_heuristics.triton_config = patched_triton_config
     triton_heuristics.triton_config_reduction = patched_triton_config_reduction
@@ -249,6 +271,7 @@ def patch_triton_config_for_spyre():
         patched_triton_config_tiled_reduction
     )
     triton_heuristics.match_target_block_product = patched_match_target_block_product
+    triton_heuristics.make_matmul_triton_config = patched_make_matmul_triton_config
 
     logger.info("Patched Triton heuristics for Spyre")
 
@@ -258,6 +281,7 @@ def patch_triton_config_for_spyre():
         "triton_config_reduction": _original_triton_config_reduction,
         "triton_config_tiled_reduction": _original_triton_config_tiled_reduction,
         "match_target_block_product": _original_match_target_block_product,
+        "make_matmul_triton_config": _original_make_matmul_triton_config,
     }
 
 
