@@ -322,9 +322,7 @@ def pointwise_layout(
     elif op == aten.index_put.default:
         x = args[1]
         x_stl = x.layout.device_layout
-        stl = SpyreTensorLayout(
-            x_stl.device_size, x_stl.dim_map, x_stl.stride_map, x_stl.device_dtype
-        )
+        stl = SpyreTensorLayout(x_stl.device_size, x_stl.stride_map, x_stl.device_dtype)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
