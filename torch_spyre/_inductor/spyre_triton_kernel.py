@@ -9,7 +9,7 @@ from .ir import FixedTiledLayout
 from .spyre_kernel import TensorAccess, UnimplementedOp
 from .op_spec import OpSpec, TensorArg
 from .views import compute_coordinates
-from .pass_utils import iteration_space, map_ir_splits_to_scheduler
+from .pass_utils import iteration_space, apply_splits_from_index_coeff
 from .constants import SPYRE_FP32_OPS
 from .logging_utils import get_inductor_logger
 from torch_spyre._C import DataFormats
@@ -214,9 +214,12 @@ class SpyreTritonKernel(TritonKernel):
         # Get core division from IR node
         core_division: dict[sympy.Symbol, int] = {}
         if hasattr(ir_node, "op_it_space_splits"):
-            core_division = map_ir_splits_to_scheduler(
-                ir_node.op_it_space_sizes,  # type: ignore[attr-defined]
+            write_index = next(iter(self.current_node.read_writes.writes)).index
+            read_index = next(iter(self.current_node.read_writes.reads)).index
+            core_division = apply_splits_from_index_coeff(
                 ir_node.op_it_space_splits,  # type: ignore[attr-defined]
+                write_index,
+                read_index,
                 it_space,
             )
             logger.debug(f"Core division for {ir_node}: {core_division}")
@@ -421,9 +424,12 @@ class SpyreTritonKernel(TritonKernel):
         ir_node = self.current_node.node  # ComputedBuffer
         core_division: dict[sympy.Symbol, int] = {}
         if hasattr(ir_node, "op_it_space_splits"):
-            core_division = map_ir_splits_to_scheduler(
-                ir_node.op_it_space_sizes,  # type: ignore[attr-defined]
+            write_index = next(iter(self.current_node.read_writes.writes)).index
+            read_index = next(iter(self.current_node.read_writes.reads)).index
+            core_division = apply_splits_from_index_coeff(
                 ir_node.op_it_space_splits,  # type: ignore[attr-defined]
+                write_index,
+                read_index,
                 it_space,
             )
 
