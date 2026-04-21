@@ -191,7 +191,7 @@ class SpyreTritonKernel(TritonKernel):
 
     def get_triton_block_size(self) -> dict[str, int]:
         """
-        Extract core splitting information from OpSpec iteration space via triton_opspec_map.
+        Extract core division information from OpSpec iteration space via triton_opspec_map.
 
         Returns:
             Dictionary mapping Triton dimension prefixes to block size per core (elements per core),
@@ -245,10 +245,10 @@ class SpyreTritonKernel(TritonKernel):
                     size_val = V.graph.sizevars.size_hint(size_expr)
                     total_size *= size_val
 
-            if total_cores > 1:
-                # Calculate block size per core: total_size / n_cores
-                block_per_core = total_size // total_cores
-                spyre_triton_block_size[triton_prefix] = max(1, block_per_core)
+            # Calculate block size per core: total_size / n_cores
+            # Include all dimensions, even when total_cores == 1 (no splitting)
+            block_per_core = total_size // total_cores
+            spyre_triton_block_size[triton_prefix] = max(1, block_per_core)
 
         logger.debug(f"spyre_triton_block_size: {spyre_triton_block_size}")
         return spyre_triton_block_size
@@ -439,38 +439,40 @@ class SpyreTritonKernel(TritonKernel):
             op_info,
         )
 
-    def _create_opspec_index(self) -> sympy.Expr:
+    def _create_opspec_index(self, name: str, is_load: bool) -> sympy.Expr:
         """
-        Create an index expression directly from iteration space variables.
+        Create an index expression from the memory dependency for a specific tensor.
 
-        This creates a linearized index from the iteration space (c0, c1, ...)
-        that can be used with compute_coordinates to get proper device coordinates.
+        This retrieves the index from MemoryDep which already contains the proper
+        linearized index in terms of iteration space variables (c0, c1, ...).
+
+        MemoryDep.index already has the correct variable ordering, stride information,
+        and properly handles both reduction and non-reduction dimensions.
+
+        Args:
+            name: The tensor name to find the MemoryDep for
+            is_load: True if this is a load operation (read), False if store (write)
+
+        Returns:
+            The index expression from the matching MemoryDep
         """
         if self.current_node is None:
             raise RuntimeError("current_node is None")
 
-        # Get the iteration space which has the c0, c1, etc. variables
-        it_space = iteration_space(self.current_node)
+        # Find the MemoryDep that matches the tensor name and access type
+        deps = (
+            self.current_node.read_writes.reads
+            if is_load
+            else self.current_node.read_writes.writes
+        )
 
-        # Create a linearized index from iteration space variables
-        # For a 2D iteration space {c0: 64, c1: 128}, create: c0 * 128 + c1
-        # This matches the row-major layout
-        iter_vars = sorted(it_space.keys(), key=lambda x: str(x))
+        for dep in deps:
+            if dep.name == name:
+                return dep.index
 
-        if len(iter_vars) == 0:
-            return sympy.Integer(0)
-        elif len(iter_vars) == 1:
-            return iter_vars[0]
-        else:
-            # Build linearized index: c0 * size1 * size2 * ... + c1 * size2 * ... + c2 * ... + cn
-            index = sympy.Integer(0)
-            for i, var in enumerate(iter_vars):
-                stride = sympy.Integer(1)
-                # Calculate stride as product of all subsequent dimension sizes
-                for j in range(i + 1, len(iter_vars)):
-                    stride *= it_space[iter_vars[j]]
-                index += var * stride
-            return index
+        raise RuntimeError(
+            f"Could not find MemoryDep for {'load' if is_load else 'store'} of {name}"
+        )
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer and track the TensorAccess"""
@@ -484,7 +486,7 @@ class SpyreTritonKernel(TritonKernel):
 
         # Create TensorArg for this load and store it
         assert self.current_node is not None
-        opspec_index = self._create_opspec_index()
+        opspec_index = self._create_opspec_index(name, is_load=True)
         tensor_access = TensorAccess(name, opspec_index, layout)
         tensor_arg = self.create_tensor_arg(True, name, tensor_access)
         self.loaded_tensor_args[name] = tensor_arg
@@ -513,7 +515,7 @@ class SpyreTritonKernel(TritonKernel):
 
         # Create index from iteration space variables
         # This is needed because compute_coordinates expects iteration space variables
-        opspec_index = self._create_opspec_index()
+        opspec_index = self._create_opspec_index(name, is_load=False)
 
         dst = TensorAccess(name, opspec_index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
@@ -561,15 +563,15 @@ class SpyreTritonKernel(TritonKernel):
         if not self.triton_opspec_map:
             self.triton_opspec_map = self._create_triton_opspec_map()
             # Print the mapping for debugging
-            logger.debug(f"[SPYRE] Triton to OpSpec mapping: {self.triton_opspec_map}")
-            logger.debug(f"[SPYRE] Triton numels: {self.numels}")
+            logger.debug(f"Triton to OpSpec mapping: {self.triton_opspec_map}")
+            logger.debug(f"Triton numels: {self.numels}")
 
             # current_node is always available here (already used earlier in this function)
             assert self.current_node is not None, (
                 "current_node should be set in store()"
             )
             it_space = iteration_space(self.current_node)
-            logger.debug(f"[SPYRE] OpSpec iteration space: {it_space}")
+            logger.debug(f"OpSpec iteration space: {it_space}")
 
             # Compute and store ALL metadata NOW while we have current_node
             # Store in V.graph so it's available during heuristics
@@ -586,4 +588,81 @@ class SpyreTritonKernel(TritonKernel):
         op_spec = self.create_op_spec("add", False, args, op_info)
         self.op_specs.append(op_spec)
 
-        return super().store(name, index, value, mode)
+    def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
+        """Store reduction result and create OpSpec following SpyreKernel pattern"""
+        _ = self.args.output(name)
+        buf = V.graph.get_buffer(name)
+        layout = buf.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            raise Unsupported(f"{name} does not have FixedTiledLayout")
+        index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
+
+        # Create index from iteration space variables
+        opspec_index = self._create_opspec_index(name, is_load=False)
+
+        dst = TensorAccess(name, opspec_index, layout)
+        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
+        if real_dst_name != name:
+            # Skip allocating an output buffer; this name is an alias to another buffer
+            V.graph.removed_buffers.add(name)
+
+        op_info = {}
+        if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
+            op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
+
+        # Try to determine reduction type from the value
+        if isinstance(value, CSEVariable):
+            # The actual reduction operation info might be in the CSEVariable
+            # For now, we'll use a generic reduction operation
+            pass
+
+        if logger.isEnabledFor(logging.DEBUG):
+            triton_is = self.get_triton_iteration_space(index)
+            opspec_is = iteration_space(self.current_node) if self.current_node else {}
+            logger.debug(
+                f"store_reduction: name={name} triton_is={triton_is} triton_index={index} "
+                f"opspec_is={opspec_is} opspec_index={opspec_index}"
+            )
+
+        # Collect all tensor args in the order they appear in kernel arguments
+        actuals = self.args.python_argdefs()[1]
+
+        # Build args list: inputs first, then output
+        args: list[TensorArg] = []
+        for arg_name in actuals:
+            if arg_name in self.loaded_tensor_args:
+                # Input argument
+                tensor_arg = self.loaded_tensor_args[arg_name]
+                tensor_arg.arg_index = len(args)
+                args.append(tensor_arg)
+            elif arg_name == real_dst_name:
+                # Output argument
+                output_tensor_arg = self.create_tensor_arg(False, real_dst_name, dst)
+                output_tensor_arg.arg_index = len(args)
+                args.append(output_tensor_arg)
+
+        # Create the mapping from Triton dimensions to OpSpec iteration space
+        if not self.triton_opspec_map:
+            self.triton_opspec_map = self._create_triton_opspec_map()
+            logger.debug(f"Triton to OpSpec mapping: {self.triton_opspec_map}")
+            logger.debug(f"Triton numels: {self.numels}")
+
+            assert self.current_node is not None, (
+                "current_node should be set in store_reduction()"
+            )
+            it_space = iteration_space(self.current_node)
+            logger.debug(f"OpSpec iteration space: {it_space}")
+
+            # Compute and store block size metadata
+            spyre_triton_block_size = self.get_triton_block_size()
+            if spyre_triton_block_size:
+                setattr(V.graph, "_spyre_triton_block_size", spyre_triton_block_size)
+                logger.debug(
+                    f"Stored spyre_triton_block_size in V.graph: {spyre_triton_block_size}"
+                )
+
+        # Create and store the OpSpec with is_reduction=True
+        op_spec = self.create_op_spec("sum", True, args, op_info)
+        self.op_specs.append(op_spec)
+
+        return super().store_reduction(name, index, value)
