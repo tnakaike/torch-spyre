@@ -120,6 +120,7 @@ def patch_triton_config_for_spyre():
 
     # Save original functions
     _original_triton_config = triton_heuristics.triton_config
+    _original_triton_config_reduction = triton_heuristics.triton_config_reduction
     _original_triton_config_tiled_reduction = (
         triton_heuristics.triton_config_tiled_reduction
     )
@@ -147,14 +148,49 @@ def patch_triton_config_for_spyre():
 
         return config
 
+    def patched_triton_config_reduction(
+        size_hints,
+        x,
+        r,
+        num_stages=1,
+        num_warps=None,
+        register_intensive=False,
+        dynamic_scale_rblock=True,
+        reduction_hint=None,
+        min_num_warps=None,
+    ):
+        """Patched version for reductions to set the block size for Spyre."""
+        logger.debug("patched_triton_config_reduction called")
+
+        config = _original_triton_config_reduction(
+            size_hints,
+            x,
+            r,
+            num_stages,
+            num_warps,
+            register_intensive,
+            dynamic_scale_rblock,
+            reduction_hint,
+            min_num_warps,
+        )
+
+        # Get spyre_triton_block_size from V.graph
+        spyre_triton_block_size = get_spyre_triton_block_size()
+
+        config.kwargs = set_spyre_triton_block_size(
+            config.kwargs, spyre_triton_block_size
+        )
+
+        return config
+
     def patched_triton_config_tiled_reduction(
-        size_hints, x, r, num_stages=1, num_warps=None, **kwargs
+        size_hints, x, y, r, num_stages=1, register_intensive=False
     ):
         """Patched version for tiled reductions to set the block size for Spyre."""
         logger.debug("patched_triton_config_tiled_reduction called")
 
         config = _original_triton_config_tiled_reduction(
-            size_hints, x, r, num_stages, num_warps, **kwargs
+            size_hints, x, y, r, num_stages, register_intensive
         )
 
         # Get spyre_triton_block_size from V.graph
@@ -208,6 +244,7 @@ def patch_triton_config_for_spyre():
 
     # Apply patches
     triton_heuristics.triton_config = patched_triton_config
+    triton_heuristics.triton_config_reduction = patched_triton_config_reduction
     triton_heuristics.triton_config_tiled_reduction = (
         patched_triton_config_tiled_reduction
     )
@@ -218,6 +255,7 @@ def patch_triton_config_for_spyre():
     # Return original functions for restoration
     return {
         "triton_config": _original_triton_config,
+        "triton_config_reduction": _original_triton_config_reduction,
         "triton_config_tiled_reduction": _original_triton_config_tiled_reduction,
         "match_target_block_product": _original_match_target_block_product,
     }
