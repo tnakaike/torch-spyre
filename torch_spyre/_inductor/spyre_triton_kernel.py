@@ -1,6 +1,5 @@
 import sympy
 from typing import Optional, Any, Sequence
-import torch
 from torch._inductor.codegen.triton import TritonKernel, FixedTritonConfig
 from torch._inductor.virtualized import StoreMode, V
 from torch._inductor.codegen.common import CSEVariable
@@ -98,265 +97,24 @@ class UnimplementedOpDict:
         return f"UnimplementedOp(op={self.op!r})"
 
 
+class TritonOpSpecMapDict:
+    """Wrapper for triton_opspec_map that serializes properly"""
+
+    def __init__(self, mapping: dict[str, list[sympy.Symbol]]):
+        self.items = [
+            (prefix, [SympyExpr(sym) for sym in symbols])
+            for prefix, symbols in mapping.items()
+        ]
+
+    def __repr__(self):
+        items_str = ", ".join(
+            f"{prefix!r}: [{', '.join(repr(sym) for sym in symbols)}]"
+            for prefix, symbols in self.items
+        )
+        return f"{{{items_str}}}"
+
+
 logger = get_inductor_logger("spyre_triton_kernel")
-
-
-def get_dtype_bytes(dtype: torch.dtype) -> int:
-    """Get the size in bytes for a given torch dtype."""
-    dtype_sizes = {
-        torch.float32: 4,
-        torch.float16: 2,
-        torch.bfloat16: 2,
-        torch.float64: 8,
-        torch.int32: 4,
-        torch.int64: 8,
-        torch.int16: 2,
-        torch.int8: 1,
-        torch.uint8: 1,
-        torch.bool: 1,
-        torch.complex64: 8,
-        torch.complex128: 16,
-    }
-    return dtype_sizes.get(dtype, 4)  # Default to 4 bytes if unknown
-
-
-def calculate_min_block_size(dtype: torch.dtype, min_bytes: int = 128) -> int:
-    """
-    Calculate minimum block size based on data type to ensure at least min_bytes
-    are accessed per block.
-
-    Args:
-        dtype: The torch data type of the tensor
-        min_bytes: Minimum number of bytes to access (default: 128)
-
-    Returns:
-        Minimum block size (power of 2)
-    """
-    dtype_bytes = get_dtype_bytes(dtype)
-    min_elements = min_bytes // dtype_bytes
-
-    # Round up to next power of 2
-    import math
-
-    if min_elements <= 1:
-        return 1
-    return 2 ** math.ceil(math.log2(min_elements))
-
-
-def enforce_min_block_sizes(
-    config_dict: dict[str, int],
-    tensor_dtypes: dict[str, torch.dtype],
-    min_bytes: int = 128,
-) -> dict[str, int]:
-    """
-    Enforce minimum block sizes based on tensor data types.
-
-    Args:
-        config_dict: Dictionary with block size configuration (e.g., {"XBLOCK": 64, "YBLOCK": 32})
-        tensor_dtypes: Dictionary mapping dimension prefixes to tensor dtypes
-                      (e.g., {"x": torch.float32, "y": torch.bfloat16, "r0_": torch.float16})
-        min_bytes: Minimum bytes per block (default: 128)
-
-    Returns:
-        Updated config_dict with enforced minimum block sizes
-    """
-    updated_config = config_dict.copy()
-
-    # Map block names to dimension prefixes
-    block_to_dim = {
-        "XBLOCK": "x",
-        "YBLOCK": "y",
-        "ZBLOCK": "z",
-        "R0_BLOCK": "r0_",
-        "R1_BLOCK": "r1_",
-        "R2_BLOCK": "r2_",
-    }
-
-    for block_name, dim_prefix in block_to_dim.items():
-        if block_name in updated_config and dim_prefix in tensor_dtypes:
-            dtype = tensor_dtypes[dim_prefix]
-            min_block = calculate_min_block_size(dtype, min_bytes)
-
-            # Enforce minimum
-            if updated_config[block_name] < min_block:
-                logger.debug(
-                    f"Increasing {block_name} from {updated_config[block_name]} to {min_block} "
-                    f"for dtype {dtype} (min_bytes={min_bytes})"
-                )
-                updated_config[block_name] = min_block
-
-    return updated_config
-
-
-def patch_triton_config_with_min_blocks(min_bytes: int = 128):
-    """
-    Monkey-patch PyTorch Inductor's triton config functions to enforce minimum block sizes.
-
-    This should be called during Spyre initialization to override the heuristics.
-
-    Args:
-        min_bytes: Minimum bytes per block dimension (default: 128)
-
-    Returns:
-        Dictionary of original functions for restoration
-    """
-    import sys
-
-    # Get the actual module from sys.modules to ensure we patch the right instance
-    triton_heuristics_module = sys.modules.get(
-        "torch._inductor.runtime.triton_heuristics"
-    )
-    if triton_heuristics_module is None:
-        # Module not loaded yet, import it
-        from torch._inductor.runtime import triton_heuristics as th_module
-
-        triton_heuristics_module = th_module
-
-    # Cast to Any to allow dynamic attribute access for monkey patching
-    triton_heuristics: Any = triton_heuristics_module
-
-    # Save original functions
-    _original_triton_config = triton_heuristics.triton_config
-    _original_triton_config_tiled_reduction = (
-        triton_heuristics.triton_config_tiled_reduction
-    )
-    _original_match_target_block_product = triton_heuristics.match_target_block_product
-
-    def patched_triton_config(size_hints, x, y=None, z=None, num_warps=None, **kwargs):
-        """Patched version that enforces minimum block sizes."""
-        config = _original_triton_config(size_hints, x, y, z, num_warps, **kwargs)
-
-        # Try to infer dtypes from the current kernel context
-        tensor_dtypes = {}
-        try:
-            if hasattr(V, "kernel") and hasattr(V.kernel, "args"):
-                # Get dtypes from kernel arguments
-                for name in V.kernel.args.input_buffers:
-                    buf = V.graph.get_buffer(name)
-                    dtype = buf.get_dtype()
-                    # Map to dimension - this is a heuristic
-                    if "x" not in tensor_dtypes:
-                        tensor_dtypes["x"] = dtype
-                    if "y" not in tensor_dtypes and y is not None:
-                        tensor_dtypes["y"] = dtype
-                    if "z" not in tensor_dtypes and z is not None:
-                        tensor_dtypes["z"] = dtype
-        except Exception as e:
-            logger.debug(f"Could not infer dtypes for block size enforcement: {e}")
-            # Use a conservative default
-            tensor_dtypes = {k: torch.float32 for k in ["x", "y", "z"]}
-
-        config.kwargs = enforce_min_block_sizes(config.kwargs, tensor_dtypes, min_bytes)
-        return config
-
-    def patched_triton_config_tiled_reduction(
-        size_hints, x, r, num_stages=1, num_warps=None, **kwargs
-    ):
-        """Patched version for tiled reductions."""
-        print("patched_triton_config_tiled_reduction called")
-        config = _original_triton_config_tiled_reduction(
-            size_hints, x, r, num_stages, num_warps, **kwargs
-        )
-
-        # Infer dtypes
-        tensor_dtypes = {}
-        try:
-            if hasattr(V, "kernel") and hasattr(V.kernel, "args"):
-                for name in V.kernel.args.input_buffers:
-                    buf = V.graph.get_buffer(name)
-                    dtype = buf.get_dtype()
-                    if "x" not in tensor_dtypes:
-                        tensor_dtypes["x"] = dtype
-                    if "r0_" not in tensor_dtypes:
-                        tensor_dtypes["r0_"] = dtype
-        except Exception as e:
-            logger.debug(f"Could not infer dtypes for reduction: {e}")
-            tensor_dtypes = {"x": torch.float32, "r0_": torch.float32}
-
-        config.kwargs = enforce_min_block_sizes(config.kwargs, tensor_dtypes, min_bytes)
-        return config
-
-    def patched_match_target_block_product(
-        size_hints, tiling_scores, target_block_product, min_block_size=1
-    ):
-        """Patched version that respects dtype-based minimums."""
-        print("patched_match_target_block_product called")
-        # First get the original block sizes
-        block_sizes = _original_match_target_block_product(
-            size_hints, tiling_scores, target_block_product, min_block_size
-        )
-
-        # Infer dtypes and enforce minimums
-        tensor_dtypes = {}
-        try:
-            if hasattr(V, "kernel") and hasattr(V.kernel, "args"):
-                for name in V.kernel.args.input_buffers:
-                    buf = V.graph.get_buffer(name)
-                    dtype = buf.get_dtype()
-                    for dim in block_sizes.keys():
-                        if dim not in tensor_dtypes:
-                            tensor_dtypes[dim] = dtype
-        except Exception as e:
-            logger.debug(f"Could not infer dtypes for block product matching: {e}")
-            tensor_dtypes = {k: torch.float32 for k in block_sizes.keys()}
-
-        # Enforce minimums for each dimension
-        for dim, dtype in tensor_dtypes.items():
-            if dim in block_sizes:
-                min_block = calculate_min_block_size(dtype, min_bytes)
-                if block_sizes[dim] < min_block:
-                    logger.debug(
-                        f"Increasing {dim} block from {block_sizes[dim]} to {min_block} "
-                        f"for dtype {dtype}"
-                    )
-                    block_sizes[dim] = min_block
-
-        return block_sizes
-
-    def patched_make_matmul_triton_config(sizes, num_warps, num_stages):
-        """Patched version for matmul configs."""
-        # Call original
-        config = _original_make_matmul_triton_config(sizes, num_warps, num_stages)
-
-        # For matmul, assume float16 as default (most common for Spyre)
-        # Map XBLOCK/YBLOCK to x/y dimensions
-        tensor_dtypes = {"x": torch.float16, "y": torch.float16, "r0_": torch.float16}
-
-        # Enforce minimums
-        original_kwargs = dict(config.kwargs)
-        config.kwargs = enforce_min_block_sizes(config.kwargs, tensor_dtypes, min_bytes)
-
-        # Log if any changes were made
-        if original_kwargs != config.kwargs:
-            logger.debug(
-                f"Enforced min block sizes for matmul: {original_kwargs} -> {config.kwargs}"
-            )
-
-        return config
-
-    # Save original make_matmul_triton_config
-    _original_make_matmul_triton_config = triton_heuristics.make_matmul_triton_config
-
-    # Apply patches
-    triton_heuristics.triton_config = patched_triton_config
-    triton_heuristics.triton_config_tiled_reduction = (
-        patched_triton_config_tiled_reduction
-    )
-    triton_heuristics.match_target_block_product = patched_match_target_block_product
-    triton_heuristics.make_matmul_triton_config = patched_make_matmul_triton_config
-
-    print(
-        f"[SPYRE] Patched Triton heuristics to enforce min_bytes={min_bytes} per block"
-    )
-    logger.info(f"Patched Triton heuristics to enforce min_bytes={min_bytes} per block")
-
-    # Return original functions for restoration
-    return {
-        "triton_config": _original_triton_config,
-        "triton_config_tiled_reduction": _original_triton_config_tiled_reduction,
-        "match_target_block_product": _original_match_target_block_product,
-        "make_matmul_triton_config": _original_make_matmul_triton_config,
-    }
 
 
 class SpyreTritonKernel(TritonKernel):
@@ -381,9 +139,13 @@ class SpyreTritonKernel(TritonKernel):
         self.spyre_kernel_args: list[tuple[str, TensorArg]] = []
         # Track loaded tensor args to use in store
         self.loaded_tensor_args: dict[str, TensorArg] = {}
+        # Mapping from Triton prefixes (x, y, z, r0_, ...) to OpSpec iteration space symbols (c0, c1, ...)
+        # Shows which OpSpec dimensions are flattened into each Triton dimension
+        self.triton_opspec_map: dict[str, list[sympy.Symbol]] = {}
 
     def codegen_kernel(self, name=None) -> str:
         original_code = super().codegen_kernel(name)
+
         code = IndentedBuffer()
         code.splice("from torch_spyre._inductor.op_spec import TensorArg, OpSpec")
         code.splice("from torch_spyre._inductor.spyre_kernel import UnimplementedOp")
@@ -391,6 +153,203 @@ class SpyreTritonKernel(TritonKernel):
         code.splice("from torch_spyre._C import DataFormats, SpyreTensorLayout")
         code.splice("from sympy import sympify")
         return code.getvalue() + original_code
+
+    def get_triton_iteration_space(self, index: sympy.Expr) -> dict[str, int]:
+        """
+        Extract the Triton iteration space from an index expression.
+
+        Args:
+            index: Triton index expression containing symbols like x0, x1, r0_0, etc.
+
+        Returns:
+            Dictionary mapping symbol names to their ranges, ordered from outermost to innermost,
+            e.g., {'x3': 16, 'x2': 32, 'x1': 64, 'x0': 128} where x3 is the outermost dimension
+        """
+        triton_symbols = index.free_symbols
+
+        # Collect symbols with their coefficients in the index expression
+        symbol_coeffs = []
+        for sym in triton_symbols:
+            if isinstance(sym, sympy.Symbol) and sym in self.range_tree_nodes:
+                # Get coefficient of this symbol in the index expression
+                coeff = index.coeff(sym)
+                if coeff is not None:
+                    symbol_coeffs.append((sym, coeff))
+
+        # Sort by coefficient (descending) to get outermost to innermost order
+        # Outermost dimension has largest coefficient (stride)
+        symbol_coeffs.sort(key=lambda x: V.graph.sizevars.size_hint(x[1]), reverse=True)
+
+        # Build ordered dictionary
+        triton_is = {}
+        for sym, _ in symbol_coeffs:
+            sym_name = str(sym)
+            range_entry = self.range_tree_nodes[sym]
+            triton_is[sym_name] = V.graph.sizevars.size_hint(range_entry.length)
+
+        return triton_is
+
+    def get_triton_block_size(self) -> dict[str, int]:
+        """
+        Extract core splitting information from OpSpec iteration space via triton_opspec_map.
+
+        Returns:
+            Dictionary mapping Triton dimension prefixes to block size per core (elements per core),
+            e.g., {'x': 64, 'r0_': 128} means XBLOCK should be 64 elements per core
+        """
+        if not self.triton_opspec_map:
+            raise RuntimeError(
+                "triton_opspec_map is not available - cannot compute block sizes"
+            )
+
+        if not hasattr(self, "current_node") or self.current_node is None:
+            raise RuntimeError(
+                "current_node is not available - cannot compute block sizes"
+            )
+
+        # Get OpSpec iteration space with core divisions
+        it_space = iteration_space(self.current_node)
+        ir_node = self.current_node.node
+
+        # Get core division from IR node
+        core_division: dict[sympy.Symbol, int] = {}
+        if hasattr(ir_node, "op_it_space_splits"):
+            core_division = map_ir_splits_to_scheduler(
+                ir_node.op_it_space_sizes,  # type: ignore[attr-defined]
+                ir_node.op_it_space_splits,  # type: ignore[attr-defined]
+                it_space,
+            )
+            logger.debug(f"Core division for {ir_node}: {core_division}")
+        else:
+            raise RuntimeError(f"ir_node {ir_node} does not have op_it_space_splits")
+
+        # Map Triton dimensions to block sizes per core based on OpSpec mapping
+        spyre_triton_block_size: dict[str, int] = {}
+
+        for triton_prefix, opspec_symbols in self.triton_opspec_map.items():
+            if not opspec_symbols:
+                # No OpSpec dimensions mapped to this Triton dimension - no splitting needed
+                continue
+
+            # Calculate total number of cores for this Triton dimension
+            # by multiplying the core divisions of all mapped OpSpec dimensions
+            total_cores = 1
+            total_size = 1
+            for sym in opspec_symbols:
+                cores = core_division.get(sym, 1)
+                total_cores *= cores
+                # Get the size of this dimension from iteration space
+                if sym in it_space:
+                    size_expr = it_space[sym]
+                    # Evaluate the size if it's a sympy expression
+                    size_val = V.graph.sizevars.size_hint(size_expr)
+                    total_size *= size_val
+
+            if total_cores > 1:
+                # Calculate block size per core: total_size / n_cores
+                block_per_core = total_size // total_cores
+                spyre_triton_block_size[triton_prefix] = max(1, block_per_core)
+
+        logger.debug(f"spyre_triton_block_size: {spyre_triton_block_size}")
+        return spyre_triton_block_size
+
+    def _create_triton_opspec_map(self) -> dict[str, list[sympy.Symbol]]:
+        """
+        Create a mapping from Triton dimension prefixes (x, y, z, r0_, r1_, ...) to
+        OpSpec iteration space symbols (c0, c1, ...).
+
+        Algorithm:
+        1. Traverse Triton iteration space from innermost dimension
+        2. Traverse OpSpec iteration space from innermost dimension
+        3. For each Triton numel, compare with products of OpSpec dimensions
+        4. Match when tnumel == product of consecutive OpSpec dimensions
+        5. Skip matched OpSpec dimensions for next Triton dimension
+
+        For example: {'x': [c0, c1], 'r0_': []} means c0 and c1 are flattened into x.
+        """
+        if self.current_node is None:
+            raise RuntimeError(
+                "Cannot map Triton to OpSpec dimensions: current_node is None"
+            )
+
+        # Get the OpSpec iteration space (c0, c1, c2, ...)
+        it_space = iteration_space(self.current_node)
+        # Sort by symbol name to get consistent ordering (c0, c1, c2, ...)
+        opspec_symbols = sorted(it_space.keys(), key=lambda x: str(x))
+
+        # Reverse to traverse from innermost (last) dimension
+        opspec_symbols_reversed = list(reversed(opspec_symbols))
+
+        # Get the Triton dimension prefixes, sorted by type and name
+        triton_prefixes = sorted(
+            self.numels.keys(), key=lambda p: (1 if p.startswith("r") else 0, p)
+        )
+
+        # Reverse to traverse from innermost dimension
+        triton_prefixes_reversed = list(reversed(triton_prefixes))
+
+        # Initialize the mapping with empty lists
+        mapping: dict[str, list[sympy.Symbol]] = {
+            prefix: [] for prefix in triton_prefixes
+        }
+
+        # Get size hints for all dimensions
+        opspec_size_hints = {
+            sym: V.graph.sizevars.size_hint(it_space[sym]) for sym in opspec_symbols
+        }
+
+        triton_size_hints = {
+            prefix: V.graph.sizevars.size_hint(self.numels[prefix])
+            for prefix in triton_prefixes
+        }
+
+        # Track which OpSpec dimensions have been matched
+        opspec_idx = 0
+
+        # Traverse Triton dimensions from innermost
+        for triton_prefix in triton_prefixes_reversed:
+            tnumel = triton_size_hints[triton_prefix]
+
+            # Skip dummy dimensions (size 1)
+            if tnumel == 1:
+                continue
+
+            # Try to match with product of consecutive OpSpec dimensions
+            matched_symbols = []
+            product = 1
+
+            # Accumulate OpSpec dimensions until product matches tnumel
+            temp_idx = opspec_idx
+            while temp_idx < len(opspec_symbols_reversed):
+                sym = opspec_symbols_reversed[temp_idx]
+                product *= opspec_size_hints[sym]
+                matched_symbols.append(sym)
+
+                if product == tnumel:
+                    # Exact match found
+                    # Store in original order (not reversed)
+                    mapping[triton_prefix] = list(reversed(matched_symbols))
+                    opspec_idx = temp_idx + 1
+                    break
+                elif product > tnumel:
+                    # Product exceeded without exact match
+                    raise RuntimeError(
+                        f"Cannot map Triton dimension '{triton_prefix}' (numel={tnumel}) "
+                        f"to OpSpec dimensions. Product {product} exceeds target. "
+                        f"Attempted symbols: {matched_symbols}"
+                    )
+
+                temp_idx += 1
+            else:
+                # Ran out of OpSpec dimensions without matching
+                raise RuntimeError(
+                    f"Cannot map Triton dimension '{triton_prefix}' (numel={tnumel}) "
+                    f"to OpSpec dimensions. Accumulated product: {product}, "
+                    f"symbols: {matched_symbols}"
+                )
+
+        logger.debug(f"Triton to OpSpec mapping: {mapping}")
+        return mapping
 
     def codegen_body(self):
         if self.triton_meta is not None:
@@ -403,7 +362,13 @@ class SpyreTritonKernel(TritonKernel):
                 else:
                     serializable_specs.append(OpSpecDict(op_spec))
 
-            self.triton_meta["spyre_options"] = {"op_specs": serializable_specs}
+            # Convert triton_opspec_map to serializable format
+            serializable_mapping = TritonOpSpecMapDict(self.triton_opspec_map)
+
+            self.triton_meta["spyre_options"] = {
+                "op_specs": serializable_specs,
+                "triton_opspec_map": serializable_mapping,
+            }
         return super().codegen_body()
 
     def create_tensor_arg(
@@ -474,7 +439,7 @@ class SpyreTritonKernel(TritonKernel):
             op_info,
         )
 
-    def _create_index_from_iteration_space(self) -> sympy.Expr:
+    def _create_opspec_index(self) -> sympy.Expr:
         """
         Create an index expression directly from iteration space variables.
 
@@ -517,22 +482,20 @@ class SpyreTritonKernel(TritonKernel):
         if not layout.allocation:
             _ = self.args.input(name)
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                f"kernel_load: {name}, shape={[int(s) for s in layout.size]}, "
-                f"device_size={list(layout.device_layout.device_size)}"
-            )
-
         # Create TensorArg for this load and store it
         assert self.current_node is not None
-        iter_index = self._create_index_from_iteration_space()
-        tensor_access = TensorAccess(name, iter_index, layout)
+        opspec_index = self._create_opspec_index()
+        tensor_access = TensorAccess(name, opspec_index, layout)
         tensor_arg = self.create_tensor_arg(True, name, tensor_access)
         self.loaded_tensor_args[name] = tensor_arg
 
         if logger.isEnabledFor(logging.DEBUG):
+            # Get iteration spaces for debugging
+            triton_is = self.get_triton_iteration_space(index)
+            opspec_is = iteration_space(self.current_node) if self.current_node else {}
             logger.debug(
-                f"load: name={name} triton_index={index} iter_index={iter_index}"
+                f"load: name={name} triton_is={triton_is} triton_index={index} "
+                f"opspec_is={opspec_is} opspec_index={opspec_index}"
             )
 
         return super().load(name, index)
@@ -550,9 +513,9 @@ class SpyreTritonKernel(TritonKernel):
 
         # Create index from iteration space variables
         # This is needed because compute_coordinates expects iteration space variables
-        iter_index = self._create_index_from_iteration_space()
+        opspec_index = self._create_opspec_index()
 
-        dst = TensorAccess(name, iter_index, layout)
+        dst = TensorAccess(name, opspec_index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
         if real_dst_name != name:
             # Skip allocating an output buffer; this name is an alias to another buffer
@@ -564,15 +527,17 @@ class SpyreTritonKernel(TritonKernel):
         if hasattr(self.current_node, "n_cores_used"):
             op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
 
-        if logger.isEnabledFor(logging.DEBUG):
-            value_type = type(value).__name__
-            logger.debug(
-                f"kernel_store: {name} (type: {value_type}), shape={[int(s) for s in layout.size]}, "
-                f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
-            )
-
         # Create output TensorArg
         output_tensor_arg = self.create_tensor_arg(False, real_dst_name, dst)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            # Get iteration spaces for debugging
+            triton_is = self.get_triton_iteration_space(index)
+            opspec_is = iteration_space(self.current_node) if self.current_node else {}
+            logger.debug(
+                f"store: name={name} triton_is={triton_is} triton_index={index} "
+                f"opspec_is={opspec_is} opspec_index={opspec_index}"
+            )
 
         # Collect all tensor args in the order they appear in kernel arguments
         # Get the actual argument list from the kernel
@@ -590,6 +555,31 @@ class SpyreTritonKernel(TritonKernel):
                 # Output argument
                 output_tensor_arg.arg_index = len(args)
                 args.append(output_tensor_arg)
+
+        # Create the mapping from Triton dimensions to OpSpec iteration space
+        # This should be done once per kernel, so check if it's empty
+        if not self.triton_opspec_map:
+            self.triton_opspec_map = self._create_triton_opspec_map()
+            # Print the mapping for debugging
+            logger.debug(f"[SPYRE] Triton to OpSpec mapping: {self.triton_opspec_map}")
+            logger.debug(f"[SPYRE] Triton numels: {self.numels}")
+
+            # current_node is always available here (already used earlier in this function)
+            assert self.current_node is not None, (
+                "current_node should be set in store()"
+            )
+            it_space = iteration_space(self.current_node)
+            logger.debug(f"[SPYRE] OpSpec iteration space: {it_space}")
+
+            # Compute and store ALL metadata NOW while we have current_node
+            # Store in V.graph so it's available during heuristics
+            spyre_triton_block_size = self.get_triton_block_size()
+            if spyre_triton_block_size:
+                # Store spyre_triton_block_size directly in V.graph
+                setattr(V.graph, "_spyre_triton_block_size", spyre_triton_block_size)
+                logger.debug(
+                    f"Stored spyre_triton_block_size in V.graph: {spyre_triton_block_size}"
+                )
 
         # Create and store the OpSpec
         # For Triton kernels, we use a generic operation name
