@@ -262,13 +262,11 @@ class SpyreTritonKernel(TritonKernel):
         OpSpec iteration space symbols (c0, c1, ...).
 
         Algorithm:
-        1. Traverse Triton iteration space from innermost dimension
-        2. Traverse OpSpec iteration space from innermost dimension
-        3. For each Triton numel, compare with products of OpSpec dimensions
-        4. Match when tnumel == product of consecutive OpSpec dimensions
-        5. Skip matched OpSpec dimensions for next Triton dimension
+        1. For matmul/dot operations: Use direct 1:1 mapping based on size matching
+        2. For other operations: Use the flattening algorithm
 
-        For example: {'x': [c0, c1], 'r0_': []} means c0 and c1 are flattened into x.
+        For matmul, Triton creates separate dimensions for each axis (y, x, r0_)
+        which map directly to OpSpec dimensions (c0, c1, c2).
         """
         if self.current_node is None:
             raise RuntimeError(
@@ -280,16 +278,10 @@ class SpyreTritonKernel(TritonKernel):
         # Sort by symbol name to get consistent ordering (c0, c1, c2, ...)
         opspec_symbols = sorted(it_space.keys(), key=lambda x: str(x))
 
-        # Reverse to traverse from innermost (last) dimension
-        opspec_symbols_reversed = list(reversed(opspec_symbols))
-
         # Get the Triton dimension prefixes, sorted by type and name
         triton_prefixes = sorted(
             self.numels.keys(), key=lambda p: (1 if p.startswith("r") else 0, p)
         )
-
-        # Reverse to traverse from innermost dimension
-        triton_prefixes_reversed = list(reversed(triton_prefixes))
 
         # Initialize the mapping with empty lists
         mapping: dict[str, list[sympy.Symbol]] = {
@@ -306,50 +298,80 @@ class SpyreTritonKernel(TritonKernel):
             for prefix in triton_prefixes
         }
 
-        # Track which OpSpec dimensions have been matched
-        opspec_idx = 0
+        # Check if this is a matmul/dot operation by looking at the reduction type
+        is_matmul = False
+        if (
+            hasattr(self.current_node, "node")
+            and self.current_node.node is not None
+            and hasattr(self.current_node.node, "data")
+        ):
+            data = self.current_node.node.data
+            if hasattr(data, "reduction_type"):
+                is_matmul = data.reduction_type in ["dot", "matmul"]
 
-        # Traverse Triton dimensions from innermost
-        for triton_prefix in triton_prefixes_reversed:
-            tnumel = triton_size_hints[triton_prefix]
+        # For matmul/dot, use direct 1:1 mapping
+        if is_matmul and len(triton_prefixes) == len(opspec_symbols):
+            logger.debug("Using direct 1:1 mapping for matmul/dot operation")
+            # Create a direct mapping: each Triton dimension maps to one OpSpec dimension
+            # Sort both by size to match them correctly
+            triton_by_size = sorted(triton_prefixes, key=lambda p: triton_size_hints[p])
+            opspec_by_size = sorted(opspec_symbols, key=lambda s: opspec_size_hints[s])
 
-            # Skip dummy dimensions (size 1)
-            if tnumel == 1:
-                continue
+            for triton_prefix, opspec_sym in zip(triton_by_size, opspec_by_size):
+                mapping[triton_prefix] = [opspec_sym]
+                logger.debug(
+                    f"  {triton_prefix} ({triton_size_hints[triton_prefix]}) -> {opspec_sym} ({opspec_size_hints[opspec_sym]})"
+                )
+        else:
+            # Use the original flattening algorithm for non-matmul operations
+            # Reverse to traverse from innermost (last) dimension
+            opspec_symbols_reversed = list(reversed(opspec_symbols))
+            triton_prefixes_reversed = list(reversed(triton_prefixes))
 
-            # Try to match with product of consecutive OpSpec dimensions
-            matched_symbols = []
-            product = 1
+            # Track which OpSpec dimensions have been matched
+            opspec_idx = 0
 
-            # Accumulate OpSpec dimensions until product matches tnumel
-            temp_idx = opspec_idx
-            while temp_idx < len(opspec_symbols_reversed):
-                sym = opspec_symbols_reversed[temp_idx]
-                product *= opspec_size_hints[sym]
-                matched_symbols.append(sym)
+            # Traverse Triton dimensions from innermost
+            for triton_prefix in triton_prefixes_reversed:
+                tnumel = triton_size_hints[triton_prefix]
 
-                if product == tnumel:
-                    # Exact match found
-                    # Store in original order (not reversed)
-                    mapping[triton_prefix] = list(reversed(matched_symbols))
-                    opspec_idx = temp_idx + 1
-                    break
-                elif product > tnumel:
-                    # Product exceeded without exact match
+                # Skip dummy dimensions (size 1)
+                if tnumel == 1:
+                    continue
+
+                # Try to match with product of consecutive OpSpec dimensions
+                matched_symbols = []
+                product = 1
+
+                # Accumulate OpSpec dimensions until product matches tnumel
+                temp_idx = opspec_idx
+                while temp_idx < len(opspec_symbols_reversed):
+                    sym = opspec_symbols_reversed[temp_idx]
+                    product *= opspec_size_hints[sym]
+                    matched_symbols.append(sym)
+
+                    if product == tnumel:
+                        # Exact match found
+                        # Store in original order (not reversed)
+                        mapping[triton_prefix] = list(reversed(matched_symbols))
+                        opspec_idx = temp_idx + 1
+                        break
+                    elif product > tnumel:
+                        # Product exceeded without exact match
+                        raise RuntimeError(
+                            f"Cannot map Triton dimension '{triton_prefix}' (numel={tnumel}) "
+                            f"to OpSpec dimensions. Product {product} exceeds target. "
+                            f"Attempted symbols: {matched_symbols}"
+                        )
+
+                    temp_idx += 1
+                else:
+                    # Ran out of OpSpec dimensions without matching
                     raise RuntimeError(
                         f"Cannot map Triton dimension '{triton_prefix}' (numel={tnumel}) "
-                        f"to OpSpec dimensions. Product {product} exceeds target. "
-                        f"Attempted symbols: {matched_symbols}"
+                        f"to OpSpec dimensions. Accumulated product: {product}, "
+                        f"symbols: {matched_symbols}"
                     )
-
-                temp_idx += 1
-            else:
-                # Ran out of OpSpec dimensions without matching
-                raise RuntimeError(
-                    f"Cannot map Triton dimension '{triton_prefix}' (numel={tnumel}) "
-                    f"to OpSpec dimensions. Accumulated product: {product}, "
-                    f"symbols: {matched_symbols}"
-                )
 
         logger.debug(f"Triton to OpSpec mapping: {mapping}")
         return mapping
@@ -616,11 +638,21 @@ class SpyreTritonKernel(TritonKernel):
         if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
             op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
 
-        # Try to determine reduction type from the value
-        if isinstance(value, CSEVariable):
-            # The actual reduction operation info might be in the CSEVariable
-            # For now, we'll use a generic reduction operation
-            pass
+        # Determine the reduction operation type from the IR node
+        data = self.current_node.node.data  # type: ignore[union-attr]
+        if not hasattr(data, "reduction_type"):
+            raise RuntimeError(
+                f"Reduction node missing reduction_type attribute: {data}"
+            )
+
+        # Map Triton reduction types to SDSC operation names
+        reduction_type = data.reduction_type
+        if reduction_type in ["dot", "matmul"]:
+            reduction_op = "matmul"
+        elif reduction_type == "sum":
+            reduction_op = "sum"
+        else:
+            raise Unsupported(f"Unsupported reduction type: {reduction_type}")
 
         if logger.isEnabledFor(logging.DEBUG):
             triton_is = self.get_triton_iteration_space(index)
@@ -668,7 +700,7 @@ class SpyreTritonKernel(TritonKernel):
                 )
 
         # Create and store the OpSpec with is_reduction=True
-        op_spec = self.create_op_spec("sum", True, args, op_info)
+        op_spec = self.create_op_spec(reduction_op, True, args, op_info)
         self.op_specs.append(op_spec)
 
         return super().store_reduction(name, index, value)
