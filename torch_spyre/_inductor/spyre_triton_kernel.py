@@ -1,12 +1,17 @@
 import sympy
 from typing import Optional, Any, Sequence
-from torch._inductor.codegen.triton import TritonKernel, FixedTritonConfig
+import torch.utils._pytree as pytree
+from torch._inductor.codegen.triton import (
+    TritonKernel,
+    FixedTritonConfig,
+    TritonOverrides,
+)
 from torch._inductor.virtualized import StoreMode, V
-from torch._inductor.codegen.common import CSEVariable
+from torch._inductor.codegen.common import CSEVariable, CSEProxy
 from torch._inductor.utils import IndentedBuffer, sympy_subs
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .spyre_kernel import TensorAccess, UnimplementedOp
+from .spyre_kernel import TensorAccess, UnimplementedOp, SpyreOpFuncs, PointwiseOp
 from .op_spec import OpSpec, TensorArg
 from .views import compute_coordinates
 from .pass_utils import iteration_space, apply_splits_from_index_coeff
@@ -117,6 +122,40 @@ class TritonOpSpecMapDict:
 logger = get_inductor_logger("spyre_triton_kernel")
 
 
+class SpyreTritonOverrides(TritonOverrides):
+    @staticmethod
+    def get_spyre_pointwise(
+        name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> Optional[PointwiseOp]:
+        if kwargs:
+            return None
+        if not hasattr(SpyreOpFuncs, name):
+            return None
+        spyre_func = getattr(SpyreOpFuncs, name)
+        result = spyre_func(*args)
+        return result if isinstance(result, PointwiseOp) else None
+
+
+class SpyreTritonCSEProxy(CSEProxy):
+    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        result = super()._default(name, args, kwargs)
+
+        if not isinstance(self.kernel, SpyreTritonKernel):
+            return result
+
+        spyre_pointwise = SpyreTritonOverrides.get_spyre_pointwise(name, args, kwargs)
+        if spyre_pointwise is None:
+            return result
+
+        def record_metadata(v: CSEVariable) -> CSEVariable:
+            kernel = self.kernel
+            if isinstance(kernel, SpyreTritonKernel):
+                kernel.cse_var_to_pointwise[str(v)] = spyre_pointwise
+            return v
+
+        return pytree.tree_map(record_metadata, result)
+
+
 class SpyreTritonKernel(TritonKernel):
     def __init__(
         self,
@@ -139,9 +178,19 @@ class SpyreTritonKernel(TritonKernel):
         self.spyre_kernel_args: list[tuple[str, TensorArg]] = []
         # Track loaded tensor args to use in store
         self.loaded_tensor_args: dict[str, TensorArg] = {}
+        # Track originating Spyre pointwise op for Triton CSE values
+        self.cse_var_to_pointwise: dict[str, PointwiseOp] = {}
         # Mapping from Triton prefixes (x, y, z, r0_, ...) to OpSpec iteration space symbols (c0, c1, ...)
         # Shows which OpSpec dimensions are flattened into each Triton dimension
         self.triton_opspec_map: dict[str, list[sympy.Symbol]] = {}
+
+    def __enter__(self):
+        super(TritonKernel, self).__enter__()
+        self.exit_stack.enter_context(
+            V.set_ops_handler(SpyreTritonCSEProxy(self, SpyreTritonOverrides()))
+        )
+        self.exit_stack.enter_context(V.set_kernel_handler(self))
+        return self
 
     def codegen_kernel(self, name=None) -> str:
         original_code = super().codegen_kernel(name)
@@ -243,8 +292,15 @@ class SpyreTritonKernel(TritonKernel):
                 f"opspec_is={opspec_is} opspec_index={opspec_index}"
             )
 
+        pointwise = self.cse_var_to_pointwise.get(str(value))
+        if pointwise is None:
+            raise Unsupported(
+                f"Could not recover Spyre pointwise op for Triton value {value}"
+            )
+
+        op_info.update(pointwise.op_info)
         self._create_opspec_for_store(
-            real_dst_name, output_tensor_arg, "add", False, op_info
+            real_dst_name, output_tensor_arg, pointwise.op, False, op_info
         )
 
     def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
@@ -278,14 +334,11 @@ class SpyreTritonKernel(TritonKernel):
                 f"Reduction node missing reduction_type attribute: {data}"
             )
 
-        # Map Triton reduction types to SDSC operation names
         reduction_type = data.reduction_type
         if reduction_type in ["dot", "matmul"]:
             reduction_op = "matmul"
-        elif reduction_type == "sum":
-            reduction_op = "sum"
         else:
-            raise Unsupported(f"Unsupported reduction type: {reduction_type}")
+            reduction_op = reduction_type
 
         output_tensor_arg = self._create_tensor_arg(False, real_dst_name, dst)
 
@@ -365,6 +418,7 @@ class SpyreTritonKernel(TritonKernel):
             The index expression from the matching MemoryDep
         """
         # Find the MemoryDep that matches the tensor name and access type
+        assert self.current_node is not None
         deps = (
             self.current_node.read_writes.reads
             if is_load
@@ -426,6 +480,7 @@ class SpyreTritonKernel(TritonKernel):
         For matmul, Triton creates separate dimensions for each axis (y, x, r0_)
         which map directly to OpSpec dimensions (c0, c1, c2).
         """
+        assert self.current_node is not None
         # Get the OpSpec iteration space (c0, c1, c2, ...)
         it_space = iteration_space(self.current_node)
         # Sort by symbol name to get consistent ordering (c0, c1, c2, ...)
@@ -544,6 +599,7 @@ class SpyreTritonKernel(TritonKernel):
                 "triton_opspec_map is not available - cannot compute block sizes"
             )
 
+        assert self.current_node is not None
         # Get OpSpec iteration space with core divisions
         it_space = iteration_space(self.current_node)
         ir_node = self.current_node.node
@@ -597,6 +653,7 @@ class SpyreTritonKernel(TritonKernel):
         self, is_input: bool, name: str, tensor: TensorAccess
     ) -> TensorArg:
         """Create a TensorArg following the same pattern as SpyreKernel"""
+        assert self.current_node is not None
         device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,  # type: ignore[arg-type]
             tensor.layout.device_layout.stride_map,  # type: ignore[arg-type]
@@ -632,6 +689,7 @@ class SpyreTritonKernel(TritonKernel):
             ]:
                 raise Unsupported(f"operation on {arg.device_dtype}")
 
+        assert self.current_node is not None
         it_space = iteration_space(self.current_node)
 
         ir_node = self.current_node.node  # ComputedBuffer
