@@ -303,6 +303,8 @@ class SpyreTritonKernel(TritonKernel):
             real_dst_name, output_tensor_arg, pointwise.op, False, op_info
         )
 
+        return super().store(name, index, value, mode)
+
     def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
         """Store reduction result and create OpSpec following SpyreKernel pattern"""
         if self.current_node is None:
