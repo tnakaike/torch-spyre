@@ -11,7 +11,13 @@ from torch._inductor.codegen.common import CSEVariable, CSEProxy
 from torch._inductor.utils import IndentedBuffer, sympy_subs
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .spyre_kernel import TensorAccess, UnimplementedOp, SpyreOpFuncs, PointwiseOp
+from .spyre_kernel import (
+    TensorAccess,
+    UnimplementedOp,
+    SpyreOpFuncs,
+    PointwiseOp,
+    simplify_op_spec,
+)
 from .op_spec import OpSpec, TensorArg
 from .views import compute_coordinates
 from .pass_utils import iteration_space, apply_splits_from_index_coeff
@@ -205,6 +211,12 @@ class SpyreTritonKernel(TritonKernel):
 
     def codegen_body(self):
         if self.triton_meta is not None:
+            # Simplify op_specs to align tensors and add singleton dimensions
+            # This matches the behavior of SpyreKernel
+            for op_spec in self.op_specs:
+                if not isinstance(op_spec, UnimplementedOp):
+                    simplify_op_spec(op_spec)
+
             # Convert op_specs to serializable format using wrapper classes
             # These classes have __repr__ methods that generate proper sympify() calls
             serializable_specs = []
@@ -317,8 +329,8 @@ class SpyreTritonKernel(TritonKernel):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
 
-        # Create index from iteration space variables
         opspec_index = self._get_opspec_index(name, is_load=False)
+
         dst = TensorAccess(name, opspec_index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
         if real_dst_name != name:
@@ -349,7 +361,7 @@ class SpyreTritonKernel(TritonKernel):
             opspec_is = iteration_space(self.current_node)
             logger.debug(
                 f"store_reduction: name={name} triton_is={triton_is} triton_index={index} "
-                f"opspec_is={opspec_is} opspec_index={opspec_index}"
+                f"opspec_is={opspec_is} opspec_index={opspec_index} (from input)"
             )
 
         self._create_opspec_for_store(
