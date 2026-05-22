@@ -16,6 +16,7 @@
 import torch
 
 from torch._inductor.choices import InductorChoices
+from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.scheduler import BaseSchedulerNode, Scheduler
 
 
@@ -58,3 +59,16 @@ class SpyreHeuristics(InductorChoices):
         shared_data_score: int,
     ) -> bool:
         return False
+
+    @staticmethod
+    def should_use_persistent_reduction(
+        features: SIMDKernelFeatures, cooperative_reduction: bool
+    ) -> bool:
+        """
+        Force persistent reduction to avoid generating loops in Triton kernels.
+
+        Persistent reduction eliminates the need for loops by using a fixed
+        R0_BLOCK size that covers the entire reduction dimension.
+        """
+        # Always use persistent reduction for Spyre backend
+        return True
