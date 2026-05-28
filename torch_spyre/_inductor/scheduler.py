@@ -336,6 +336,19 @@ class SuperDSCScheduling(BaseScheduling):
         """
         Generate a kernel given a list of pre-fused nodes.
         """
+        if isinstance(node, CountedLoopSchedulerNode):
+            self._codegen_counted_loop(node)
+            return
+
+        assert self.scheduler
+        nodes = [
+            node
+            for node in node.get_nodes()
+            if node.get_name() not in self.scheduler.removed_ops
+        ]
+        if len(nodes) == 0:
+            return
+
         # If TORCH_SPYRE_TRITON_FORCE=1, use Triton scheduling directly
         if os.getenv("TORCH_SPYRE_TRITON_FORCE") == "1":
             print("Using SpyreTritonKernel (forced)")

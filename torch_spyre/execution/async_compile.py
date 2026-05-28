@@ -29,7 +29,7 @@ from torch._inductor.runtime.triton_compat import (
     triton,
 )
 
-from torch_spyre._inductor.constants import SEGMENT_OFFSETS
+from torch_spyre._C import convert_artifacts
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
@@ -109,13 +109,4 @@ class SpyreAsyncCompile:
             "op_specs"
         ]
         _ = triton.compile(*compile_args, **compile_kwargs)
-        
-        # Set allocation addresses for tensor arguments
-        # This mimics what happens in spyre_kernel.py lines 628-634
-        for spec in specs:
-            if isinstance(spec, OpSpec):
-                for arg in spec.args:
-                    if not arg.allocation:  # Only set if not already set
-                        arg.allocation["hbm"] = SEGMENT_OFFSETS[arg.arg_index]
-        
         return self.sdsc(kernel_name, specs)
