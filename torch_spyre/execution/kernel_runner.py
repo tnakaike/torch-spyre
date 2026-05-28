@@ -40,8 +40,12 @@ class SpyreSDSCKernelRunner:
             self.jobplan = prepare_kernel(code_dir + "/spyreCodeDir")
 
     def run(self, *args, **kw_args):
+        import torch
+        # Filter to only include torch.Tensor arguments
+        actuals = [arg for arg in args if isinstance(arg, torch.Tensor)]
+
         logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
         if self.jobplan:
-            launch_jobplan(self.jobplan, args)
+            launch_jobplan(self.jobplan, actuals)
         else:
-            launch_kernel(self.code_dir, args)
+            launch_kernel(self.code_dir, actuals)
