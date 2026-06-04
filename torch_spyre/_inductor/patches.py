@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
+import os
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 
 import torch
 from torch._inductor.graph import GraphLowering
@@ -122,8 +123,18 @@ def enable_spyre_context(
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
 
+    if os.getenv("TORCH_SPYRE_TRITON") == "1":
+        from torch_spyre._inductor_triton.spyre_triton_patches import (
+            spyre_triton_patches,
+        )
+
+        triton_heuristics_cm: AbstractContextManager = spyre_triton_patches()
+    else:
+        triton_heuristics_cm = nullcontext()
+
     with (
         spyre_data_types(),
+        triton_heuristics_cm,
         enable_spyre_lowerings(),
         enable_spyre_decompositions(decomps=decomps) as spyre_context_decompositions,
         V.set_real_inputs(example_inputs),

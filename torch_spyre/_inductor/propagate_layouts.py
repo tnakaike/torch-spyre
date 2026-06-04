@@ -52,6 +52,7 @@ from . import config
 from .constants import (
     BATCH_MATMUL_OP,
     COPY_BACK_CANDIDATE_ATTR,
+    DOT_REDUCTION_OP,
     ELIDED_COPY_BACK_ATTR,
     TOPK_OPS,
 )
@@ -780,7 +781,10 @@ def compute_layouts(
     if len(args) > 1 and isinstance(data, Pointwise):
         return _multi_arg_pointwise_layouts(op, output, output_dep, args)
 
-    if isinstance(data, Reduction) and data.reduction_type == BATCH_MATMUL_OP:
+    if isinstance(data, Reduction) and data.reduction_type in (
+        BATCH_MATMUL_OP,
+        DOT_REDUCTION_OP,
+    ):
         return _matmul_layouts(op, output, output_dep, args)
 
     if isinstance(data, Reduction) and data.reduction_type == "exx2":
