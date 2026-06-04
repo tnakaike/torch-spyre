@@ -17,8 +17,7 @@ from collections.abc import Sequence
 from typing import Any
 import os
 import subprocess
-import tempfile
-from typing import Any, Union
+from typing import Union
 
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.runtime.runtime_utils import cache_dir
@@ -29,7 +28,6 @@ from torch._inductor.runtime.triton_compat import (
     triton,
 )
 
-from torch_spyre._C import convert_artifacts
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
