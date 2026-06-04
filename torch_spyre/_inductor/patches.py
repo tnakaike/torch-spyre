@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
+import os
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import wraps
 
 import torch
@@ -137,8 +138,18 @@ def enable_spyre_context(example_inputs: list[InputType]):
 
     SchedulerNode.has_side_effects = _spyre_scheduler_node_has_side_effects  # type: ignore[method-assign]
 
+    if os.getenv("TORCH_SPYRE_TRITON") == "1":
+        from torch_spyre._inductor_triton.spyre_triton_patches import (
+            spyre_triton_patches,
+        )
+
+        spyre_triton_patches_cm: AbstractContextManager = spyre_triton_patches()
+    else:
+        spyre_triton_patches_cm = nullcontext()
+
     with (
         spyre_data_types(),
+        spyre_triton_patches_cm,
         enable_spyre_lowerings(),
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),

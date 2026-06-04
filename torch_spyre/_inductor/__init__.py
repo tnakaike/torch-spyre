@@ -203,14 +203,33 @@ def _autoload():
             device=DEVICE_NAME, device_op_overrides=SpyreDeviceOpOverrides()
         )
 
-        from .scheduler import SuperDSCScheduling
         from .wrapper import SpyrePythonWrapperCodegen
 
-        register_backend_for_device(
-            DEVICE_NAME,
-            SuperDSCScheduling,
-            SpyrePythonWrapperCodegen,
-            device_custom_config=config,
-        )
+        import os
+
+        if os.getenv("TORCH_SPYRE_TRITON") == "1":
+            from torch_spyre._inductor_triton import (
+                SpyreTritonPythonWrapperCodegen,
+                SpyreTritonScheduling,
+            )
+            from torch._inductor import config as torch_config
+
+            torch_config.triton.native_matmul = True
+
+            register_backend_for_device(
+                DEVICE_NAME,
+                SpyreTritonScheduling,
+                SpyreTritonPythonWrapperCodegen,
+                device_custom_config=config,
+            )
+        else:
+            from .scheduler import SuperDSCScheduling
+
+            register_backend_for_device(
+                DEVICE_NAME,
+                SuperDSCScheduling,
+                SpyrePythonWrapperCodegen,
+                device_custom_config=config,
+            )
 
         _autoload._ran = True

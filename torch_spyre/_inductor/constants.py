@@ -15,6 +15,7 @@
 from torch_spyre._C import ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
+DOT_REDUCTION_OP = "dot"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
