@@ -24,10 +24,11 @@ from torch._inductor.codegen.triton import (
     FixedTritonConfig,
     TritonKernel,
     TritonSymbols,
+    get_triton_reduction_function,
 )
 from torch._inductor.utils import sympy_subs
-from torch._inductor.virtualized import StoreMode, V
-from torch.utils._sympy.functions import FloorDiv
+from torch._inductor.virtualized import ReductionType, StoreMode, V
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -208,8 +209,167 @@ class SpyreTritonKernel(TritonKernel):
         )
         self._emit_descriptor_store(name, desc_var, offset_var_names, layout, value)
 
+    def _get_reduction_axis(self) -> int:
+        """Return the device axis to pass to tl.sum for Spyre descriptor kernels.
+
+        The reduction symbol (e.g. c1 = 4096 elements) maps to two device
+        dimensions for stick layouts:
+          - NS  (outer stick): coord = c1 // stick_size  (FloorDiv) → reduce here
+          - NE  (inner stick): coord = c1 %  stick_size  (Mod)       → skip
+
+        Reducing over NS while leaving NE intact is correct: the Spyre KTIR
+        backend implicitly reduces NE in hardware when it sees a tt.reduce on
+        the outer stick axis.
+
+        For non-stick reductions (coord == c1 directly), returns the device
+        dimension that contains the reduction symbol without a Mod wrapper.
+        """
+        it_space = iteration_space(self.current_node)
+        write_dep = next(iter(self.current_node.read_writes.writes))
+        spatial_syms = set(write_dep.ranges.keys())
+        reduction_syms = [s for s in it_space if s not in spatial_syms]
+
+        if not reduction_syms:
+            return 0
+
+        for read_dep in self.current_node.read_writes.reads:
+            buf = V.graph.get_buffer(read_dep.name)
+            if buf is None:
+                continue
+            layout = buf.get_layout()
+            if not isinstance(layout, FixedTiledLayout):
+                continue
+
+            device_size = [int(s) for s in layout.device_layout.device_size]
+            dep_idx = sympy_subs(
+                read_dep.index, V.graph.sizevars.precomputed_replacements
+            )
+            dep_idx = concretize_index(dep_idx, set(it_space.keys()))
+            device_coords = compute_coordinates(
+                device_size, layout.device_layout.stride_map, it_space, dep_idx
+            )
+
+            for r_sym in reduction_syms:
+                for k, coord in enumerate(device_coords):
+                    if r_sym not in coord.free_symbols:
+                        continue
+                    # Skip Mod / ModularIndexing dims (inner stick = NE).
+                    # Only the FloorDiv or direct-symbol dim is the outer
+                    # stick (NS) that we want to reduce.
+                    if isinstance(coord, (sympy.Mod, ModularIndexing)):
+                        continue
+                    logger.debug(
+                        "SpyreTritonKernel: reduction axis=%d (sym=%s, coord=%s)",
+                        k,
+                        r_sym,
+                        coord,
+                    )
+                    return k
+            break  # only inspect the first FixedTiledLayout read dep
+
+        return 0  # fallback
+
+    def reduction(
+        self,
+        dtype: torch.dtype,
+        src_dtype: torch.dtype,
+        reduction_type: ReductionType,
+        value: CSEVariable,
+    ) -> CSEVariable:
+        """For Spyre descriptor kernels: reduce over the outer stick dimension.
+
+        Bypasses TritonKernel's broadcast_to pattern (incompatible with 3D
+        descriptor blocks) and emits the appropriate tl.* or triton_helpers.*
+        reduction call directly.
+
+        "dot" (matmul) and indexed reductions ("argmin", "argmax") are not
+        handled here — they are deferred to the parent which uses a different
+        code path.
+        """
+        if not self.triton_opspec_map or not self.current_node.is_reduction():
+            return super().reduction(dtype, src_dtype, reduction_type, value)
+
+        # Matmul and indexed reductions are structurally different from axis
+        # reductions; defer to TritonKernel for those.
+        if reduction_type in ("dot", "argmin", "argmax"):
+            return super().reduction(dtype, src_dtype, reduction_type, value)
+
+        # Upcast fp16/bf16 → float32 for all reduction types.  TritonKernel
+        # does this unconditionally because max/min don't support fp16/bf16.
+        if hasattr(value, "dtype") and value.dtype in (torch.float16, torch.bfloat16):
+            value = self.cse.generate(
+                self.compute,
+                f"{value}.to(tl.float32)",
+                dtype=torch.float32,
+                shape=getattr(value, "shape", None),
+            )
+
+        triton_fn = get_triton_reduction_function(reduction_type)
+        axis = self._get_reduction_axis()
+        val_shape = getattr(value, "shape", None)
+        result_shape = (
+            val_shape[:axis] + val_shape[axis + 1 :]
+            if (val_shape and axis < len(val_shape))
+            else None
+        )
+        result_dtype = getattr(value, "dtype", dtype)
+        return self.cse.generate(
+            self.compute,
+            f"{triton_fn}({value}, {axis})",
+            dtype=result_dtype,
+            shape=result_shape,
+        )
+
     def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
-        return super().store_reduction(name, index, value)
+        if not self.triton_opspec_map:
+            return super().store_reduction(name, index, value)
+
+        buf = V.graph.get_buffer(name)
+        layout = buf.get_layout() if buf is not None else None
+        if not isinstance(layout, FixedTiledLayout):
+            return super().store_reduction(name, index, value)
+
+        if "pool" in layout.allocation:
+            return super().store_reduction(name, index, value)
+
+        dep = next(
+            (d for d in self.current_node.read_writes.writes if d.name == name),
+            None,
+        )
+        if dep is None:
+            return super().store_reduction(name, index, value)
+
+        var = self.args.output(name)
+
+        if not self._opspec_dumped:
+            self._opspec_dumped = True
+            self._dump_opspec_json(name, dep)
+
+        desc_var, offset_var_names, block_shape = self._emit_tensor_descriptor(
+            name, var, dep, layout
+        )
+
+        # Downcast from float32 (reduction accumulation dtype) to output dtype.
+        out_dtype = V.graph.get_dtype(name)
+        if out_dtype in (torch.float16, torch.bfloat16):
+            triton_dtype = "tl.float16" if out_dtype == torch.float16 else "tl.bfloat16"
+            value = self.cse.generate(
+                self.stores,
+                f"{value}.to({triton_dtype})",
+                dtype=out_dtype,
+                shape=getattr(value, "shape", None),
+            )
+
+        # Reshape from (M, NE) to output block_shape (1, M, NE) so the tensor
+        # descriptor store receives a block matching its declared block_shape.
+        reshaped = self.cse.generate(
+            self.stores,
+            f"tl.reshape({value}, {list(block_shape)})",
+            dtype=out_dtype,
+            shape=tuple(str(s) for s in block_shape),
+        )
+
+        self._emit_descriptor_store(name, desc_var, offset_var_names, layout, reshaped)
 
     def _emit_tensor_descriptor(
         self,
@@ -438,10 +598,22 @@ class SpyreTritonKernel(TritonKernel):
 
         For each device dimension k, divides device_size[k] by the product of
         core divisors for all OpSpec symbols that appear in device_coords[k].
+
+        The stick dimension (device_rank - 1, the innermost device dimension) is
+        always 128 bytes / dtype element size (e.g. 64 for fp16/bf16).  It must
+        never be divided across cores — block_shape for that dim must equal
+        device_size[-1].  (See docs/source/user_guide/tensors_and_layouts.md and
+        docs/source/compiler/work_division_planning.md: work division only applies
+        to dims 0 through device_rank - 2; splits are always stick-aligned.)
         """
         it_space = iteration_space(self.current_node)
+        last_dim = len(device_size) - 1
         result = []
         for k, coord in enumerate(device_coords):
+            # Stick dimension: always full size — never divide.
+            if k == last_dim:
+                result.append(int(device_size[k]))
+                continue
             syms = coord.free_symbols & set(it_space.keys())
             divisor = 1
             for s in syms:
@@ -561,18 +733,29 @@ class SpyreTritonKernel(TritonKernel):
         if n_cores <= 1:
             return spyre_div
 
-        total_size = 1
-        for rng in it_space.values():
-            total_size *= V.graph.sizevars.size_hint(rng)
-        xblock = total_size // n_cores
+        # For reductions, xblock is based on SPATIAL dimensions only.
+        # Including the reduction range in total_size causes cores to be
+        # under-divided (core_div collapses to 1 for all spatial symbols).
+        spatial_total = 1
+        for prefix, syms in self.triton_opspec_map.items():
+            if prefix.startswith("r"):  # reduction prefix (r0_, r1_, ...)
+                continue
+            for sym in syms:
+                if sym in it_space:
+                    spatial_total *= V.graph.sizevars.size_hint(it_space[sym])
+        xblock = spatial_total // n_cores
 
         # Re-derive per-symbol core division from Triton range tree entries.
         # entry.divisor is the number of flat indices per unit of this symbol
         # (the "inner product" of all ranges that are inside / lower-stride).
         # Elements of symbol s per core = min(s_range, xblock // divisor).
+        # Reduction symbols are not divided across cores: core_div = 1.
         result: dict[sympy.Symbol, int] = {}
         for triton_sym, opspec_sym in self._triton_to_opspec.items():
             entry = self.range_tree_nodes[triton_sym]
+            if entry.prefix.startswith("r"):  # reduction symbol
+                result[opspec_sym] = 1
+                continue
             s_range = V.graph.sizevars.size_hint(it_space[opspec_sym])
             inner = V.graph.sizevars.size_hint(entry.divisor)
             if inner > 0 and xblock > 0:
@@ -596,6 +779,10 @@ class SpyreTritonKernel(TritonKernel):
         result: dict[str, int] = {}
         for prefix, syms in self.triton_opspec_map.items():
             if not syms:
+                continue
+            # R0_BLOCK / R1_BLOCK etc. are body constants in Triton reduction
+            # kernels, not constexpr parameters — omit them from fixed_config.
+            if prefix.startswith("r"):
                 continue
             total_cores = 1
             total_size = 1
