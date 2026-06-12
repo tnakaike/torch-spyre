@@ -23,6 +23,18 @@ from torch._inductor.utils import get_current_backend
 from torch._inductor.virtualized import V
 from torch.fx.experimental.symbolic_shapes import has_free_unbacked_symbols
 
+from torch_spyre._inductor.lowering import spyre_lowerings
+
+# Spyre mm lowerings use BATCH_MATMUL_OP with a tuple-valued inner_fn, which
+# SpyreKernel (SDSC) understands but TritonKernel cannot codegen.  The Triton
+# path relies on PyTorch's standard aten.mm lowering so that use_native_matmul
+# converts it to tl.dot.  These ops are popped from spyre_lowerings before
+# enable_spyre_lowerings() installs them, and restored on context exit.
+_TRITON_SKIP_MM_OPS = [
+    torch.ops.aten.mm.default,
+    torch.ops.aten.bmm.default,
+]
+
 
 def _patched_use_native_matmul(mat1, mat2) -> bool:
     """use_native_matmul with spyre added to supported device types.
@@ -107,9 +119,25 @@ class SpyreTritonPatches:
 @contextmanager
 def spyre_triton_patches():
     """Context manager to apply Spyre-specific monkey patches for Triton compilation."""
+    # Remove Spyre's BATCH_MATMUL_OP mm lowerings before enable_spyre_lowerings()
+    # installs them.  spyre_triton_patches() is entered before enable_spyre_lowerings()
+    # in patches.py, so the pop takes effect when the lowering pass runs.
+    saved_mm = {op: spyre_lowerings.pop(op, None) for op in _TRITON_SKIP_MM_OPS}
+
+    # Enable native matmul for the Spyre Triton path.  The default value is
+    # False (TORCHINDUCTOR_NATIVE_MATMUL=0), but Spyre's Triton kernels always
+    # handle mm via tl.dot — this must be True so SIMDKernel sets
+    # is_native_matmul=True and SpyreTritonOverrides.dot() is invoked.
+    saved_native_matmul = config.triton.native_matmul
+    config.triton.native_matmul = True
+
     saved = SpyreTritonPatches().patch()
     try:
         yield
     finally:
         for mod, orig in saved:
             mod.use_native_matmul = orig
+        for op, fn in saved_mm.items():
+            if fn is not None:
+                spyre_lowerings[op] = fn
+        config.triton.native_matmul = saved_native_matmul
