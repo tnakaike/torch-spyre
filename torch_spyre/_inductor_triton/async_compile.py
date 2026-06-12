@@ -46,8 +46,13 @@ class SpyreTritonAsyncCompile:
             compile_meta["cc"],
             cc_warp_size(compile_meta["cc"]),
         )
+        # spyre_grid is injected by SpyreTritonKernel.codegen_body() and
+        # carries the per-axis program count for SpyreOptions.grid.  The
+        # DistributeWork MLIR pass requires grid.size() == kernel pid rank.
+        spyre_grid = compile_meta.get("spyre_grid", (32,))
         compile_kwargs = {
             "target": target,
+            "options": {"grid": spyre_grid},
         }
         _ = triton.compile(*compile_args, **compile_kwargs)
         return None

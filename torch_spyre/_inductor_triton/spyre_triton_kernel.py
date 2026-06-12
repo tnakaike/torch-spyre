@@ -14,7 +14,7 @@
 
 import contextlib
 import json
-from typing import Optional
+from typing import Any, Optional
 
 import sympy
 import torch
@@ -69,8 +69,57 @@ def _normalize_floor_div(expr: sympy.Expr) -> sympy.Expr:
 
 logger = get_inductor_logger("spyre_triton_kernel")
 
+# TritonKernelOverrides is not publicly exported; access it via the class attr.
+_TritonKernelOverrides: type[Any] = TritonKernel.overrides
+
+
+class SpyreTritonOverrides(_TritonKernelOverrides):  # type: ignore[misc]
+    """TritonKernelOverrides subclass for SpyreTritonKernel.
+
+    Overrides ops.dot to handle 3D descriptor blocks: reshapes the loaded
+    [M_tile, K-sticks, K-elems] and [K, N-sticks, N-elems] blocks to 2D
+    matrices before calling tl.dot.
+    """
+
+    @staticmethod
+    def dot(a, b):  # type: ignore[override]
+        """Reshape 3D descriptor blocks to 2D and emit tl.dot."""
+        kernel = V.kernel
+        a_shape = getattr(a, "shape", None)
+        b_shape = getattr(b, "shape", None)
+
+        if a_shape and len(a_shape) == 3:
+            # A: [M_tile, K-sticks, K-elems] → [M_tile, K]
+            m_tile = int(a_shape[0])
+            k = int(a_shape[1]) * int(a_shape[2])
+            a_mat = kernel.cse.generate(
+                kernel.compute,
+                f"tl.reshape({a}, [{m_tile}, {k}])",
+                dtype=a.dtype,
+                shape=(str(m_tile), str(k)),
+            )
+        else:
+            a_mat = a
+
+        if b_shape and len(b_shape) == 3:
+            # B: [K, N-sticks, N-elems] → [K, N]
+            k2 = int(b_shape[0])
+            n = int(b_shape[1]) * int(b_shape[2])
+            b_mat = kernel.cse.generate(
+                kernel.compute,
+                f"tl.reshape({b}, [{k2}, {n}])",
+                dtype=b.dtype,
+                shape=(str(k2), str(n)),
+            )
+        else:
+            b_mat = b
+
+        return f'tl.dot({a_mat}, {b_mat}, input_precision="ieee")'
+
 
 class SpyreTritonKernel(TritonKernel):
+    overrides = SpyreTritonOverrides  # type: ignore[assignment]
+
     def __init__(
         self,
         tiling: dict[str, sympy.Expr],
@@ -140,7 +189,36 @@ class SpyreTritonKernel(TritonKernel):
         return super().codegen_kernel(name)
 
     def codegen_body(self):
+        # Inject spyre_grid into triton_meta so async_compile.py can pass
+        # the correct grid shape to SpyreOptions (and thus DistributeWork).
+        # triton_meta is set on self just before codegen_body() is called,
+        # and the same dict object is serialized into the generated Python —
+        # mutations here ARE reflected in the @fixed_config decorator call.
+        if self.triton_meta is not None and self.triton_opspec_map:
+            self.triton_meta["spyre_grid"] = self._compute_spyre_grid()
         return super().codegen_body()
+
+    def _compute_spyre_grid(self) -> tuple:
+        """Compute the per-axis program count for SpyreOptions.grid.
+
+        Returns a tuple (num_x_programs [, num_y_programs]) where:
+          grid[0] = programs on axis 0 (x = tl.program_id(0))
+          grid[1] = programs on axis 1 (y = tl.program_id(1)), if present
+
+        For a 1D pointwise kernel with XBLOCK=16384 and xnumel=524288 the
+        result is (32,).  For a 2D matmul kernel with XBLOCK=512/xnumel=512
+        and YBLOCK=8/ynumel=256 the result is (1, 32).
+        """
+        config = self.fixed_config.config if self.fixed_config else {}
+        grid = []
+        for prefix in ["x", "y", "z"]:
+            numel = self.numels.get(prefix)
+            if numel is None:
+                break
+            block = config.get(f"{prefix.upper()}BLOCK", 1)
+            numel_hint = V.graph.sizevars.size_hint(numel)
+            grid.append(max(1, (numel_hint + block - 1) // block))
+        return tuple(grid) if grid else (32,)
 
     def load(self, name: str, index: sympy.Expr):
         if not self.triton_opspec_map:
@@ -169,9 +247,14 @@ class SpyreTritonKernel(TritonKernel):
         )
         var = self.args.input(resolved)
 
-        desc_var, offset_var_names, block_shape = self._emit_tensor_descriptor(
-            name, var, dep, layout
-        )
+        if self.is_native_matmul:
+            desc_var, offset_var_names, block_shape = (
+                self._emit_matmul_tensor_descriptor(name, var, dep, layout)
+            )
+        else:
+            desc_var, offset_var_names, block_shape = self._emit_tensor_descriptor(
+                name, var, dep, layout
+            )
         return self._emit_descriptor_load(
             name, desc_var, offset_var_names, block_shape, layout
         )
@@ -289,8 +372,12 @@ class SpyreTritonKernel(TritonKernel):
         if not self.triton_opspec_map or not self.current_node.is_reduction():
             return super().reduction(dtype, src_dtype, reduction_type, value)
 
-        # Matmul and indexed reductions are structurally different from axis
-        # reductions; defer to TritonKernel for those.
+        # Matmul: the value is the 2D tl.dot result from SpyreTritonOverrides.dot().
+        # Pass it through to store_reduction() without any reshaping.
+        if reduction_type == "dot" and self.is_native_matmul:
+            return value
+
+        # Indexed reductions are structurally different; defer to TritonKernel.
         if reduction_type in ("dot", "argmin", "argmax"):
             return super().reduction(dtype, src_dtype, reduction_type, value)
 
@@ -345,9 +432,14 @@ class SpyreTritonKernel(TritonKernel):
             self._opspec_dumped = True
             self._dump_opspec_json(name, dep)
 
-        desc_var, offset_var_names, block_shape = self._emit_tensor_descriptor(
-            name, var, dep, layout
-        )
+        if self.is_native_matmul:
+            desc_var, offset_var_names, block_shape = (
+                self._emit_matmul_tensor_descriptor(name, var, dep, layout)
+            )
+        else:
+            desc_var, offset_var_names, block_shape = self._emit_tensor_descriptor(
+                name, var, dep, layout
+            )
 
         # Downcast from float32 (reduction accumulation dtype) to output dtype.
         out_dtype = V.graph.get_dtype(name)
@@ -360,8 +452,10 @@ class SpyreTritonKernel(TritonKernel):
                 shape=getattr(value, "shape", None),
             )
 
-        # Reshape from (M, NE) to output block_shape (1, M, NE) so the tensor
-        # descriptor store receives a block matching its declared block_shape.
+        # Reshape to the declared block_shape so the descriptor store receives
+        # a matching 3D block.
+        # For matmul: [M_tile, N] → [M_tile, N-sticks, N-elems]
+        # For sum:    [M, NE]     → [1, M, NE]
         reshaped = self.cse.generate(
             self.stores,
             f"tl.reshape({value}, {list(block_shape)})",
@@ -436,6 +530,94 @@ class SpyreTritonKernel(TritonKernel):
         self.prologue.writeline(DeferredLine(name, f"{desc_name} = {desc_line}"))
         logger.debug("SpyreTritonKernel: emitted %s = %s", desc_name, desc_line)
         return desc_name, offset_var_names, block_shape
+
+    @staticmethod
+    def _matmul_dim_permutation(device_coords: list) -> list:
+        """Return the permutation that places the direct-symbol dim first.
+
+        For standard Spyre 3D tensor device layouts the structure is always
+        [FloorDiv_expr, plain_symbol, Mod_expr].  Matmul descriptors need the
+        plain-symbol ("tiling") dimension first so that a single tl.reshape
+        converts the loaded 3D block into a 2D matrix for tl.dot without any
+        permute.
+
+        Returns the permutation as a list of indices, e.g. [1, 0, 2].
+        """
+        for k, coord in enumerate(device_coords):
+            if isinstance(coord, sympy.Symbol):
+                if k == 0:
+                    return list(range(len(device_coords)))
+                return [k] + [i for i in range(len(device_coords)) if i != k]
+        return list(range(len(device_coords)))
+
+    def _emit_matmul_tensor_descriptor(
+        self,
+        name: str,
+        var: str,
+        dep,
+        layout: "FixedTiledLayout",
+    ) -> tuple[str, list[str], list]:
+        """Emit tl.make_tensor_descriptor with matmul dimension reordering.
+
+        For matmul, the descriptor dimensions are permuted so the "tiling"
+        dimension (M for A/C, K for B) is first.  This allows the loaded 3D
+        block to be reshaped to 2D via a single tl.reshape before tl.dot,
+        without any transpose.
+
+        The permutation is [1, 0, 2] for standard Spyre 3D layouts.
+
+        Returns (desc_var, offset_var_names, permuted_block_shape).
+        """
+        it_space = iteration_space(self.current_node)
+        device_size = [int(s) for s in layout.device_layout.device_size]
+
+        dep_index = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
+        dep_index = concretize_index(dep_index, set(it_space.keys()))
+
+        device_coords = compute_coordinates(
+            device_size,
+            layout.device_layout.stride_map,
+            it_space,
+            dep_index,
+        )
+
+        perm = self._matmul_dim_permutation(device_coords)
+
+        phys_strides = self._row_major_strides(device_size)
+        phys_block_shape = self._device_block_shape(device_size, device_coords)
+
+        perm_size = [device_size[p] for p in perm]
+        perm_strides = [phys_strides[p] for p in perm]
+        perm_block_shape = [phys_block_shape[p] for p in perm]
+        perm_coords = [device_coords[p] for p in perm]
+
+        offset_var_names = self._emit_scalar_offsets(name, perm_coords)
+
+        f = self.index_to_str
+        desc_line = (
+            f"tl.make_tensor_descriptor("
+            f"{var}, "
+            f"shape={f(perm_size)}, "
+            f"strides={f(perm_strides)}, "
+            f"block_shape={f(perm_block_shape)})"
+        )
+
+        existing = self.cse.try_get(desc_line)
+        if existing:
+            return str(existing), offset_var_names, perm_block_shape
+
+        block_ptr_id = next(self.block_ptr_id)
+        desc_name = f"desc_{block_ptr_id}"
+        named_var = self.cse.namedvar(desc_name, dtype=torch.uint64, shape=[])
+        self.cse.put(desc_line, named_var)
+        self.prologue.writeline(DeferredLine(name, f"{desc_name} = {desc_line}"))
+        logger.debug(
+            "SpyreTritonKernel: matmul desc %s = %s (perm=%s)",
+            desc_name,
+            desc_line,
+            perm,
+        )
+        return desc_name, offset_var_names, perm_block_shape
 
     def _emit_descriptor_load(
         self,
@@ -724,6 +906,14 @@ class SpyreTritonKernel(TritonKernel):
             read_index,
             it_space,
         )
+
+        # For native matmul, Triton uses an independent 2D grid (program_id(1)
+        # for y=M, program_id(0) for x=N) — the range-tree re-derivation below
+        # assumes a flat 1D xblock layout and produces wrong results.
+        # apply_splits_from_index_coeff already returns the correct per-symbol
+        # division directly from op_it_space_splits, so return it as-is.
+        if self.is_native_matmul:
+            return spyre_div
 
         # Total core count is always correct even when the per-symbol
         # assignment is wrong (the product is always n_cores = 32).
