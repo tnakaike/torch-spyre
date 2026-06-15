@@ -26,7 +26,8 @@ from torch._inductor.codegen.triton import (
     TritonSymbols,
     get_triton_reduction_function,
 )
-from torch._inductor.utils import sympy_subs
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.utils import IndentedBuffer, sympy_subs
 from torch._inductor.virtualized import ReductionType, StoreMode, V
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
@@ -155,6 +156,13 @@ class SpyreTritonKernel(TritonKernel):
         self._device_offset_vars: dict[tuple, list[str]] = {}
         # Guard: dump opspec.json only once per kernel instance.
         self._opspec_dumped: bool = False
+        # Tiling loop state (set by SpyreTritonScheduling for CountedLoopSchedulerNode).
+        self._tiling_loop_count: Optional[int] = None
+        self._tiling_loop_tiled_syms: list[sympy.Symbol] = []
+        # Maps each tiled symbol to its per-tile range (tile_step to add per iteration).
+        self._tiling_tile_steps: dict[sympy.Symbol, int] = {}
+        # Buffer for Logical→Device assignments emitted inside the tile loop.
+        self._loop_offset_code: Optional[IndentedBuffer] = None
 
     def __enter__(self):
         super(TritonKernel, self).__enter__()
@@ -189,6 +197,15 @@ class SpyreTritonKernel(TritonKernel):
         return super().codegen_kernel(name)
 
     def codegen_body(self):
+        if self._tiling_loop_count is not None:
+            # Scale spatial range-tree numels by tile_count so that
+            # codegen_static_numels() (called by codegen_kernel() after this
+            # method) writes xnumel = full_tensor_numel instead of the
+            # per-tile numel of the inner SchedulerNode.
+            for tree in self.range_trees:
+                if not tree.prefix.startswith("r"):
+                    tree.numel = tree.numel * int(self._tiling_loop_count)
+
         # Inject spyre_grid into triton_meta so async_compile.py can pass
         # the correct grid shape to SpyreOptions (and thus DistributeWork).
         # triton_meta is set on self just before codegen_body() is called,
@@ -196,7 +213,61 @@ class SpyreTritonKernel(TritonKernel):
         # mutations here ARE reflected in the @fixed_config decorator call.
         if self.triton_meta is not None and self.triton_opspec_map:
             self.triton_meta["spyre_grid"] = self._compute_spyre_grid()
-        return super().codegen_body()
+
+        if self._tiling_loop_count is None:
+            return super().codegen_body()
+        return self._codegen_tile_loop_body()
+
+    def _codegen_tile_loop_body(self) -> None:
+        """Emit the tiling-loop body: indexing_code outside, loop wrapping the rest.
+
+        Called when _tiling_loop_count is set (CountedLoopSchedulerNode path).
+        Only pointwise (non-reduction) kernels are supported; reduction kernels
+        fall through to the standard TritonKernel codegen_body path unchanged.
+        """
+        if self.inside_reduction:
+            # Reduction tiling is not yet supported — fall back to the standard
+            # TritonKernel body (no tile loop).
+            TritonKernel.codegen_body(self)
+            return
+
+        if not (
+            self.indexing_code
+            or self.loads
+            or self.stores
+            or self.compute
+            or self.post_loop_combine
+            or self.post_loop_store
+        ):
+            return
+
+        # Pointwise: indexing_code is stable per program invocation and goes
+        # OUTSIDE the tile loop.
+        self.body.splice(self.indexing_code)
+        self.indexing_code.clear()
+
+        # Emit the tile loop.
+        assert self._tiling_loop_count is not None
+        self.body.writeline(
+            f"for tile_idx in tl.range({int(self._tiling_loop_count)}):"
+        )
+        with self.body.indent():
+            # Logical→Device offset variables (with tile_idx adjustment for
+            # tiled dims) go inside the loop so tile_idx is in scope.
+            if self._loop_offset_code:
+                self.body.splice(self._loop_offset_code)
+                self._loop_offset_code.clear()
+            self.body.splice(self.loads)
+            self.body.splice(self.compute)
+            self.body.splice(self.stores)
+
+        self.loads.clear()
+        self.compute.clear()
+        self.stores.clear()
+        if hasattr(self, "post_loop_combine"):
+            self.post_loop_combine.clear()
+        if hasattr(self, "post_loop_store"):
+            self.post_loop_store.clear()
 
     def _compute_spyre_grid(self) -> tuple:
         """Compute the per-axis program count for SpyreOptions.grid.
@@ -218,7 +289,8 @@ class SpyreTritonKernel(TritonKernel):
             block = config.get(f"{prefix.upper()}BLOCK", 1)
             numel_hint = V.graph.sizevars.size_hint(numel)
             grid.append(max(1, (numel_hint + block - 1) // block))
-        return tuple(grid) if grid else (32,)
+        assert grid, "_compute_spyre_grid: no x-range numel found in self.numels"
+        return tuple(grid)
 
     def load(self, name: str, index: sympy.Expr):
         if not self.triton_opspec_map:
@@ -699,15 +771,44 @@ class SpyreTritonKernel(TritonKernel):
         # --- Logical layouts -> Device layouts ---
         # device_coords already reference c0, c1, ... (OpSpec symbols).
         # After _normalize_floor_div they print as integer // using those names.
+        #
+        # In tiling-loop mode: emit to _loop_offset_code (inside the tile loop)
+        # so tile_idx is in scope. Tiled dims get "+tile_idx * tile_step" added.
+        # In non-tiling mode: emit to prologue as before.
+        tiling = (
+            self._tiling_loop_count is not None and self._loop_offset_code is not None
+        )
+        target_buf = self._loop_offset_code if tiling else self.prologue
         group = len(self._device_offset_vars)
-        self.prologue.writeline("# Logical layouts -> Device layouts")
+        target_buf.writeline("# Logical layouts -> Device layouts")
         offset_var_names: list[str] = []
         for k, coord in enumerate(device_coords):
             fixed_coord = _normalize_floor_div(coord)
             var_name = f"dim{k}" if group == 0 else f"dim_{group}_{k}"
-            self.prologue.writeline(
-                DeferredLine(name, f"{var_name} = {f(fixed_coord)}")
-            )
+            if tiling:
+                tiled_syms_in_coord = coord.free_symbols & set(
+                    self._tiling_loop_tiled_syms
+                )
+                tile_offset_parts = []
+                for sym in tiled_syms_in_coord:
+                    step = self._tiling_tile_steps.get(sym, 0)
+                    if step > 0:
+                        tile_offset_parts.append(f"tile_idx * {step}")
+                if tile_offset_parts:
+                    offset_str = " + ".join(tile_offset_parts)
+                    target_buf.writeline(
+                        DeferredLine(
+                            name, f"{var_name} = {f(fixed_coord)} + {offset_str}"
+                        )
+                    )
+                else:
+                    target_buf.writeline(
+                        DeferredLine(name, f"{var_name} = {f(fixed_coord)}")
+                    )
+            else:
+                target_buf.writeline(
+                    DeferredLine(name, f"{var_name} = {f(fixed_coord)}")
+                )
             offset_var_names.append(var_name)
 
         self._device_offset_vars[coords_key] = offset_var_names
@@ -726,6 +827,8 @@ class SpyreTritonKernel(TritonKernel):
         it_space = iteration_space(self.current_node)
 
         def _tensor_arg_dict(name: str, dep, is_input: bool) -> dict | None:
+            if not isinstance(dep, MemoryDep):
+                return None
             buf = V.graph.get_buffer(name)
             if buf is None:
                 return None
@@ -790,6 +893,10 @@ class SpyreTritonKernel(TritonKernel):
         """
         it_space = iteration_space(self.current_node)
         last_dim = len(device_size) - 1
+        loop_count = self._tiling_loop_count
+        tiled_syms = (
+            set(self._tiling_loop_tiled_syms) if loop_count is not None else set()
+        )
         result = []
         for k, coord in enumerate(device_coords):
             # Stick dimension: always full size — never divide.
@@ -800,6 +907,11 @@ class SpyreTritonKernel(TritonKernel):
             divisor = 1
             for s in syms:
                 divisor *= self._core_division.get(s, 1)
+                # block_shape is used per tile-loop iteration, so also divide
+                # by tile_count for tiled symbols.
+                if s in tiled_syms:
+                    assert loop_count is not None
+                    divisor *= loop_count
             size_hint = V.graph.sizevars.size_hint(device_size[k])
             result.append(max(1, size_hint // max(1, divisor)))
         return result
@@ -976,10 +1088,21 @@ class SpyreTritonKernel(TritonKernel):
                 continue
             total_cores = 1
             total_size = 1
+            loop_count = self._tiling_loop_count
+            tiled_syms = (
+                set(self._tiling_loop_tiled_syms) if loop_count is not None else set()
+            )
             for sym in syms:
                 total_cores *= self._core_division.get(sym, 1)
                 if sym in it_space:
-                    total_size *= V.graph.sizevars.size_hint(it_space[sym])
+                    size = V.graph.sizevars.size_hint(it_space[sym])
+                    # For tiled symbols, multiply by tile_count so XBLOCK
+                    # covers the full per-core range (tile_count tiles × per-tile
+                    # per-core range). This makes xoffset = pid * per_core_total.
+                    if sym in tiled_syms:
+                        assert loop_count is not None
+                        size *= loop_count
+                    total_size *= size
             result[prefix] = max(1, total_size // total_cores)
 
         logger.debug("triton_block_size=%s", result)
