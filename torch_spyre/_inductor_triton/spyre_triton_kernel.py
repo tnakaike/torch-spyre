@@ -872,10 +872,25 @@ class SpyreTritonKernel(TritonKernel):
                 for sym, rng in it_space.items()
             },
             "args": args,
+            "tiled_symbols": [str(s) for s in self._tiling_loop_tiled_syms],
         }
 
+        # When a tiling loop is active (CountedLoopSchedulerNode path), the op is
+        # wrapped in a LoopSpec. Mirror that structure in the dump so the JSON
+        # matches the LoopSpec(count, body, tiled_symbols) emitted to the runtime.
+        if self._tiling_loop_count is not None:
+            payload: dict = {
+                "loop_spec": {
+                    "count": int(self._tiling_loop_count),
+                    "tiled_symbols": [str(s) for s in self._tiling_loop_tiled_syms],
+                    "body": [opspec],
+                }
+            }
+        else:
+            payload = opspec
+
         with debug.fopen_context("opspec.json") as f:
-            json.dump(opspec, f, indent=2)
+            json.dump(payload, f, indent=2)
         logger.debug("SpyreTritonKernel: dumped opspec to %s/opspec.json", debug._path)
 
     def _device_block_shape(self, device_size: list, device_coords: list) -> list:
