@@ -19,7 +19,7 @@ from typing import Any, Optional
 import sympy
 import torch
 
-from torch._inductor.codegen.common import CSEVariable, DeferredLine
+from torch._inductor.codegen.common import CSEProxy, CSEVariable, DeferredLine
 from torch._inductor.codegen.triton import (
     FixedTritonConfig,
     TritonKernel,
@@ -30,9 +30,11 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.utils import IndentedBuffer, sympy_subs
 from torch._inductor.virtualized import ReductionType, StoreMode, V
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
+from torch.utils._sympy.symbol import SymT, symbol_is_type
 
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.op_spec import IndexLoad
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
     concretize_index,
@@ -118,6 +120,36 @@ class SpyreTritonOverrides(_TritonKernelOverrides):  # type: ignore[misc]
         return f'tl.dot({a_mat}, {b_mat}, input_precision="ieee")'
 
 
+class _SpyreGatherCSEProxy(CSEProxy):
+    """CSEProxy that skips the upstream negative-index wrap + bounds-check for
+    ``indirect_indexing``.
+
+    Upstream ``CSEProxy.indirect_indexing`` emits
+    ``ops.add(index, index_expr(size))`` (plus ``where`` / ``device_assert``)
+    and propagates shapes by broadcasting.  That broadcast is incompatible with
+    SpyreTritonKernel's device-tile-shaped descriptor loads: the loaded index
+    carries its device block shape (e.g. ``(1, 32)``), not the kernel's
+    iteration shape (e.g. ``(XBLOCK,)``), so the broadcast asserts whenever they
+    do not match (it happens to broadcast for some tilings, which is why a 2-D
+    source slips through but a 1-D-flattened one does not).
+
+    The Spyre gather addresses with the raw index buffer, so the wrap result and
+    the bounds assert are unused for addressing.  We mint the index symbol
+    directly (matching the SDSC ``SpyreKernel`` path) and skip both.
+    """
+
+    def indirect_indexing(
+        self,
+        var: CSEVariable,
+        size: Any,
+        check: bool = True,
+        wrap_neg: bool = True,
+    ) -> sympy.Symbol:
+        if isinstance(size, int):
+            size = sympy.Integer(size)
+        return self.parent_handler.indirect_indexing(var, size, check)
+
+
 class SpyreTritonKernel(TritonKernel):
     overrides = SpyreTritonOverrides  # type: ignore[assignment]
 
@@ -163,9 +195,25 @@ class SpyreTritonKernel(TritonKernel):
         self._tiling_tile_steps: dict[sympy.Symbol, int] = {}
         # Buffer for Logical→Device assignments emitted inside the tile loop.
         self._loop_offset_code: Optional[IndentedBuffer] = None
+        # Set True in load() when an indirect (gather) load is emitted; read by
+        # store() to permute the output descriptor (gathered/output-row axis to
+        # dim 0) so the gather result block stores directly.
+        self._is_gather: bool = False
+        # The gathered output-row iteration symbol (the index dep's symbol, e.g.
+        # c0).  Set during the gather load; used by store() to permute the
+        # output-row device dim to dim 0 so the row-first gather result stores
+        # directly (matching shape with the gather result).
+        self._gather_row_sym: Optional[sympy.Symbol] = None
 
     def __enter__(self):
         super(TritonKernel, self).__enter__()
+        # Stack a CSEProxy that skips the upstream indirect_indexing wrap /
+        # bounds-check codegen (incompatible with device-tile-shaped descriptor
+        # loads).  This shadows the standard CSEProxy installed by the base
+        # __enter__; all other ops behave identically.
+        self.exit_stack.enter_context(
+            V.set_ops_handler(_SpyreGatherCSEProxy(self, self.overrides()))
+        )
         return self
 
     def split_and_set_ranges(self, lengths):
@@ -319,9 +367,17 @@ class SpyreTritonKernel(TritonKernel):
         )
         var = self.args.input(resolved)
 
+        # Indirect (gather) load: a device coordinate references an indirect
+        # SymT.TMP symbol (the loaded index). Route to the gather primitive
+        # instead of a plain descriptor offset load (which the Spyre Triton
+        # backend cannot lower).
+        k_star, device_coords = self._gather_indirect_dim(dep, layout)
+        if k_star is not None:
+            return self._emit_gather_load(name, var, dep, layout, k_star, device_coords)
+
         if self.is_native_matmul:
             desc_var, offset_var_names, block_shape = (
-                self._emit_matmul_tensor_descriptor(name, var, dep, layout)
+                self._emit_symbol_first_tensor_descriptor(name, var, dep, layout)
             )
         else:
             desc_var, offset_var_names, block_shape = self._emit_tensor_descriptor(
@@ -359,9 +415,21 @@ class SpyreTritonKernel(TritonKernel):
             self._opspec_dumped = True
             self._dump_opspec_json(name, dep)
 
-        desc_var, offset_var_names, block_shape = self._emit_tensor_descriptor(
-            name, var, dep, layout
-        )
+        if self._is_gather:
+            # Gather output: the gather result block is [num_rows, *rest], with
+            # the output-row axis at dim 0.  Permute the output device dim whose
+            # coordinate is the index's iteration symbol (self._gather_row_sym)
+            # to dim 0, so the row-first gather result stores with matching shape
+            # (not just the first bare symbol, which is wrong for >=3D sources).
+            desc_var, offset_var_names, block_shape = (
+                self._emit_symbol_first_tensor_descriptor(
+                    name, var, dep, layout, row_sym=self._gather_row_sym
+                )
+            )
+        else:
+            desc_var, offset_var_names, block_shape = self._emit_tensor_descriptor(
+                name, var, dep, layout
+            )
         self._emit_descriptor_store(name, desc_var, offset_var_names, layout, value)
 
     def _get_reduction_axis(self) -> int:
@@ -506,7 +574,7 @@ class SpyreTritonKernel(TritonKernel):
 
         if self.is_native_matmul:
             desc_var, offset_var_names, block_shape = (
-                self._emit_matmul_tensor_descriptor(name, var, dep, layout)
+                self._emit_symbol_first_tensor_descriptor(name, var, dep, layout)
             )
         else:
             desc_var, offset_var_names, block_shape = self._emit_tensor_descriptor(
@@ -604,14 +672,16 @@ class SpyreTritonKernel(TritonKernel):
         return desc_name, offset_var_names, block_shape
 
     @staticmethod
-    def _matmul_dim_permutation(device_coords: list) -> list:
-        """Return the permutation that places the direct-symbol dim first.
+    def _symbol_first_permutation(device_coords: list) -> list:
+        """Return the permutation that places the plain-symbol dim first.
 
         For standard Spyre 3D tensor device layouts the structure is always
-        [FloorDiv_expr, plain_symbol, Mod_expr].  Matmul descriptors need the
-        plain-symbol ("tiling") dimension first so that a single tl.reshape
-        converts the loaded 3D block into a 2D matrix for tl.dot without any
-        permute.
+        [FloorDiv_expr, plain_symbol, Mod_expr].  This moves the device
+        dimension whose coordinate is a bare iteration symbol (not a
+        FloorDiv/Mod stick split) to position 0.  Callers want that dim
+        leading: matmul reshapes the loaded 3D block to a 2D matrix for
+        tl.dot via a single tl.reshape; the gather output store puts the
+        output-row axis first so the gather result stores directly.
 
         Returns the permutation as a list of indices, e.g. [1, 0, 2].
         """
@@ -622,21 +692,48 @@ class SpyreTritonKernel(TritonKernel):
                 return [k] + [i for i in range(len(device_coords)) if i != k]
         return list(range(len(device_coords)))
 
-    def _emit_matmul_tensor_descriptor(
+    def _gather_output_permutation(
+        self, device_coords: list, row_sym: Optional[sympy.Symbol]
+    ) -> list:
+        """Permutation that places the gathered output-row axis first.
+
+        The gather result is row-first (``[num_rows, ...]``), so the output
+        store must put the dense output-row device dim — the dim whose
+        coordinate is the index's iteration symbol ``row_sym`` (e.g. c0) — at
+        position 0, matching the gather result's shape without a transpose.
+
+        Unlike ``_symbol_first_permutation`` (which takes the *first* bare
+        symbol — wrong when an outer dim such as c1 precedes the row axis, as in
+        a >=3D source), this targets ``row_sym`` specifically.  Falls back to
+        ``_symbol_first_permutation`` when ``row_sym`` is unknown or absent.
+        """
+        if row_sym is not None:
+            for k, coord in enumerate(device_coords):
+                if coord == row_sym:
+                    if k == 0:
+                        return list(range(len(device_coords)))
+                    return [k] + [i for i in range(len(device_coords)) if i != k]
+        return self._symbol_first_permutation(device_coords)
+
+    def _emit_symbol_first_tensor_descriptor(
         self,
         name: str,
         var: str,
         dep,
         layout: "FixedTiledLayout",
+        row_sym: Optional[sympy.Symbol] = None,
     ) -> tuple[str, list[str], list]:
-        """Emit tl.make_tensor_descriptor with matmul dimension reordering.
+        """Emit tl.make_tensor_descriptor with a chosen device dim permuted first.
 
-        For matmul, the descriptor dimensions are permuted so the "tiling"
-        dimension (M for A/C, K for B) is first.  This allows the loaded 3D
-        block to be reshaped to 2D via a single tl.reshape before tl.dot,
-        without any transpose.
+        The descriptor dimensions are reordered so a chosen device dim leads at
+        position 0.  Used where that dim must be outermost:
 
-        The permutation is [1, 0, 2] for standard Spyre 3D layouts.
+        - matmul (``row_sym=None``): the plain-symbol (tiling) dim — M for A/C,
+          K for B — so the loaded 3D block reshapes to 2D for tl.dot without a
+          transpose (``_symbol_first_permutation``).
+        - gather output store (``row_sym`` set): the output-row dim whose
+          coordinate is the index's iteration symbol, so the row-first gather
+          result stores with matching shape (``_gather_output_permutation``).
 
         Returns (desc_var, offset_var_names, permuted_block_shape).
         """
@@ -653,7 +750,10 @@ class SpyreTritonKernel(TritonKernel):
             dep_index,
         )
 
-        perm = self._matmul_dim_permutation(device_coords)
+        if row_sym is not None:
+            perm = self._gather_output_permutation(device_coords, row_sym)
+        else:
+            perm = self._symbol_first_permutation(device_coords)
 
         phys_strides = self._row_major_strides(device_size)
         phys_block_shape = self._device_block_shape(device_size, device_coords)
@@ -684,12 +784,278 @@ class SpyreTritonKernel(TritonKernel):
         self.cse.put(desc_line, named_var)
         self.prologue.writeline(DeferredLine(name, f"{desc_name} = {desc_line}"))
         logger.debug(
-            "SpyreTritonKernel: matmul desc %s = %s (perm=%s)",
+            "SpyreTritonKernel: symbol-first desc %s = %s (perm=%s, row_sym=%s)",
             desc_name,
             desc_line,
             perm,
+            row_sym,
         )
         return desc_name, offset_var_names, perm_block_shape
+
+    def _gather_indirect_dim(
+        self, dep, layout: "FixedTiledLayout"
+    ) -> tuple[Optional[int], list]:
+        """Detect an indirect (gather) load.
+
+        Returns ``(k, device_coords)`` where ``k`` is the device dimension whose
+        coordinate references an indirect ``SymT.TMP`` symbol (the loaded index,
+        i.e. the gathered axis), or ``(None, device_coords)`` for a plain load.
+        """
+        it_space = iteration_space(self.current_node)
+        device_size = [int(s) for s in layout.device_layout.device_size]
+        dep_index = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
+        dep_index = concretize_index(dep_index, set(it_space.keys()))
+        device_coords = compute_coordinates(
+            device_size,
+            layout.device_layout.stride_map,
+            it_space,
+            dep_index,
+        )
+        for k, coord in enumerate(device_coords):
+            if any(symbol_is_type(s, SymT.TMP) for s in coord.free_symbols):
+                return k, device_coords
+        return None, device_coords
+
+    def _emit_gather_load(
+        self,
+        name: str,
+        var: str,
+        dep,
+        layout: "FixedTiledLayout",
+        k_star: int,
+        device_coords: list,
+    ) -> CSEVariable:
+        """Emit a gather for an indirect value load.
+
+        Uses the index buffer's multi-D device-layout load directly as
+        ``x_offsets`` (no flatten — preserves layout), permutes the indirect
+        axis to descriptor dim 0 via permuted strides, and emits
+        ``desc.gather(x_offsets, y_offset)``.
+        """
+        self._is_gather = True
+        indirect_syms = {
+            s
+            for coord in device_coords
+            for s in coord.free_symbols
+            if symbol_is_type(s, SymT.TMP)
+        }
+        if len(indirect_syms) != 1:
+            raise NotImplementedError(
+                "gather supports exactly one indirect index symbol, got "
+                f"{sorted(map(str, indirect_syms))}"
+            )
+        indirect_sym = next(iter(indirect_syms))
+
+        x_offsets, idx_shape, num_rows = self._emit_index_xoffsets(indirect_sym)
+        desc_var, y_offset, block_shape = self._emit_gather_descriptor(
+            name, var, dep, layout, k_star, device_coords
+        )
+        return self._emit_descriptor_gather(
+            name, desc_var, x_offsets, y_offset, block_shape, idx_shape, num_rows
+        )
+
+    def _emit_index_xoffsets(self, indirect_sym: sympy.Symbol) -> tuple[str, list, int]:
+        """Resolve ``x_offsets`` to the index buffer's multi-D device load.
+
+        The indirect ``SymT.TMP`` symbol's name *is* the CSE variable produced by
+        the upstream index descriptor load (emitted earlier in ``self.loads`` by
+        the normal ``_emit_tensor_descriptor`` path, because the index load runs
+        before the value load).  We use that multi-D load **directly** as
+        ``x_offsets`` — no flatten, so the index's device layout is preserved
+        into the gather.  This requires the relaxed Triton verifier
+        that accepts a >1D ``x_offsets`` on the Spyre target.
+
+        Returns ``(x_offsets_var_name, idx_block_shape, num_rows)`` where
+        ``idx_block_shape`` is the per-core device block of the index load and
+        ``num_rows`` is its element count (the number of gathered rows).
+        """
+        it_space = iteration_space(self.current_node)
+        # The index buffer is the lone int32 FixedTiledLayout read dep (the
+        # current implementation supports a single 1-D index tensor only).
+        idx_dep = None
+        idx_layout = None
+        for d in self.current_node.read_writes.reads:
+            b = V.graph.get_buffer(d.name)
+            if b is None:
+                continue
+            lay = b.get_layout()
+            if isinstance(lay, FixedTiledLayout) and (
+                V.graph.get_dtype(d.name) == torch.int32
+            ):
+                idx_dep, idx_layout = d, lay
+                break
+        if idx_dep is None or idx_layout is None:
+            raise NotImplementedError(
+                "gather: could not locate the int32 index buffer read dep"
+            )
+
+        idx_size = [int(s) for s in idx_layout.device_layout.device_size]
+        idx_index = sympy_subs(idx_dep.index, V.graph.sizevars.precomputed_replacements)
+        idx_index = concretize_index(idx_index, set(it_space.keys()))
+        idx_coords = compute_coordinates(
+            idx_size, idx_layout.device_layout.stride_map, it_space, idx_index
+        )
+
+        # The gathered output-row axis is the index dep's iteration symbol (e.g.
+        # c0).  store() permutes the output device dim with this coordinate to
+        # dim 0 so the row-first gather result stores with matching shape.
+        row_syms = idx_index.free_symbols & set(it_space.keys())
+        self._gather_row_sym = next(iter(row_syms)) if len(row_syms) == 1 else None
+        # Per-core device block of the index load == the x_offsets tensor shape
+        # (the upstream _emit_tensor_descriptor used the same _device_block_shape).
+        idx_block = self._device_block_shape(idx_size, idx_coords)
+        num_rows = 1
+        for b in idx_block:
+            num_rows *= int(b)
+        if num_rows < 8:
+            raise NotImplementedError(
+                f"gather: x_offsets must have >= 8 rows, got {num_rows}"
+            )
+
+        # x_offsets is the upstream multi-D index load (its CSE var name is the
+        # indirect symbol's name); no extra descriptor or load is emitted.
+        x_offsets = str(indirect_sym)
+        logger.debug(
+            "SpyreTritonKernel: gather x_offsets=%s (idx_block=%s, num_rows=%d)",
+            x_offsets,
+            idx_block,
+            num_rows,
+        )
+        return x_offsets, idx_block, num_rows
+
+    def _emit_gather_descriptor(
+        self,
+        name: str,
+        var: str,
+        dep,
+        layout: "FixedTiledLayout",
+        k_star: int,
+        device_coords: list,
+    ) -> tuple[str, str, list]:
+        """Emit the value descriptor for a gather.
+
+        The indirect axis (device dim ``k_star``) is permuted to dim 0 and the
+        true physical layout is expressed via permuted strides;
+        ``block_shape[0]`` is forced to 1.  Only dim 1 may carry a runtime
+        scalar offset (``y_offset``); dims >= 2 read their full block extent.
+
+        Returns ``(desc_var, y_offset_str, permuted_block_shape)``.
+        """
+        device_size = [int(s) for s in layout.device_layout.device_size]
+        rank = len(device_size)
+        perm = [k_star] + [i for i in range(rank) if i != k_star]
+
+        phys_strides = self._row_major_strides(device_size)
+        phys_block_shape = self._device_block_shape(device_size, device_coords)
+
+        perm_size = [device_size[p] for p in perm]
+        perm_strides = [phys_strides[p] for p in perm]
+        perm_block_shape = [phys_block_shape[p] for p in perm]
+        perm_coords = [device_coords[p] for p in perm]
+        perm_block_shape[0] = 1  # descriptor block must have exactly 1 row
+
+        # Representability: only dim 1 carries an offset; dims >= 2 read the
+        # full block extent.  A residual indirect symbol outside dim 0 would
+        # require a second indirect axis — not expressible as one gather.
+        for c in perm_coords[1:]:
+            if any(symbol_is_type(s, SymT.TMP) for s in c.free_symbols):
+                raise NotImplementedError(
+                    "gather: more than one indirect axis is not expressible as "
+                    "a single desc.gather"
+                )
+
+        y_offset = self._emit_gather_y_offset(name, perm_coords)
+
+        f = self.index_to_str
+        desc_line = (
+            f"tl.make_tensor_descriptor("
+            f"{var}, "
+            f"shape={f(perm_size)}, "
+            f"strides={f(perm_strides)}, "
+            f"block_shape={f(perm_block_shape)})"
+        )
+
+        existing = self.cse.try_get(desc_line)
+        if existing:
+            return str(existing), y_offset, perm_block_shape
+
+        block_ptr_id = next(self.block_ptr_id)
+        desc_name = f"desc_{block_ptr_id}"
+        named_var = self.cse.namedvar(desc_name, dtype=torch.uint64, shape=[])
+        self.cse.put(desc_line, named_var)
+        self.prologue.writeline(DeferredLine(name, f"{desc_name} = {desc_line}"))
+        logger.debug(
+            "SpyreTritonKernel: gather desc %s = %s (perm=%s, y_offset=%s)",
+            desc_name,
+            desc_line,
+            perm,
+            y_offset,
+        )
+        return desc_name, y_offset, perm_block_shape
+
+    def _emit_gather_y_offset(self, name: str, perm_coords: list) -> str:
+        """Emit the single direct scalar offset (dim 1) for a gather.
+
+        dim 0 (indirect) is addressed by ``x_offsets`` — no scalar offset; dims
+        >= 2 read the full block extent.  The Triton->Logical section (``c0 =
+        ...``, ``c1 = ...``) is already emitted by the index load's
+        ``_emit_scalar_offsets`` call, so those symbols are in scope here.
+        """
+        if len(perm_coords) < 2:
+            return "0"
+        coord = perm_coords[1]
+        if coord == 0:
+            return "0"
+        fixed = _normalize_floor_div(coord)
+        self.prologue.writeline(
+            DeferredLine(name, f"y_off = {self.index_to_str(fixed)}")
+        )
+        return "y_off"
+
+    def _emit_descriptor_gather(
+        self,
+        name: str,
+        desc_var: str,
+        x_offsets: str,
+        y_offset: str,
+        block_shape: list,
+        idx_shape: list,
+        num_rows: int,
+    ) -> CSEVariable:
+        """Emit ``val = desc.gather(x_offsets, y_offset)`` into self.loads.
+
+        With a multi-D ``x_offsets`` of shape ``idx_shape`` the gather result is
+        ``[*idx_shape, *block_shape[1:]]`` (the index dims lead; trailing dims
+        read at full block extent).  The index dims are then collapsed via
+        ``tl.reshape`` to the output's single row dim so the store path receives
+        the expected ``[num_rows, *block_shape[1:]]`` block.  Row-major reshape
+        maps index element ``[i0, i1, ...]`` to row ``flatten(i0, i1, ...)``,
+        which matches the output-row order.
+        """
+        gather_line = f"{desc_var}.gather({x_offsets}, {y_offset})"
+        dtype = V.graph.get_dtype(name)
+        gather_shape = (
+            *(str(s) for s in idx_shape),
+            *(str(b) for b in block_shape[1:]),
+        )
+        result_var = self.cse.generate(
+            self.loads, gather_line, dtype=dtype, shape=gather_shape
+        )
+
+        # Collapse multi-D index dims to the output's single row dim.
+        if list(idx_shape) != [num_rows]:
+            out_shape = [num_rows, *block_shape[1:]]
+            result_var = self.cse.generate(
+                self.loads,
+                f"tl.reshape({result_var}, {out_shape})",
+                dtype=dtype,
+                shape=tuple(str(s) for s in out_shape),
+            )
+
+        if not self.inside_reduction:
+            self.outside_loop_vars.add(result_var)
+        logger.debug("SpyreTritonKernel: gather %s -> %s", name, gather_line)
+        return result_var
 
     def _emit_descriptor_load(
         self,
@@ -826,6 +1192,30 @@ class SpyreTritonKernel(TritonKernel):
 
         it_space = iteration_space(self.current_node)
 
+        # Build {indirect_sym -> IndexLoad(index_buffer_name)} so a gather's value
+        # coordinates print IndexLoad(...) instead of the raw tmpN, matching the
+        # SDSC op-spec.  The index buffer is the int32 FixedTiledLayout read dep;
+        # the indirect symbols are the SymT.TMP atoms in the read indices.
+        indirect_subs: dict = {}
+        idx_name = next(
+            (
+                d.name
+                for d in self.current_node.read_writes.reads
+                if V.graph.get_dtype(d.name) == torch.int32
+                and isinstance(
+                    getattr(V.graph.get_buffer(d.name), "get_layout", lambda: None)(),
+                    FixedTiledLayout,
+                )
+            ),
+            None,
+        )
+        if idx_name is not None:
+            for d in self.current_node.read_writes.reads:
+                d_idx = sympy_subs(d.index, V.graph.sizevars.precomputed_replacements)
+                for s in d_idx.free_symbols:
+                    if symbol_is_type(s, SymT.TMP):
+                        indirect_subs[s] = IndexLoad(sympy.Symbol(idx_name))
+
         def _tensor_arg_dict(name: str, dep, is_input: bool) -> dict | None:
             if not isinstance(dep, MemoryDep):
                 return None
@@ -842,7 +1232,19 @@ class SpyreTritonKernel(TritonKernel):
                 layout.device_layout.stride_map,
                 it_space,
                 idx,
+                indirect_subs or None,
             )
+            # Strip the redundant floor the Triton-path coordinate decomposition
+            # adds around the (integer-valued) IndexLoad on the indirect dim
+            # (FloorDiv-by-1).  Genuine floors (e.g. floor(c1/64)) are untouched.
+            coords = [
+                c.replace(
+                    lambda x: isinstance(x, sympy.floor)
+                    and isinstance(x.args[0], IndexLoad),
+                    lambda x: x.args[0],
+                )
+                for c in coords
+            ]
             return {
                 "is_input": is_input,
                 "name": name,
@@ -902,9 +1304,8 @@ class SpyreTritonKernel(TritonKernel):
         The stick dimension (device_rank - 1, the innermost device dimension) is
         always 128 bytes / dtype element size (e.g. 64 for fp16/bf16).  It must
         never be divided across cores — block_shape for that dim must equal
-        device_size[-1].  (See docs/source/user_guide/tensors_and_layouts.md and
-        docs/source/compiler/work_division_planning.md: work division only applies
-        to dims 0 through device_rank - 2; splits are always stick-aligned.)
+        device_size[-1].  Work division only applies to dims 0 through
+        device_rank - 2; splits are always stick-aligned.
         """
         it_space = iteration_space(self.current_node)
         last_dim = len(device_size) - 1
