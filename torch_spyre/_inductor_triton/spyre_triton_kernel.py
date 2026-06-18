@@ -19,7 +19,12 @@ from typing import Any, Optional
 import sympy
 import torch
 
-from torch._inductor.codegen.common import CSEProxy, CSEVariable, DeferredLine
+from torch._inductor.codegen.common import (
+    CSEProxy,
+    CSEVariable,
+    DeferredLine,
+    triton_type,
+)
 from torch._inductor.codegen.triton import (
     FixedTritonConfig,
     TritonKernel,
@@ -82,7 +87,64 @@ class SpyreTritonOverrides(_TritonKernelOverrides):  # type: ignore[misc]
     Overrides ops.dot to handle 3D descriptor blocks: reshapes the loaded
     [M_tile, K-sticks, K-elems] and [K, N-sticks, N-elems] blocks to 2D
     matrices before calling tl.dot.
+
+    Overrides the elementwise math ops that upstream emits via ``libdevice``
+    (a GPU/CUDA-specific module the Spyre Triton backend does not provide, so
+    ``libdevice.*`` resolves to ``None`` at ttir generation time).  Each is
+    re-emitted as the equivalent ``tl.*`` op, which lowers to the MLIR
+    ``math`` dialect that the Spyre backend accepts.
+
+    Only ops that have a ``tl.*`` equivalent are overridden: ``exp``, ``exp2``,
+    ``log2``, ``erf``, ``rsqrt``, ``floor``, ``ceil``.  Upstream ops without a
+    ``tl.*`` counterpart (e.g. ``expm1``, ``log10``, ``log1p``, ``tan``,
+    ``sinh``/``cosh``, the inverse-trig family, ``pow``, ``fmod``, ``erfc``,
+    ``lgamma``, ``trunc``, ``round``) keep their libdevice mapping and will
+    still fail until the Spyre backend grows native support.  ``abs``, ``cos``,
+    ``sin``, ``log`` and ``sqrt`` already use ``tl_math.*``/``tl.*`` upstream
+    and need no override.
     """
+
+    @staticmethod
+    def _tl_unary(fn: str, x) -> str:
+        """Emit a Spyre ``tl.*`` unary math op, upcasting fp16/bf16 to fp32.
+
+        Spyre's ``tl.*`` math ops accept only fp32/fp64, so fp16/bf16 inputs
+        are upcast to fp32 and the result is downcast back to the input dtype.
+        (Upstream relies on ``libdevice``, which accepts fp16 on GPU, so it
+        does not upcast under the default ``codegen_upcast_to_fp32=True``.)
+        """
+        dtype = getattr(x, "dtype", None)
+        if dtype in (torch.float16, torch.bfloat16):
+            return f"{fn}({x}.to(tl.float32)).to({triton_type(dtype)})"
+        return f"{fn}({x})"
+
+    @staticmethod
+    def exp(x):  # type: ignore[override]
+        return SpyreTritonOverrides._tl_unary("tl.exp", x)
+
+    @staticmethod
+    def exp2(x):  # type: ignore[override]
+        return SpyreTritonOverrides._tl_unary("tl.exp2", x)
+
+    @staticmethod
+    def log2(x):  # type: ignore[override]
+        return SpyreTritonOverrides._tl_unary("tl.log2", x)
+
+    @staticmethod
+    def erf(x):  # type: ignore[override]
+        return SpyreTritonOverrides._tl_unary("tl.erf", x)
+
+    @staticmethod
+    def rsqrt(x):  # type: ignore[override]
+        return SpyreTritonOverrides._tl_unary("tl.rsqrt", x)
+
+    @staticmethod
+    def floor(x):  # type: ignore[override]
+        return SpyreTritonOverrides._tl_unary("tl.floor", x)
+
+    @staticmethod
+    def ceil(x):  # type: ignore[override]
+        return SpyreTritonOverrides._tl_unary("tl.ceil", x)
 
     @staticmethod
     def dot(a, b):  # type: ignore[override]
