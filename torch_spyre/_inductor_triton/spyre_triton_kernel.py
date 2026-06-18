@@ -34,7 +34,7 @@ from torch.utils._sympy.symbol import SymT, symbol_is_type
 
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import IndexLoad
+from torch_spyre._inductor.op_spec import IndirectAccess
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
     concretize_index,
@@ -1192,8 +1192,9 @@ class SpyreTritonKernel(TritonKernel):
 
         it_space = iteration_space(self.current_node)
 
-        # Build {indirect_sym -> IndexLoad(index_buffer_name)} so a gather's value
-        # coordinates print IndexLoad(...) instead of the raw tmpN, matching the
+        # Build {indirect_sym -> IndirectAccess(index_buffer_name)} so a gather's
+        # value coordinates print IndirectAccess(...) instead of the raw tmpN,
+        # matching the
         # SDSC op-spec.  The index buffer is the int32 FixedTiledLayout read dep;
         # the indirect symbols are the SymT.TMP atoms in the read indices.
         indirect_subs: dict = {}
@@ -1214,7 +1215,7 @@ class SpyreTritonKernel(TritonKernel):
                 d_idx = sympy_subs(d.index, V.graph.sizevars.precomputed_replacements)
                 for s in d_idx.free_symbols:
                     if symbol_is_type(s, SymT.TMP):
-                        indirect_subs[s] = IndexLoad(sympy.Symbol(idx_name))
+                        indirect_subs[s] = IndirectAccess(sympy.Symbol(idx_name))
 
         def _tensor_arg_dict(name: str, dep, is_input: bool) -> dict | None:
             if not isinstance(dep, MemoryDep):
@@ -1235,12 +1236,12 @@ class SpyreTritonKernel(TritonKernel):
                 indirect_subs or None,
             )
             # Strip the redundant floor the Triton-path coordinate decomposition
-            # adds around the (integer-valued) IndexLoad on the indirect dim
+            # adds around the (integer-valued) IndirectAccess on the indirect dim
             # (FloorDiv-by-1).  Genuine floors (e.g. floor(c1/64)) are untouched.
             coords = [
                 c.replace(
                     lambda x: isinstance(x, sympy.floor)
-                    and isinstance(x.args[0], IndexLoad),
+                    and isinstance(x.args[0], IndirectAccess),
                     lambda x: x.args[0],
                 )
                 for c in coords
