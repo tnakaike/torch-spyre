@@ -411,7 +411,13 @@ class SpyreTritonKernel(TritonKernel):
         if not isinstance(layout, FixedTiledLayout):
             return super().load(name, index)
 
-        if "lx" in layout.allocation or "pool" in layout.allocation:
+        # Pool (scratchpad) buffers are not emitted as descriptors.  LX buffers
+        # are now routed through the descriptor path: after the per-node split a
+        # fused LX intermediate is a real buffer threaded between separate
+        # kernels (not a removed SSA temp), so it must load/store like any other
+        # tensor.  (Full LX-as-baked-offset support is a later milestone; see
+        # 2606-KernelBundleLXModel.md.)
+        if "pool" in layout.allocation:
             return super().load(name, index)
 
         # Find the MemoryDep for this buffer in the read set.
@@ -460,13 +466,12 @@ class SpyreTritonKernel(TritonKernel):
         if not isinstance(layout, FixedTiledLayout):
             return super().store(name, index, value, mode)
 
-        # LX/pool buffers are not emitted as descriptors (mirror load()).  An LX
-        # intermediate in a fused kernel is a removed buffer whose store is
-        # elided into an SSA temp; routing it through the descriptor path would
-        # emit a DeferredLine descriptor def that gets dropped with the removed
-        # buffer, while a surviving output store reuses the same desc via the
-        # descriptor CSE cache — leaving `desc_N.store(...)` with no definition.
-        if "lx" in layout.allocation or "pool" in layout.allocation:
+        # Pool (scratchpad) buffers are not emitted as descriptors (mirror
+        # load()).  LX buffers are routed through the descriptor path: after the
+        # per-node split an LX intermediate is a real buffer threaded between
+        # separate kernels, so its store must be emitted (not elided as a removed
+        # SSA temp).  (Full LX-as-baked-offset support is a later milestone.)
+        if "pool" in layout.allocation:
             return super().store(name, index, value, mode)
 
         # Find the MemoryDep for this buffer in the write set.
@@ -624,8 +629,10 @@ class SpyreTritonKernel(TritonKernel):
         if not isinstance(layout, FixedTiledLayout):
             return super().store_reduction(name, index, value)
 
-        # LX/pool buffers are not emitted as descriptors (mirror load()/store()).
-        if "lx" in layout.allocation or "pool" in layout.allocation:
+        # Pool (scratchpad) buffers are not emitted as descriptors (mirror
+        # load()/store()).  LX buffers are routed through the descriptor path so
+        # a reduction output on LX is materialized between split kernels.
+        if "pool" in layout.allocation:
             return super().store_reduction(name, index, value)
 
         dep = next(

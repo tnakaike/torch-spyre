@@ -17,6 +17,7 @@ from typing import Any, Optional
 from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
 from torch._inductor.utils import IndentedBuffer
 
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -53,6 +54,37 @@ class SpyreTritonScheduling(TritonScheduling):
         if isinstance(node, CountedLoopSchedulerNode):
             self._codegen_counted_loop_triton(node)
             return
+
+        # torch-spyre fuses ops with *different* iteration spaces into one
+        # FusedSchedulerNode (spyre_fuse_nodes in fusion.py, driven by the
+        # 6-tensor budget -- not iteration-space compatibility; Inductor's own
+        # fusion is disabled).  A single upstream TritonKernel requires one
+        # (numel, rnumel), so a heterogeneous group trips "unexpected group" in
+        # generate_node_schedule.  Split every member SchedulerNode into its own
+        # kernel -- each node has exactly one iteration space by construction, so
+        # no mixed group ever reaches generate_node_schedule.  (Same-iteration-
+        # space merging and one-launch SpyreTritonKernelBundle packing are later
+        # milestones; see 2606-KernelBundleLXModel.md.)  CountedLoopSchedulerNode
+        # is a FusedSchedulerNode subclass but is handled above, so it never
+        # reaches this split.
+        if isinstance(node, FusedSchedulerNode):
+            assert self.scheduler
+            members = [
+                n
+                for n in node.get_nodes()
+                if isinstance(n, SchedulerNode)
+                and n.get_name() not in self.scheduler.removed_ops
+            ]
+            if len(members) > 1:
+                logger.debug(
+                    "SpyreTritonScheduling: splitting %s into %d per-node kernels",
+                    node.get_name(),
+                    len(members),
+                )
+                for member in members:
+                    super().codegen_node(member)
+                return
+
         return super().codegen_node(node)
 
     def _codegen_counted_loop_triton(self, node: CountedLoopSchedulerNode) -> None:
