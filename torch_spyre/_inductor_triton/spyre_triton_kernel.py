@@ -266,6 +266,10 @@ class SpyreTritonKernel(TritonKernel):
         # output-row device dim to dim 0 so the row-first gather result stores
         # directly (matching shape with the gather result).
         self._gather_row_sym: Optional[sympy.Symbol] = None
+        # When this kernel is a SpyreTritonKernelBundle entry, extra triton_meta
+        # fields (spyre_grids, spyre_entry, spyre_grid) to merge in codegen_body
+        # so they land in the emitted @fixed_config decorator.  None otherwise.
+        self._bundle_meta: Optional[dict] = None
 
     def __enter__(self):
         super(TritonKernel, self).__enter__()
@@ -303,8 +307,25 @@ class SpyreTritonKernel(TritonKernel):
                 )
             yield
 
-    def codegen_kernel(self, name=None) -> str:
-        return super().codegen_kernel(name)
+    def codegen_kernel(self, name=None, as_bundled_kernel=False) -> str:
+        src = super().codegen_kernel(name)
+        if not as_bundled_kernel:
+            return src
+        # Bundled-kernel flavor for a SpyreTritonKernelBundle: keep only the
+        # function (from `def {name}(` onward) and make it a device-callable
+        # noinline jit function.  The host-side @triton_heuristics.fixed_config
+        # decorator is dropped -- it returns a launcher, which the bundle entry
+        # cannot call; the entry carries the config/grids instead.
+        # super().codegen_kernel (name set) already omits the imports block, and
+        # still populates self.triton_meta / self.fixed_config as a side effect,
+        # which the bundle emitter reads back for the entry's signature and grids.
+        lines = src.splitlines()
+        def_idx = next(
+            i
+            for i, line in enumerate(lines)
+            if line.lstrip().startswith(f"def {name}(")
+        )
+        return "@triton.jit(noinline=True)\n" + "\n".join(lines[def_idx:])
 
     def codegen_body(self):
         if self._tiling_loop_count is not None:
@@ -323,6 +344,12 @@ class SpyreTritonKernel(TritonKernel):
         # mutations here ARE reflected in the @fixed_config decorator call.
         if self.triton_meta is not None and self.triton_opspec_map:
             self.triton_meta["spyre_grid"] = self._compute_spyre_grid()
+
+        # Bundle entry: merge spyre_grids / spyre_entry / spyre_grid so they
+        # serialize into the entry's @fixed_config decorator (triton_meta is set
+        # on self just before codegen_body() runs).
+        if self._bundle_meta is not None and self.triton_meta is not None:
+            self.triton_meta.update(self._bundle_meta)
 
         if self._tiling_loop_count is None:
             return super().codegen_body()
@@ -415,8 +442,7 @@ class SpyreTritonKernel(TritonKernel):
         # are now routed through the descriptor path: after the per-node split a
         # fused LX intermediate is a real buffer threaded between separate
         # kernels (not a removed SSA temp), so it must load/store like any other
-        # tensor.  (Full LX-as-baked-offset support is a later milestone; see
-        # 2606-KernelBundleLXModel.md.)
+        # tensor.  (Full LX-as-baked-offset support is a later milestone.)
         if "pool" in layout.allocation:
             return super().load(name, index)
 
