@@ -14,11 +14,17 @@
 
 from typing import Any, Optional
 
+import sympy
+
+from torch._inductor import config
 from torch._inductor.codegen.simd import SIMDKernelFeatures
-from torch._inductor.codegen.triton import TritonScheduling
+from torch._inductor.codegen.triton import FixedTritonConfig, TritonScheduling
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.runtime import triton_heuristics
 from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
-from torch._inductor.utils import IndentedBuffer
+from torch._inductor.tiling_utils import analyze_memory_coalescing
+from torch._inductor.utils import IndentedBuffer, Placeholder
+from torch._inductor.virtualized import V
 
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.pass_utils import (
@@ -49,6 +55,8 @@ class SpyreTritonScheduling(TritonScheduling):
         # Tiling info passed from codegen_node → create_kernel_choices.
         # Tuple (loop_count, tiled_syms, tile_steps) or None.
         self._pending_tiling: Optional[tuple] = None
+        # Counter for naming SpyreTritonKernelBundle entry functions (bundle_0, …).
+        self._bundle_counter: int = 0
 
     def codegen_node(self, node) -> None:
         if isinstance(node, CountedLoopSchedulerNode):
@@ -60,13 +68,15 @@ class SpyreTritonScheduling(TritonScheduling):
         # 6-tensor budget -- not iteration-space compatibility; Inductor's own
         # fusion is disabled).  A single upstream TritonKernel requires one
         # (numel, rnumel), so a heterogeneous group trips "unexpected group" in
-        # generate_node_schedule.  Split every member SchedulerNode into its own
-        # kernel -- each node has exactly one iteration space by construction, so
-        # no mixed group ever reaches generate_node_schedule.  (Same-iteration-
-        # space merging and one-launch SpyreTritonKernelBundle packing are later
-        # milestones; see 2606-KernelBundleLXModel.md.)  CountedLoopSchedulerNode
-        # is a FusedSchedulerNode subclass but is handled above, so it never
-        # reaches this split.
+        # generate_node_schedule.  Codegen each member SchedulerNode as its own
+        # SpyreTritonKernel -- each node has exactly one iteration space by
+        # construction -- and pack the members into a single SpyreTritonKernel-
+        # Bundle: one async_compile.triton('triton_bundle_N', ...) block of
+        # noinline bundled kernels + one entry fn + one .run() launch (one launch
+        # keeps any LX intermediate live across the bundled kernels).  Same-
+        # iteration-space merging of adjacent bundled kernels is a later
+        # milestone.  CountedLoopSchedulerNode is a FusedSchedulerNode subclass
+        # but is handled above, so it never reaches this split.
         if isinstance(node, FusedSchedulerNode):
             assert self.scheduler
             members = [
@@ -77,15 +87,187 @@ class SpyreTritonScheduling(TritonScheduling):
             ]
             if len(members) > 1:
                 logger.debug(
-                    "SpyreTritonScheduling: splitting %s into %d per-node kernels",
+                    "SpyreTritonScheduling: bundling %s into %d per-node "
+                    "SpyreTritonKernels",
                     node.get_name(),
                     len(members),
                 )
-                for member in members:
-                    super().codegen_node(member)
+                self._codegen_bundle(members)
                 return
 
         return super().codegen_node(node)
+
+    def _codegen_bundle(self, members: list) -> None:
+        """Build one SpyreTritonKernel per member, then emit them as a bundle.
+
+        Mirrors the per-member half of ``SIMDScheduling._codegen_nodes`` /
+        ``codegen_node_schedule`` (tiling + kernel + body) but skips the per-
+        member ``define_kernel`` / ``call_kernel``; the built bundled kernels are
+        handed to ``_emit_bundle`` which synthesizes one entry kernel that calls
+        them, emitted as a single
+        ``async_compile.triton('triton_bundle_N', ...)`` block + one ``.run()``.
+        """
+        assert self.scheduler
+        bundled_kernels: list = []
+        for member in members:
+            coalesce = (
+                analyze_memory_coalescing(member)
+                if config.triton.coalesce_tiling_analysis
+                else None
+            )
+            _, (numel, rnumel) = member.group
+            node_schedule = self.generate_node_schedule([member], numel, rnumel)
+            features = SIMDKernelFeatures(node_schedule, numel, rnumel, coalesce)
+            tiling, tiling_score = self.get_tiling_and_scores(
+                node_schedule,
+                features.numel,
+                features.reduction_numel,
+                features.coalesce_analysis,
+            )
+            (kernel,) = self.create_kernel_choices(
+                features,
+                [tiling],
+                {"features": features, "tiling_scores": tiling_score},
+            )
+            self.codegen_node_schedule_with_kernel(node_schedule, kernel)
+            # Buffer/liveness bookkeeping normally done by codegen_node_schedule.
+            with V.set_kernel_handler(kernel):
+                for snode in features.scheduler_nodes():
+                    snode.mark_run()
+            V.graph.removed_buffers |= kernel.removed_buffers
+            V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
+            bundled_kernels.append(kernel)
+
+        self._emit_bundle(bundled_kernels)
+        self.free_buffers_in_scheduler()
+
+    def _bundled_kernel_constants(self, kernel) -> list[str]:
+        """Literal numel + block-size args a bundled kernel takes after tensors.
+
+        Order matches ``TritonKernel.codegen_kernel``: per-active-tree
+        ``{prefix}numel`` then per-tree ``{PREFIX}BLOCK`` constexpr.  These are
+        compile-time constants for the bundle, so they are passed as literals.
+        """
+        constants = [
+            str(int(V.graph.sizevars.size_hint(tree.numel)))
+            for tree in kernel.active_range_trees()
+        ]
+        cfg = kernel.fixed_config.config if kernel.fixed_config else {}
+        for tree in kernel.range_trees:
+            if tree.tensor_dim is None:
+                continue
+            key = f"{tree.prefix.upper()}BLOCK"
+            if key in cfg:
+                constants.append(str(cfg[key]))
+        return constants
+
+    def _emit_bundle(self, bundled_kernels: list) -> None:
+        """Synthesize one entry kernel that calls the bundled kernels.
+
+        The entry has no IR node, so it is built by hand: the bundled kernels are
+        added as ``noinline`` helper functions (emitted before the entry by
+        ``codegen_kernel``), the entry's body is the sequence of their calls, and
+        its args are the union of their tensors.  ``codegen_kernel`` /
+        ``define_kernel`` / ``call_kernel`` then emit the decorator, signature,
+        ``triton_meta`` and ``.run()`` -- reused from the normal path.
+        """
+        bundle_id = self._bundle_counter
+        self._bundle_counter += 1
+        entry_name = f"triton_bundle_{bundle_id}"
+
+        # Per bundled kernel: source text, ordered tensor outer names, constants.
+        bundled_kernel_texts: list[str] = []
+        bundled_kernel_tensors: list[list[str]] = []
+        bundled_kernel_constants: list[list[str]] = []
+        written: list[str] = []  # outer names any bundled kernel writes (outputs)
+        read: list[str] = []  # outer names any bundled kernel reads
+        spyre_grids: dict[str, tuple] = {}
+        for i, kernel in enumerate(bundled_kernels):
+            bundled_kernel_name = f"{entry_name}_kernel_{i}"
+            with V.set_kernel_handler(kernel):
+                bundled_kernel_texts.append(
+                    kernel.codegen_kernel(
+                        name=bundled_kernel_name, as_bundled_kernel=True
+                    )
+                )
+            _argdefs, call_args, _sig, _types = kernel.args.python_argdefs()
+            bundled_kernel_tensors.append(list(call_args))
+            bundled_kernel_constants.append(self._bundled_kernel_constants(kernel))
+            for outer in kernel.args.output_buffers:
+                if outer not in written:
+                    written.append(outer)
+            for outer in kernel.args.input_buffers:
+                if outer not in read:
+                    read.append(outer)
+            spyre_grids[bundled_kernel_name] = kernel._compute_spyre_grid()
+
+        # Entry args: inputs = read-but-never-written; outputs = written.  Build
+        # a synthetic SpyreTritonKernel, drop its range trees (no iteration space
+        # of its own -> only tensor params), and register the union of args.
+        entry_inputs = [o for o in read if o not in written]
+        entry_outputs = written
+        entry_features = SIMDKernelFeatures([], sympy.S.One, sympy.S.One, None)
+        (entry,) = self.create_kernel_choices(
+            entry_features,
+            [{"x": sympy.S.One}],
+            {"features": entry_features, "tiling_scores": None},
+        )
+        # The entry only sequences bundled-kernel calls -- it has no iteration
+        # space.  Drop its range trees so codegen_kernel emits no xnumel/XBLOCK
+        # params, and clear the body of the xoffset/xindex/xmask prologue that
+        # TritonKernel.__init__ emitted via codegen_range_tree() (the entry reads
+        # no program_id; that prologue would reference an undefined XBLOCK).
+        # Force Grid1D since _get_grid_type rejects 0 dims -- DistributeWork then
+        # stamps grid=[1] for the pid-less entry; each bundled kernel carries its
+        # own real grid.
+        entry.range_trees = []
+        entry.body.clear()
+        entry._get_grid_type = lambda: triton_heuristics.Grid1D  # type: ignore[method-assign]
+        entry.fixed_config = FixedTritonConfig(config={})
+        outer_to_inner: dict[str, str] = {}
+        for outer in entry_inputs:
+            outer_to_inner[outer] = entry.args.input(outer)
+        for outer in entry_outputs:
+            outer_to_inner[outer] = entry.args.output(outer)
+
+        # Bundled kernels are emitted before the entry via helper_functions; the
+        # entry body calls each with the entry's own (inner) param names + consts.
+        for text in bundled_kernel_texts:
+            entry.helper_functions.finalized_helpers.append(text)
+        for i in range(len(bundled_kernels)):
+            bundled_kernel_name = f"{entry_name}_kernel_{i}"
+            call_args = [outer_to_inner[o] for o in bundled_kernel_tensors[i]]
+            call_args += bundled_kernel_constants[i]
+            entry.body.writeline(f"{bundled_kernel_name}({', '.join(call_args)})")
+
+        # Per-bundled-kernel grids for the backend; a single spyre_grid also
+        # suffices today since every bundled kernel shares (32,).
+        entry._bundle_meta = {
+            "spyre_grids": spyre_grids,
+            "spyre_entry": entry_name,
+            "spyre_grid": next(iter(spyre_grids.values())),
+        }
+
+        # Reuse codegen_kernel (imports + bundled kernels + entry) but name the
+        # entry ourselves (triton_bundle_<id>) instead of the auto-generated from
+        # the standard define_kernel.  codegen_kernel(name=None) emits the
+        # KERNEL_NAME / DESCRIPTIVE_NAME placeholders that define_kernel would
+        # substitute; we substitute them with entry_name and emit one block.
+        with V.set_kernel_handler(entry):
+            src_code = entry.codegen_kernel()
+        src_code = src_code.replace(str(Placeholder.KERNEL_NAME), entry_name)
+        src_code = src_code.replace(str(Placeholder.DESCRIPTIVE_NAME), entry_name)
+
+        wrapper = V.graph.wrapper_code
+        compile_wrapper = IndentedBuffer()
+        compile_wrapper.writeline(f"async_compile.triton({entry_name!r}, '''")
+        compile_wrapper.splice(src_code, strip=True)
+        compile_wrapper.writeline("''', device_str='spyre')")
+        wrapper.define_kernel(
+            entry_name, compile_wrapper.getvalue(), f"# bundle: {entry_name}"
+        )
+        entry.kernel_name = entry_name
+        entry.call_kernel(entry_name)
 
     def _codegen_counted_loop_triton(self, node: CountedLoopSchedulerNode) -> None:
         """Generate a Triton kernel for a CountedLoopSchedulerNode.
