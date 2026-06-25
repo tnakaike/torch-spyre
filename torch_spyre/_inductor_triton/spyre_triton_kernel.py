@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import contextlib
-import json
 from typing import Any, Optional
 
 import sympy
@@ -39,11 +38,16 @@ from torch.utils._sympy.symbol import SymT, symbol_is_type
 
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import IndirectAccess
+from torch_spyre._inductor.op_spec import IndirectAccess, LoopSpec, OpSpec, TensorArg
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
     concretize_index,
     iteration_space,
+)
+from torch_spyre._inductor.spyre_kernel import (
+    _codegen_op_spec_list,
+    _iter_op_specs,
+    simplify_op_spec,
 )
 from torch_spyre._inductor.views import compute_coordinates
 
@@ -248,7 +252,7 @@ class SpyreTritonKernel(TritonKernel):
         # Caches emitted Level-3 variable names keyed by device_coords tuple.
         # Each entry maps coords_key -> [dim0, dim1, ...] var name list.
         self._device_offset_vars: dict[tuple, list[str]] = {}
-        # Guard: dump opspec.json only once per kernel instance.
+        # Guard: dump the per-kernel opspec file only once per kernel instance.
         self._opspec_dumped: bool = False
         # Tiling loop state (set by SpyreTritonScheduling for CountedLoopSchedulerNode).
         self._tiling_loop_count: Optional[int] = None
@@ -270,6 +274,11 @@ class SpyreTritonKernel(TritonKernel):
         # fields (spyre_grids, spyre_entry, spyre_grid) to merge in codegen_body
         # so they land in the emitted @fixed_config decorator.  None otherwise.
         self._bundle_meta: Optional[dict] = None
+        # Kernel name for the opspec dump's op name and file name, assigned by
+        # the scheduler before codegen: triton_bundle_<id>_kernel_<i> for bundle
+        # members, kernel_<N> for standalone kernels.  None only if unset (the
+        # dump then falls back to the scheduler node name).
+        self._opspec_name: Optional[str] = None
 
     def __enter__(self):
         super(TritonKernel, self).__enter__()
@@ -512,7 +521,7 @@ class SpyreTritonKernel(TritonKernel):
 
         if not self._opspec_dumped:
             self._opspec_dumped = True
-            self._dump_opspec_json(name, dep)
+            self._dump_opspec(name, dep)
 
         if self._is_gather:
             # Gather output: the gather result block is [num_rows, *rest], with
@@ -672,7 +681,7 @@ class SpyreTritonKernel(TritonKernel):
 
         if not self._opspec_dumped:
             self._opspec_dumped = True
-            self._dump_opspec_json(name, dep)
+            self._dump_opspec(name, dep)
 
         if self.is_native_matmul:
             desc_var, offset_var_names, block_shape = (
@@ -1282,17 +1291,25 @@ class SpyreTritonKernel(TritonKernel):
         self._device_offset_vars[coords_key] = offset_var_names
         return offset_var_names
 
-    def _dump_opspec_json(self, write_name: str, write_dep) -> None:
-        """Dump a debug OpSpec dict to opspec.json in the inductor debug directory.
+    def _dump_opspec(self, write_name: str, write_dep) -> None:
+        """Dump this kernel's OpSpec to a per-kernel file in the debug directory.
 
-        The file lands next to ir_post_fusion.txt; only written when
-        TORCH_COMPILE_DEBUG=1 (V.debug._path is set).
+        The dump matches the SDSC path's serialized form (``OpSpec`` / ``TensorArg``
+        with ``sympify('...')``-wrapped exprs -- see ``spyre_kernel.codegen_kernel``)
+        by building real OpSpec/TensorArg objects and reusing the same
+        ``_codegen_op_spec_list`` serializer, so the two paths' op-specs are
+        directly comparable.  One file per kernel (named by the scheduler node) so
+        a bundle's kernels do not overwrite each other.  Lands next to
+        ir_post_fusion.txt; only written when TORCH_COMPILE_DEBUG=1.
         """
         debug = getattr(V, "debug", None)
         if debug is None or not getattr(debug, "_path", None):
             return
 
         it_space = iteration_space(self.current_node)
+        # arg_index = position in this kernel's runtime args (mirrors SDSC's
+        # actuals.index(name)); -1 if the buffer is not a kernel argument.
+        actuals = self.args.python_argdefs()[1]
 
         # Build {indirect_sym -> IndirectAccess(index_buffer_name)} so a gather's
         # value coordinates print IndirectAccess(...) instead of the raw tmpN,
@@ -1319,7 +1336,7 @@ class SpyreTritonKernel(TritonKernel):
                     if symbol_is_type(s, SymT.TMP):
                         indirect_subs[s] = IndirectAccess(sympy.Symbol(idx_name))
 
-        def _tensor_arg_dict(name: str, dep, is_input: bool) -> dict | None:
+        def _tensor_arg(name: str, dep, is_input: bool) -> TensorArg | None:
             if not isinstance(dep, MemoryDep):
                 return None
             buf = V.graph.get_buffer(name)
@@ -1348,54 +1365,73 @@ class SpyreTritonKernel(TritonKernel):
                 )
                 for c in coords
             ]
-            return {
-                "is_input": is_input,
-                "name": name,
-                "device_dtype": str(layout.device_layout.device_dtype),
-                "device_size": [int(s) for s in layout.device_layout.device_size],
-                "device_coordinates": [str(c) for c in coords],
-                "allocation": {k: str(v) for k, v in layout.allocation.items()},
-            }
+            return TensorArg(
+                is_input=is_input,
+                arg_index=actuals.index(name) if name in actuals else -1,
+                device_dtype=layout.device_layout.device_dtype,
+                device_size=[int(s) for s in layout.device_layout.device_size],
+                device_coordinates=coords,
+                allocation=dict(layout.allocation),
+                stride_map=list(layout.device_layout.stride_map),
+            )
 
         args = []
         for dep in self.current_node.read_writes.reads:
-            ta = _tensor_arg_dict(dep.name, dep, is_input=True)
+            ta = _tensor_arg(dep.name, dep, is_input=True)
             if ta:
                 args.append(ta)
-        ta = _tensor_arg_dict(write_name, write_dep, is_input=False)
+        ta = _tensor_arg(write_name, write_dep, is_input=False)
         if ta:
             args.append(ta)
 
-        opspec = {
-            "op": self.current_node.get_name(),
-            "is_reduction": self.current_node.is_reduction(),
-            "iteration_space": {
-                str(sym): {
-                    "range": str(rng),
-                    "work_division": self._core_division.get(sym, 1),
-                }
+        # op name: the reduction type ('sum', ...) when this is a reduction (to
+        # match the SDSC op field), else the scheduler node name.
+        # Identify the opspec by the kernel name (triton_bundle_N_kernel_M for
+        # bundle members, kernel_N for standalone kernels) so the dump's op field
+        # and file name correlate with the kernel.  Fall back to the scheduler
+        # node name only if the scheduler left _opspec_name unset.
+        op_name = self._opspec_name or self.current_node.get_name()
+
+        opspec: Any = OpSpec(
+            op=op_name,
+            is_reduction=self.current_node.is_reduction(),
+            iteration_space={
+                sym: (rng, self._core_division.get(sym, 1))
                 for sym, rng in it_space.items()
             },
-            "args": args,
-            "tiled_symbols": [str(s) for s in self._tiling_loop_tiled_syms],
-        }
+            args=args,
+            op_info={},
+            tiled_symbols=list(self._tiling_loop_tiled_syms),
+        )
 
-        # When a tiling loop is active (CountedLoopSchedulerNode path), the op is
-        # wrapped in a LoopSpec. Mirror that structure in the dump so the JSON
-        # matches the LoopSpec(count, body, tiled_symbols) emitted to the runtime.
+        # Under a tiling loop (CountedLoopSchedulerNode path) the op is wrapped in
+        # a LoopSpec; mirror that so the dump matches the runtime structure.
         if self._tiling_loop_count is not None:
-            payload: dict = {
-                "loop_spec": {
-                    "count": int(self._tiling_loop_count),
-                    "tiled_symbols": [str(s) for s in self._tiling_loop_tiled_syms],
-                    "body": [opspec],
-                }
-            }
-        else:
-            payload = opspec
+            opspec = LoopSpec(
+                count=sympy.Integer(int(self._tiling_loop_count)),
+                body=[opspec],
+                tiled_symbols=list(self._tiling_loop_tiled_syms),
+            )
 
-        with debug.fopen_context("opspec.json") as f:
-            json.dump(payload, f, indent=2)
+        # Serialize exactly like the SDSC path (sympify('...')-wrapped exprs).
+        def sympy_str(x: Any) -> str:
+            if isinstance(x, IndirectAccess):
+                return f"IndirectAccess('{x.args[0]}')"
+            return "sympify('" + str(x) + "')"
+
+        specs = [opspec]
+        for s in _iter_op_specs(specs):
+            simplify_op_spec(s)
+        out = IndentedBuffer()
+        out.writeline("[")
+        with out.indent():
+            _codegen_op_spec_list(specs, out, sympy_str)
+        out.writeline("]")
+
+        fname = f"opspec_{op_name}.py"
+        with debug.fopen_context(fname) as f:
+            f.write(out.getvalue())
+        logger.debug("SpyreTritonKernel: dumped opspec to %s/%s", debug._path, fname)
         logger.debug("SpyreTritonKernel: dumped opspec to %s/opspec.json", debug._path)
 
     def _device_block_shape(self, device_size: list, device_coords: list) -> list:
