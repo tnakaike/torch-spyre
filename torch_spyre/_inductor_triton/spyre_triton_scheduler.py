@@ -57,6 +57,12 @@ class SpyreTritonScheduling(TritonScheduling):
         self._pending_tiling: Optional[tuple] = None
         # Counter for naming SpyreTritonKernelBundle entry functions (bundle_0, …).
         self._bundle_counter: int = 0
+        # Counter for naming standalone (non-bundle) kernels' opspec dumps
+        # (kernel_0, kernel_1, …); bundle members get their bundled name instead.
+        self._kernel_counter: int = 0
+        # True while _codegen_bundle builds member kernels, so create_kernel_choices
+        # leaves their _opspec_name for the bundle to assign.
+        self._building_bundle: bool = False
 
     def codegen_node(self, node) -> None:
         if isinstance(node, CountedLoopSchedulerNode):
@@ -108,8 +114,19 @@ class SpyreTritonScheduling(TritonScheduling):
         ``async_compile.triton('triton_bundle_N', ...)`` block + one ``.run()``.
         """
         assert self.scheduler
+        # Allocate the bundle id up front so each kernel can be tagged with its
+        # final bundled-kernel name (triton_bundle_<id>_kernel_<i>) *before*
+        # codegen_node_schedule_with_kernel runs -- the opspec dump (in
+        # store/store_reduction) reads that name, and it must match the kernel
+        # name _emit_bundle emits.
+        bundle_id = self._bundle_counter
+        self._bundle_counter += 1
+        entry_name = f"triton_bundle_{bundle_id}"
         bundled_kernels: list = []
-        for member in members:
+        # Suppress create_kernel_choices's kernel_<N> auto-naming while building
+        # bundle members; their name is assigned explicitly below.
+        self._building_bundle = True
+        for i, member in enumerate(members):
             coalesce = (
                 analyze_memory_coalescing(member)
                 if config.triton.coalesce_tiling_analysis
@@ -129,6 +146,7 @@ class SpyreTritonScheduling(TritonScheduling):
                 [tiling],
                 {"features": features, "tiling_scores": tiling_score},
             )
+            kernel._opspec_name = f"{entry_name}_kernel_{i}"
             self.codegen_node_schedule_with_kernel(node_schedule, kernel)
             # Buffer/liveness bookkeeping normally done by codegen_node_schedule.
             with V.set_kernel_handler(kernel):
@@ -137,8 +155,9 @@ class SpyreTritonScheduling(TritonScheduling):
             V.graph.removed_buffers |= kernel.removed_buffers
             V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
             bundled_kernels.append(kernel)
+        self._building_bundle = False
 
-        self._emit_bundle(bundled_kernels)
+        self._emit_bundle(bundled_kernels, entry_name)
         self.free_buffers_in_scheduler()
 
     def _bundled_kernel_constants(self, kernel) -> list[str]:
@@ -161,7 +180,7 @@ class SpyreTritonScheduling(TritonScheduling):
                 constants.append(str(cfg[key]))
         return constants
 
-    def _emit_bundle(self, bundled_kernels: list) -> None:
+    def _emit_bundle(self, bundled_kernels: list, entry_name: str) -> None:
         """Synthesize one entry kernel that calls the bundled kernels.
 
         The entry has no IR node, so it is built by hand: the bundled kernels are
@@ -170,11 +189,11 @@ class SpyreTritonScheduling(TritonScheduling):
         its args are the union of their tensors.  ``codegen_kernel`` /
         ``define_kernel`` / ``call_kernel`` then emit the decorator, signature,
         ``triton_meta`` and ``.run()`` -- reused from the normal path.
-        """
-        bundle_id = self._bundle_counter
-        self._bundle_counter += 1
-        entry_name = f"triton_bundle_{bundle_id}"
 
+        ``entry_name`` (``triton_bundle_<id>``) is allocated by the caller so the
+        per-kernel names (``<entry_name>_kernel_<i>``) match the ``_opspec_name``
+        tags set before codegen.
+        """
         # Per bundled kernel: source text, ordered tensor outer names, constants.
         bundled_kernel_texts: list[str] = []
         bundled_kernel_tensors: list[list[str]] = []
@@ -395,5 +414,14 @@ class SpyreTritonScheduling(TritonScheduling):
                     loop_count,
                     tiled_syms,
                 )
+
+        # Tag standalone (non-bundle) kernels with a kernel_<N> opspec name, so
+        # their opspec dump reads kernel_0/kernel_1/… (consistent with the
+        # bundle's _kernel_<i> suffix) instead of the scheduler node name.
+        # Bundle members are skipped here; _codegen_bundle assigns their name.
+        if not self._building_bundle:
+            for kernel in kernels:
+                kernel._opspec_name = f"kernel_{self._kernel_counter}"
+                self._kernel_counter += 1
 
         return kernels
