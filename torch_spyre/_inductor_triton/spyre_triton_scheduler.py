@@ -17,13 +17,14 @@ from typing import Any, Optional
 import sympy
 
 from torch._inductor import config
+from torch._inductor.codegen.common import RemovedArg
 from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.codegen.triton import FixedTritonConfig, TritonScheduling
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.runtime import triton_heuristics
 from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
 from torch._inductor.tiling_utils import analyze_memory_coalescing
-from torch._inductor.utils import IndentedBuffer, Placeholder
+from torch._inductor.utils import IndentedBuffer, Placeholder, unique
 from torch._inductor.virtualized import V
 
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -200,6 +201,15 @@ class SpyreTritonScheduling(TritonScheduling):
         bundled_kernel_constants: list[list[str]] = []
         written: list[str] = []  # outer names any bundled kernel writes (outputs)
         read: list[str] = []  # outer names any bundled kernel reads
+        # In-place (in_out) alias groups: a bundled kernel that mutates a buffer
+        # in place (e.g. exp(buf0) reusing buf0's storage, named buf1) registers
+        # an InplacedBuffer whose aliases share one pointer.  These names appear
+        # in python_argdefs (so the bundled-kernel call references them) but in
+        # neither input_buffers nor output_buffers, so the entry must replicate
+        # the in-place relationship -- otherwise the aliased name (buf1) is
+        # absent from outer_to_inner and the call lookup KeyErrors.
+        inplace_groups: list[list[str]] = []
+        inplace_names: set[str] = set()
         spyre_grids: dict[str, tuple] = {}
         for i, kernel in enumerate(bundled_kernels):
             bundled_kernel_name = f"{entry_name}_kernel_{i}"
@@ -218,13 +228,23 @@ class SpyreTritonScheduling(TritonScheduling):
             for outer in kernel.args.input_buffers:
                 if outer not in read:
                     read.append(outer)
+            for inplaced in unique(kernel.args.inplace_buffers.values()):
+                if isinstance(inplaced, RemovedArg):
+                    continue
+                names = list(inplaced.other_names)
+                if any(n in inplace_names for n in names):
+                    continue  # same alias group already recorded
+                inplace_groups.append(names)
+                inplace_names.update(names)
             spyre_grids[bundled_kernel_name] = kernel._compute_spyre_grid()
 
         # Entry args: inputs = read-but-never-written; outputs = written.  Build
         # a synthetic SpyreTritonKernel, drop its range trees (no iteration space
         # of its own -> only tensor params), and register the union of args.
-        entry_inputs = [o for o in read if o not in written]
-        entry_outputs = written
+        # In-place aliases are threaded as a single in_out_ptr on the entry
+        # (registered below), not as plain inputs/outputs.
+        entry_inputs = [o for o in read if o not in written and o not in inplace_names]
+        entry_outputs = [o for o in written if o not in inplace_names]
         entry_features = SIMDKernelFeatures([], sympy.S.One, sympy.S.One, None)
         (entry,) = self.create_kernel_choices(
             entry_features,
@@ -248,6 +268,15 @@ class SpyreTritonScheduling(TritonScheduling):
             outer_to_inner[outer] = entry.args.input(outer)
         for outer in entry_outputs:
             outer_to_inner[outer] = entry.args.output(outer)
+        # Replicate each in-place alias group as one in_out_ptr on the entry, so
+        # every alias (the producer's output name and the mutated output name)
+        # resolves to the same shared pointer when calling the bundled kernels.
+        for group in inplace_groups:
+            for alias in group[1:]:
+                entry.args.make_inplace(group[0], alias)
+            inner = entry.args.inplace_buffers[group[0]].inner_name
+            for alias in group:
+                outer_to_inner[alias] = inner
 
         # Bundled kernels are emitted before the entry via helper_functions; the
         # entry body calls each with the entry's own (inner) param names + consts.
