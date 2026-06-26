@@ -447,13 +447,13 @@ class SpyreTritonKernel(TritonKernel):
         if not isinstance(layout, FixedTiledLayout):
             return super().load(name, index)
 
-        # Pool (scratchpad) buffers are not emitted as descriptors.  LX buffers
-        # are now routed through the descriptor path: after the per-node split a
-        # fused LX intermediate is a real buffer threaded between separate
-        # kernels (not a removed SSA temp), so it must load/store like any other
-        # tensor.  (Full LX-as-baked-offset support is a later milestone.)
-        if "pool" in layout.allocation:
-            return super().load(name, index)
+        # LX and pool (HBM intermediate-pool) buffers are both routed through the
+        # descriptor path.  After the per-node split a fused intermediate is a
+        # real buffer threaded between separate bundled kernels (not a removed SSA
+        # temp), so it must load/store like any other device tensor.  A pool
+        # tensor gets a plain HBM descriptor (LowerDescriptorMemory defaults the
+        # memory space to HBM); full LX-as-baked-offset support is a later
+        # milestone.
 
         # Find the MemoryDep for this buffer in the read set.
         dep = next(
@@ -501,13 +501,10 @@ class SpyreTritonKernel(TritonKernel):
         if not isinstance(layout, FixedTiledLayout):
             return super().store(name, index, value, mode)
 
-        # Pool (scratchpad) buffers are not emitted as descriptors (mirror
-        # load()).  LX buffers are routed through the descriptor path: after the
-        # per-node split an LX intermediate is a real buffer threaded between
-        # separate kernels, so its store must be emitted (not elided as a removed
-        # SSA temp).  (Full LX-as-baked-offset support is a later milestone.)
-        if "pool" in layout.allocation:
-            return super().store(name, index, value, mode)
+        # LX and pool (HBM intermediate-pool) buffers are both routed through the
+        # descriptor path (mirror load()): a bundled intermediate is a real buffer
+        # threaded between separate kernels, so its store must be emitted (not
+        # elided as a removed SSA temp).  pool tensors get a plain HBM descriptor.
 
         # Find the MemoryDep for this buffer in the write set.
         dep = next(
@@ -664,11 +661,10 @@ class SpyreTritonKernel(TritonKernel):
         if not isinstance(layout, FixedTiledLayout):
             return super().store_reduction(name, index, value)
 
-        # Pool (scratchpad) buffers are not emitted as descriptors (mirror
-        # load()/store()).  LX buffers are routed through the descriptor path so
-        # a reduction output on LX is materialized between split kernels.
-        if "pool" in layout.allocation:
-            return super().store_reduction(name, index, value)
+        # LX and pool (HBM intermediate-pool) buffers are both routed through the
+        # descriptor path (mirror load()/store()) so a reduction output on LX or
+        # in the HBM pool is materialized between split kernels.  pool tensors get
+        # a plain HBM descriptor.
 
         dep = next(
             (d for d in self.current_node.read_writes.writes if d.name == name),
