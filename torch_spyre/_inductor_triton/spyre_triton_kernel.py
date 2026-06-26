@@ -1206,6 +1206,89 @@ class SpyreTritonKernel(TritonKernel):
             self.outside_loop_vars.add(value)
         logger.debug("SpyreTritonKernel: store %s -> %s", name, store_line)
 
+    def _emit_split_logical_offsets(self, name: str) -> None:
+        """Emit Level-2 logical offsets honoring the device-space work division.
+
+        Each split spatial symbol's per-program tile base is taken from
+        ``tl.program_id(0)``: the split dims are decomposed from the flat
+        program id (outermost dim — largest range-tree divisor — varies
+        slowest), unsplit spatial dims start at base 0 (the descriptor
+        ``block_shape`` covers their full range), and reduction symbols keep
+        their range-tree offset (``r0_offset``).
+
+        This mirrors the SDSC device-space split (``spyre_div``, returned by
+        ``_compute_core_division``) rather than the flat row-major XBLOCK cut:
+        each program owns one ``range_s // div_s`` slice of every split dim.
+        The total tile size (XBLOCK) is unchanged — only the per-program tile
+        *shape* differs (e.g. for ``{c1:32}`` the tile is full-c0 × 1-c1 instead
+        of the flat ``{c0:16, c1:2}`` cut's 1-c0 × 16-c1).
+        """
+        it_space = iteration_space(self.current_node)
+        f = self.index_to_str
+
+        # Partition symbols, preserving the range-tree (outer -> inner) order.
+        spatial: list[tuple[sympy.Symbol, sympy.Symbol]] = []
+        reduction: list[tuple[sympy.Symbol, sympy.Symbol]] = []
+        for triton_sym, opspec_sym in self._triton_to_opspec.items():
+            entry = self.range_tree_nodes[triton_sym]
+            if entry.prefix.startswith("r"):
+                reduction.append((triton_sym, opspec_sym))
+            else:
+                spatial.append((triton_sym, opspec_sym))
+
+        # Split dims, outermost (largest range-tree divisor) first.
+        split = [(ts, os) for ts, os in spatial if self._core_division.get(os, 1) > 1]
+        split.sort(
+            key=lambda p: V.graph.sizevars.size_hint(
+                self.range_tree_nodes[p[0]].divisor
+            ),
+            reverse=True,
+        )
+        total_split_cores = 1
+        for _, opspec_sym in split:
+            total_split_cores *= self._core_division[opspec_sym]
+
+        # program_id(0) -> per-split-dim tile index -> tile base offset.
+        # With the innermost split dim varying fastest:
+        #   idx_s = (program_id(0) // inner_cores) % div_s
+        #   base  = idx_s * (range_s // div_s)
+        # The "// inner_cores" is dropped for the innermost dim and the
+        # "% div_s" for the outermost (it is then the identity over [0, ncores)).
+        inner_cores = 1
+        bases: dict[sympy.Symbol, str] = {}
+        for _, opspec_sym in reversed(split):  # innermost first
+            div = self._core_division[opspec_sym]
+            s_range = V.graph.sizevars.size_hint(it_space[opspec_sym])
+            extent = max(1, s_range // div)
+            idx_expr = "tl.program_id(0)"
+            if inner_cores > 1:
+                idx_expr = f"({idx_expr} // {inner_cores})"
+            if inner_cores * div != total_split_cores:
+                idx_expr = f"({idx_expr} % {div})"
+            bases[opspec_sym] = idx_expr if extent == 1 else f"({idx_expr}) * {extent}"
+            inner_cores *= div
+
+        # Spatial symbols in range-tree order: split dim -> program-id base,
+        # unsplit dim -> 0 (the descriptor block covers its full range).
+        for _, opspec_sym in spatial:
+            var_name = str(opspec_sym)
+            expr = bases.get(opspec_sym, "0")
+            self.prologue.writeline(DeferredLine(name, f"{var_name} = {expr}"))
+            self._logical_offset_vars[opspec_sym] = var_name
+
+        # Reduction symbols keep their range-tree offset (r0_offset).
+        for triton_sym, opspec_sym in reduction:
+            entry = self.range_tree_nodes[triton_sym]
+            root = entry.root
+            xoffset = TritonSymbols.block_offsets[root.symt]
+            index_sym = root.index_sym()
+            scalar_expr = sympy_subs(entry.expr, {index_sym: xoffset})
+            var_name = str(opspec_sym)
+            self.prologue.writeline(
+                DeferredLine(name, f"{var_name} = {f(scalar_expr)}")
+            )
+            self._logical_offset_vars[opspec_sym] = var_name
+
     def _emit_scalar_offsets(self, name: str, device_coords: list) -> list[str]:
         """Emit named scalar offset variables into prologue; return Level-3 names.
 
@@ -1233,17 +1316,25 @@ class SpyreTritonKernel(TritonKernel):
         # Emit once: one assignment per OpSpec symbol (c0, c1, ...).
         if not self._logical_offset_vars:
             self.prologue.writeline("# Triton -> Logical layouts")
-            for triton_sym, opspec_sym in self._triton_to_opspec.items():
-                entry = self.range_tree_nodes[triton_sym]
-                root = entry.root
-                xoffset = TritonSymbols.block_offsets[root.symt]
-                index_sym = root.index_sym()
-                scalar_expr = sympy_subs(entry.expr, {index_sym: xoffset})
-                var_name = str(opspec_sym)  # "c0", "c1", etc.
-                self.prologue.writeline(
-                    DeferredLine(name, f"{var_name} = {f(scalar_expr)}")
-                )
-                self._logical_offset_vars[opspec_sym] = var_name
+            # M5: outside native matmul (own 2D grid) and the tiling-loop path
+            # (flat per-core tiling set up in the scheduler), drive the split
+            # dim(s) from program_id so the per-symbol work division matches the
+            # SDSC device-space split (spyre_div).  Otherwise fall back to the
+            # flat row-major xoffset decomposition.
+            if not self.is_native_matmul and self._tiling_loop_count is None:
+                self._emit_split_logical_offsets(name)
+            else:
+                for triton_sym, opspec_sym in self._triton_to_opspec.items():
+                    entry = self.range_tree_nodes[triton_sym]
+                    root = entry.root
+                    xoffset = TritonSymbols.block_offsets[root.symt]
+                    index_sym = root.index_sym()
+                    scalar_expr = sympy_subs(entry.expr, {index_sym: xoffset})
+                    var_name = str(opspec_sym)  # "c0", "c1", etc.
+                    self.prologue.writeline(
+                        DeferredLine(name, f"{var_name} = {f(scalar_expr)}")
+                    )
+                    self._logical_offset_vars[opspec_sym] = var_name
 
         # --- Logical layouts -> Device layouts ---
         # device_coords already reference c0, c1, ... (OpSpec symbols).
@@ -1580,6 +1671,18 @@ class SpyreTritonKernel(TritonKernel):
         # apply_splits_from_index_coeff already returns the correct per-symbol
         # division directly from op_it_space_splits, so return it as-is.
         if self.is_native_matmul:
+            return spyre_div
+
+        # M5: honor the SDSC device-space split directly.  The Level-2 logical
+        # offsets (see _emit_split_logical_offsets) drive the split dim(s) from
+        # program_id and leave unsplit dims at base 0 (the descriptor block
+        # covers their full range), so the per-symbol division must equal
+        # spyre_div.  This aligns the Triton and SDSC iteration-space dumps and
+        # makes the per-core tile shape match SDSC (same XBLOCK, transposed
+        # tile).  The tiling-loop path (CountedLoopSchedulerNode) keeps the flat
+        # row-major re-derivation below, since its Level-2 offsets are still the
+        # flat xoffset decomposition (per_core tiling set up in the scheduler).
+        if self._tiling_loop_count is None:
             return spyre_div
 
         # Total core count is always correct even when the per-symbol
