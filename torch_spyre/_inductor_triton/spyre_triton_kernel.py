@@ -152,37 +152,37 @@ class SpyreTritonOverrides(_TritonKernelOverrides):  # type: ignore[misc]
 
     @staticmethod
     def dot(a, b):  # type: ignore[override]
-        """Reshape 3D descriptor blocks to 2D and emit tl.dot."""
+        """Collapse descriptor blocks to matrices (or batched matrices) for tl.dot.
+
+        A descriptor block's two innermost dims are the stick split of the
+        contraction/free dim (``[..., sticks, elems]``); collapsing them yields
+        the matrix dim.  The leading dims are kept as-is, so:
+
+        - plain matmul: A ``[M, Ksticks, Kelems]`` -> ``[M, K]`` and
+          B ``[K, Nsticks, Nelems]`` -> ``[K, N]`` (2D tl.dot).
+        - batched matmul (bmm): A ``[B, M, Ksticks, Kelems]`` -> ``[B, M, K]``
+          and B ``[B, K, Nsticks, Nelems]`` -> ``[B, K, N]`` (batched tl.dot;
+          the leading batch dim is preserved).  The batch dim is placed first by
+          ``_batch_symbol_first_permutation`` when the descriptor is built.
+        """
         kernel = V.kernel
-        a_shape = getattr(a, "shape", None)
-        b_shape = getattr(b, "shape", None)
 
-        if a_shape and len(a_shape) == 3:
-            # A: [M_tile, K-sticks, K-elems] → [M_tile, K]
-            m_tile = int(a_shape[0])
-            k = int(a_shape[1]) * int(a_shape[2])
-            a_mat = kernel.cse.generate(
+        def _collapse(operand):
+            shape = getattr(operand, "shape", None)
+            if not shape or len(shape) < 3:
+                return operand  # already a (batched) matrix
+            lead = [int(s) for s in shape[:-2]]
+            inner = int(shape[-2]) * int(shape[-1])
+            new_shape = lead + [inner]
+            return kernel.cse.generate(
                 kernel.compute,
-                f"tl.reshape({a}, [{m_tile}, {k}])",
-                dtype=a.dtype,
-                shape=(str(m_tile), str(k)),
+                f"tl.reshape({operand}, {new_shape})",
+                dtype=operand.dtype,
+                shape=tuple(str(s) for s in new_shape),
             )
-        else:
-            a_mat = a
 
-        if b_shape and len(b_shape) == 3:
-            # B: [K, N-sticks, N-elems] → [K, N]
-            k2 = int(b_shape[0])
-            n = int(b_shape[1]) * int(b_shape[2])
-            b_mat = kernel.cse.generate(
-                kernel.compute,
-                f"tl.reshape({b}, [{k2}, {n}])",
-                dtype=b.dtype,
-                shape=(str(k2), str(n)),
-            )
-        else:
-            b_mat = b
-
+        a_mat = _collapse(a)
+        b_mat = _collapse(b)
         return f'tl.dot({a_mat}, {b_mat}, input_precision="ieee")'
 
 
@@ -799,6 +799,42 @@ class SpyreTritonKernel(TritonKernel):
                 return [k] + [i for i in range(len(device_coords)) if i != k]
         return list(range(len(device_coords)))
 
+    def _batch_symbol(self) -> Optional[sympy.Symbol]:
+        """OpSpec symbol of the bmm batch dim (the ``z`` Triton prefix), or None.
+
+        A batched matmul has a 3D grid (z=batch, y=M, x=N); a plain 2D matmul
+        has no ``z`` prefix.  The batch symbol is used to keep the batch device
+        dim leading so the loaded block reshapes to a batched matrix for tl.dot.
+        """
+        syms = self.triton_opspec_map.get("z")
+        return syms[0] if syms else None
+
+    def _batch_symbol_first_permutation(
+        self, device_coords: list, batch_sym: sympy.Symbol
+    ) -> list:
+        """Permutation that leads with the batch dim, then the plain-symbol dim.
+
+        For a bmm operand the device layout carries both the batch symbol and
+        the matmul row/contraction symbol as bare iteration symbols.  This
+        orders them ``[batch, plain_symbol, <remaining stick dims>]`` so the
+        loaded block reshapes cleanly to ``[B, M, K]`` / ``[B, K, N]`` (batch
+        leading) for a batched tl.dot.  Falls back to ``_symbol_first_permutation``
+        when the batch dim is absent from this tensor.
+        """
+        batch_idx = next(
+            (k for k, c in enumerate(device_coords) if c == batch_sym), None
+        )
+        if batch_idx is None:
+            return self._symbol_first_permutation(device_coords)
+        rest = [i for i in range(len(device_coords)) if i != batch_idx]
+        # The plain-symbol (matmul row/contraction) dim among the non-batch dims.
+        sym_idx = next(
+            (i for i in rest if isinstance(device_coords[i], sympy.Symbol)),
+            rest[0],
+        )
+        ordered_rest = [sym_idx] + [i for i in rest if i != sym_idx]
+        return [batch_idx] + ordered_rest
+
     def _gather_output_permutation(
         self, device_coords: list, row_sym: Optional[sympy.Symbol]
     ) -> list:
@@ -860,7 +896,13 @@ class SpyreTritonKernel(TritonKernel):
         if row_sym is not None:
             perm = self._gather_output_permutation(device_coords, row_sym)
         else:
-            perm = self._symbol_first_permutation(device_coords)
+            batch_sym = self._batch_symbol()
+            if batch_sym is not None and any(c == batch_sym for c in device_coords):
+                # bmm: keep the batch dim leading (then symbol-first) so the
+                # loaded block reshapes to a batched matrix for tl.dot.
+                perm = self._batch_symbol_first_permutation(device_coords, batch_sym)
+            else:
+                perm = self._symbol_first_permutation(device_coords)
 
         phys_strides = self._row_major_strides(device_size)
         phys_block_shape = self._device_block_shape(device_size, device_coords)
