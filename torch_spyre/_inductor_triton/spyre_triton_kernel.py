@@ -1501,7 +1501,8 @@ class SpyreTritonKernel(TritonKernel):
                 device_size=[int(s) for s in layout.device_layout.device_size],
                 device_coordinates=coords,
                 allocation=dict(layout.allocation),
-                stride_map=list(layout.device_layout.stride_map),
+                per_tile_fixed=getattr(layout, "per_tile_fixed", False),
+                name=self._opspec_name or self.current_node.get_name(),
             )
 
         args = []
