@@ -352,7 +352,22 @@ class SpyreTritonKernel(TritonKernel):
         # and the same dict object is serialized into the generated Python —
         # mutations here ARE reflected in the @fixed_config decorator call.
         if self.triton_meta is not None and self.triton_opspec_map:
-            self.triton_meta["spyre_grid"] = self._compute_spyre_grid()
+            # M6 (inter-core reduction): the reduction dim is sharded across
+            # cores, so the grid is the flat product of all split divisors
+            # (spatial x reduction) and each tile's slice indices are carried in
+            # work_slices.  Otherwise use the spatial-only grid.
+            if self._is_inter_core_reduction():
+                grid, work_slices = self._build_work_slices()
+                self.triton_meta["spyre_grid"] = grid
+                self.triton_meta["spyre_work_slices"] = work_slices
+                logger.debug(
+                    "SpyreTritonKernel: M6 grid=%s work_slices(len=%d)=%s",
+                    grid,
+                    len(work_slices),
+                    work_slices,
+                )
+            else:
+                self.triton_meta["spyre_grid"] = self._compute_spyre_grid()
 
         # Bundle entry: merge spyre_grids / spyre_entry / spyre_grid so they
         # serialize into the entry's @fixed_config decorator (triton_meta is set
@@ -437,6 +452,96 @@ class SpyreTritonKernel(TritonKernel):
             grid.append(max(1, (numel_hint + block - 1) // block))
         assert grid, "_compute_spyre_grid: no x-range numel found in self.numels"
         return tuple(grid)
+
+    def _reduction_core_division(self) -> dict[sympy.Symbol, int]:
+        """Reduction OpSpec symbols that SDSC split across more than one core.
+
+        Mirrors the reduction/spatial partition of ``_emit_split_logical_offsets``
+        (``range_tree_nodes[ts].prefix.startswith("r")``).  Returns ``{opspec_sym:
+        divisor}`` for each reduction symbol whose core divisor is > 1 — the
+        shard that the spatial-only grid (``_compute_spyre_grid``) drops today.
+        """
+        result: dict[sympy.Symbol, int] = {}
+        for triton_sym, opspec_sym in self._triton_to_opspec.items():
+            entry = self.range_tree_nodes[triton_sym]
+            if not entry.prefix.startswith("r"):
+                continue
+            div = self._core_division.get(opspec_sym, 1)
+            if div > 1:
+                result[opspec_sym] = div
+        return result
+
+    def _is_inter_core_reduction(self) -> bool:
+        """True when this kernel is an M6 inter-core reduction.
+
+        Single standalone ``sum`` whose reduction dim SDSC sharded across cores.
+        Excludes native matmul (independent 2D grid) and the tiling-loop path
+        (reduction divisors hard-set to 1).
+        """
+        if not self.inside_reduction:
+            return False
+        if self.is_native_matmul:
+            return False
+        if self._tiling_loop_count is not None:
+            return False
+        if not self._triton_to_opspec:
+            return False
+        return bool(self._reduction_core_division())
+
+    def _build_work_slices(self) -> tuple[tuple, list[dict]]:
+        """Flat 1D grid + per-tile ``work_slices`` for an inter-core reduction.
+
+        Axis order matches ``_emit_split_logical_offsets``: spatial split syms
+        outer-first (largest range-tree divisor varies slowest), reduced sym
+        innermost/fastest (the K-shards of one output group are contiguous, so
+        reduced-slice ``== 0`` is pick0).  Each ``work_slices`` entry maps
+        ``str(opspec_sym) -> slice_index``.  ``grid = (prod(divisors),)`` so
+        ``prod(grid) == len(work_slices)``.
+        """
+        spatial: list[tuple[sympy.Symbol, sympy.Symbol]] = []
+        reduction: list[tuple[sympy.Symbol, sympy.Symbol]] = []
+        for triton_sym, opspec_sym in self._triton_to_opspec.items():
+            entry = self.range_tree_nodes[triton_sym]
+            if entry.prefix.startswith("r"):
+                reduction.append((triton_sym, opspec_sym))
+            else:
+                spatial.append((triton_sym, opspec_sym))
+
+        # Spatial split dims, outermost (largest range-tree divisor) first.
+        spatial_split = [
+            (ts, os) for ts, os in spatial if self._core_division.get(os, 1) > 1
+        ]
+        spatial_split.sort(
+            key=lambda p: V.graph.sizevars.size_hint(
+                self.range_tree_nodes[p[0]].divisor
+            ),
+            reverse=True,
+        )
+        reduction_split = [
+            (ts, os) for ts, os in reduction if self._core_division.get(os, 1) > 1
+        ]
+
+        # Axis order: spatial (outer-first) then reduced (innermost/fastest).
+        axes: list[tuple[sympy.Symbol, int]] = [
+            (os, self._core_division[os]) for _, os in spatial_split
+        ]
+        axes += [(os, self._core_division[os]) for _, os in reduction_split]
+
+        total = 1
+        for _, div in axes:
+            total *= div
+
+        # Radix decode: innermost axis varies fastest (matches the
+        # _emit_split_logical_offsets `(pid // inner) % div` decomposition).
+        work_slices: list[dict] = []
+        for tile_id in range(total):
+            rem = tile_id
+            slot: dict[str, int] = {}
+            for opspec_sym, div in reversed(axes):
+                slot[str(opspec_sym)] = rem % div
+                rem //= div
+            work_slices.append(slot)
+        return (total,), work_slices
 
     def load(self, name: str, index: sympy.Expr):
         if not self.triton_opspec_map:
