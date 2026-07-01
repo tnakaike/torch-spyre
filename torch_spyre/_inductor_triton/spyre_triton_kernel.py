@@ -254,6 +254,13 @@ class SpyreTritonKernel(TritonKernel):
         self._device_offset_vars: dict[tuple, list[str]] = {}
         # Guard: dump the per-kernel opspec file only once per kernel instance.
         self._opspec_dumped: bool = False
+        # M6 (inter-core reduction): per-tile work_slices list built in
+        # codegen_body() and baked as a module-level constexpr in codegen_kernel()
+        # (§6).  None for non-M6 kernels.
+        self._work_slices: Optional[list[dict]] = None
+        # Cached M6 decision, computed in set_current_node() while current_node is
+        # live; read back in codegen_body() (after current_node is cleared).
+        self._inter_core_reduction: Optional[bool] = None
         # Tiling loop state (set by SpyreTritonScheduling for CountedLoopSchedulerNode).
         self._tiling_loop_count: Optional[int] = None
         self._tiling_loop_tiled_syms: list[sympy.Symbol] = []
@@ -314,11 +321,23 @@ class SpyreTritonKernel(TritonKernel):
                 logger.debug(
                     "SpyreTritonKernel: fixed_config=%s", self.fixed_config.config
                 )
+                # Decide the M6 (inter-core reduction) case once, while
+                # current_node is live (the Risk-1 stick-alignment check and the
+                # within-stick lookup both need it).  codegen_body() runs after
+                # current_node is cleared, so it reads this cached flag.
+                self._inter_core_reduction = self._compute_inter_core_reduction()
             yield
 
     def codegen_kernel(self, name=None, as_bundled_kernel=False) -> str:
         src = super().codegen_kernel(name)
         if not as_bundled_kernel:
+            # M6 (§6): bake the per-tile work_slices as a module-level constexpr
+            # literal so the kernel body's tl.wk_slice_coord(work_slices, ...)
+            # calls resolve it as a Triton-captured global.  Inserted above the
+            # @triton_heuristics.fixed_config decorator (module scope, after the
+            # import block), mirroring 2606's LX_TMP baked-constant pattern.
+            if self._work_slices is not None:
+                src = self._bake_work_slices(src)
             return src
         # Bundled-kernel flavor for a SpyreTritonKernelBundle: keep only the
         # function (from `def {name}(` onward) and make it a device-callable
@@ -335,6 +354,25 @@ class SpyreTritonKernel(TritonKernel):
             if line.lstrip().startswith(f"def {name}(")
         )
         return "@triton.jit(noinline=True)\n" + "\n".join(lines[def_idx:])
+
+    def _bake_work_slices(self, src: str) -> str:
+        """Insert a module-level ``work_slices = [...]`` literal into the source.
+
+        The literal is placed just before the kernel's first decorator (module
+        scope, after the import block) so the @triton.jit body captures it.  A
+        global referenced from a @jit body must be instantiated as
+        ``tl.constexpr(...)`` (a bare literal raises ``Cannot access global
+        variable ... instantiated as constexpr``).  A list of int-keyed dicts
+        ``repr()``s to a valid Triton literal.
+        """
+        assert self._work_slices is not None
+        lines = src.splitlines()
+        dec_idx = next(
+            (i for i, line in enumerate(lines) if line.lstrip().startswith("@")),
+            len(lines),
+        )
+        bake = f"work_slices = tl.constexpr({self._work_slices!r})\n"
+        return "\n".join(lines[:dec_idx]) + "\n" + bake + "\n".join(lines[dec_idx:])
 
     def codegen_body(self):
         if self._tiling_loop_count is not None:
@@ -358,8 +396,13 @@ class SpyreTritonKernel(TritonKernel):
             # work_slices.  Otherwise use the spatial-only grid.
             if self._is_inter_core_reduction():
                 grid, work_slices = self._build_work_slices()
+                # Only spyre_grid rides the triton_meta channel to the backend
+                # (async_compile.py reads it for SpyreOptions.grid).  work_slices
+                # is referenced inside the kernel body via tl.wk_slice_coord, so
+                # it is baked as a module-level constexpr in codegen_kernel (§6)
+                # rather than serialized here.
                 self.triton_meta["spyre_grid"] = grid
-                self.triton_meta["spyre_work_slices"] = work_slices
+                self._work_slices = work_slices
                 logger.debug(
                     "SpyreTritonKernel: M6 grid=%s work_slices(len=%d)=%s",
                     grid,
@@ -431,15 +474,24 @@ class SpyreTritonKernel(TritonKernel):
             self.post_loop_store.clear()
 
     def _compute_spyre_grid(self) -> tuple:
-        """Compute the per-axis program count for SpyreOptions.grid.
+        """Compute the program count for SpyreOptions.grid.
 
-        Returns a tuple (num_x_programs [, num_y_programs]) where:
-          grid[0] = programs on axis 0 (x = tl.program_id(0))
-          grid[1] = programs on axis 1 (y = tl.program_id(1)), if present
+        For native matmul, returns the per-axis tuple
+        (num_x_programs, num_y_programs) — the body genuinely reads both
+        tl.program_id(0) and tl.program_id(1) (e.g. (1, 32) for a kernel with
+        XBLOCK=512/xnumel=512 and YBLOCK=8/ynumel=256).
 
-        For a 1D pointwise kernel with XBLOCK=16384 and xnumel=524288 the
-        result is (32,).  For a 2D matmul kernel with XBLOCK=512/xnumel=512
-        and YBLOCK=8/ynumel=256 the result is (1, 32).
+        For every other (descriptor / M5) kernel the grid is **flat 1D**
+        ``(total,)``.  ``_emit_split_logical_offsets`` linearizes the whole work
+        division onto ``tl.program_id(0)`` (the radix ``(pid // inner) % div``),
+        so the body reads a single program id.  A multi-axis grid would then
+        (a) fail DistributeWork's "grid rank N vs pid dimensionality 1" check
+        and (b) under-cover the work — with grid ``(2, 2)`` ``program_id(0)``
+        only ranges ``[0, 2)`` so the outer ``pid // 2`` tile never runs.  The
+        flat total equals the product of the per-axis program counts (XBLOCK /
+        YBLOCK partition each prefix, so the product is the core count the radix
+        assumes).  This mirrors the M6 flat grid and the planned program_id ->
+        work_slices unification.
         """
         config = self.fixed_config.config if self.fixed_config else {}
         grid = []
@@ -451,7 +503,12 @@ class SpyreTritonKernel(TritonKernel):
             numel_hint = V.graph.sizevars.size_hint(numel)
             grid.append(max(1, (numel_hint + block - 1) // block))
         assert grid, "_compute_spyre_grid: no x-range numel found in self.numels"
-        return tuple(grid)
+        if self.is_native_matmul:
+            return tuple(grid)
+        total = 1
+        for g in grid:
+            total *= g
+        return (total,)
 
     def _reduction_core_division(self) -> dict[sympy.Symbol, int]:
         """Reduction OpSpec symbols that SDSC split across more than one core.
@@ -472,11 +529,20 @@ class SpyreTritonKernel(TritonKernel):
         return result
 
     def _is_inter_core_reduction(self) -> bool:
+        """Cached M6 decision (computed in set_current_node, read everywhere).
+
+        Returns False until ``_compute_inter_core_reduction`` has run (i.e. for
+        kernels that never built a triton_opspec_map).
+        """
+        return bool(self._inter_core_reduction)
+
+    def _compute_inter_core_reduction(self) -> bool:
         """True when this kernel is an M6 inter-core reduction.
 
         Single standalone ``sum`` whose reduction dim SDSC sharded across cores.
         Excludes native matmul (independent 2D grid) and the tiling-loop path
-        (reduction divisors hard-set to 1).
+        (reduction divisors hard-set to 1).  Must run while ``current_node`` is
+        live (the Risk-1 check and within-stick lookup need it).
         """
         if not self.inside_reduction:
             return False
@@ -486,7 +552,52 @@ class SpyreTritonKernel(TritonKernel):
             return False
         if not self._triton_to_opspec:
             return False
-        return bool(self._reduction_core_division())
+        reduction_div = self._reduction_core_division()
+        if not reduction_div:
+            return False
+        # Scope (current increment): a single split reduction axis, sharded only
+        # on the outer-stick dim.  More than one split reduction axis is not
+        # supported.
+        if len(reduction_div) > 1:
+            raise NotImplementedError(
+                "SpyreTritonKernel: inter-core reduction over more than one "
+                f"split reduction axis is not supported (got {reduction_div})"
+            )
+        # Risk 1 (stick alignment): the shard must land on a stick boundary --
+        # the reduction extent must be divisible by reduction work_div x
+        # stick_size -- else the cut falls mid-stick and the outer-stick
+        # block_shape is silently wrong.  Bail to the non-M6 path (spatial-only
+        # grid) when that does not hold.
+        it_space = iteration_space(self.current_node)
+        stick_size = self._within_stick_size()
+        for opspec_sym, work_div in reduction_div.items():
+            s_range = V.graph.sizevars.size_hint(it_space[opspec_sym])
+            if s_range % work_div != 0 or (s_range // work_div) % stick_size != 0:
+                logger.debug(
+                    "SpyreTritonKernel: M6 bail -- reduction %s range=%d not "
+                    "stick-aligned for work_div=%d (stick=%d)",
+                    opspec_sym,
+                    s_range,
+                    work_div,
+                    stick_size,
+                )
+                return False
+        return True
+
+    def _within_stick_size(self) -> int:
+        """Within-stick width (innermost device dim) of the first tiled read.
+
+        Equals 128 bytes / dtype element size (64 at fp16/bf16).  Used by the
+        M6 stick-alignment guard; defaults to 64 when no tiled read is found.
+        """
+        for read_dep in self.current_node.read_writes.reads:
+            buf = V.graph.get_buffer(read_dep.name)
+            if buf is None:
+                continue
+            layout = buf.get_layout()
+            if isinstance(layout, FixedTiledLayout):
+                return int(layout.device_layout.device_size[-1])
+        return 64
 
     def _build_work_slices(self) -> tuple[tuple, list[dict]]:
         """Flat 1D grid + per-tile ``work_slices`` for an inter-core reduction.
@@ -750,12 +861,93 @@ class SpyreTritonKernel(TritonKernel):
             else None
         )
         result_dtype = getattr(value, "dtype", dtype)
-        return self.cse.generate(
+        # On-core partial: reduce the outer-stick axis this program owns.  The
+        # backend implicitly reduces the within-stick (NE) dim as well (see
+        # _get_reduction_axis), so this is the complete per-core reduction.
+        local_partial = self.cse.generate(
             self.compute,
             f"{triton_fn}({value}, {axis})",
             dtype=result_dtype,
             shape=result_shape,
         )
+        if not self._is_inter_core_reduction():
+            return local_partial
+
+        # M6 (§5): the reduction axis was sharded across cores, so each program
+        # holds only a partial sum.  Combine them over the split reduction axis
+        # via the HW reduce-sum ring (tl.inter_tile).  inter_tile requires a
+        # unit leading dim and returns rank-1 (result rank = partial rank - 1);
+        # reshape result_shape -> [1, *result_shape], reduce, and the collapsed
+        # result carries result_shape again -- store_reduction is unchanged.
+        group_name = self._group_axis_name()
+        reduced_name = self._reduced_reduction_axis_name()
+        # tl.inter_tile "axis" is the group dimension, not the reduced one.
+        self.compute.writeline(
+            f"# {group_name} is a group dimension. {reduced_name} is a "
+            f"reduction dimension."
+        )
+        shape_str = ", ".join(str(s) for s in result_shape)
+        partial = self.cse.generate(
+            self.compute,
+            f"tl.reshape({local_partial}, [1, {shape_str}])",
+            dtype=result_dtype,
+            shape=("1", *result_shape),
+        )
+        return self.cse.generate(
+            self.compute,
+            f'tl.inter_tile({partial}, axis="{group_name}", '
+            f'combiner="add", mode="reduce_to_one", work_slices=work_slices)',
+            dtype=result_dtype,
+            shape=result_shape,
+        )
+
+    def _reduced_reduction_axis_name(self) -> str:
+        """Name of the single split reduction axis (the pick0 store-guard axis).
+
+        This is the dim that varies *within* an inter-tile group and is summed
+        across cores -- NOT the ``tl.inter_tile`` ``axis=`` argument (that is the
+        group dim, ``_group_axis_name``).  It is used for the ``reduce_to_one``
+        pick0 store guard ``if tl.wk_slice_coord(work_slices, "<this>") == 0``.
+
+        M6 supports exactly one split reduction symbol (``> 1`` reduction axes
+        raise in ``_compute_inter_core_reduction``), so this unpacks the sole
+        key of ``_reduction_core_division()``.  Returns ``str(opspec_sym)`` --
+        the same name baked into every ``work_slices`` entry.
+        """
+        reduction_div = self._reduction_core_division()
+        assert len(reduction_div) == 1, (
+            f"_reduced_reduction_axis_name: expected exactly one split "
+            f"reduction axis, got {reduction_div}"
+        )
+        (sym,) = reduction_div
+        return str(sym)
+
+    def _group_axis_name(self) -> str:
+        """Grouping axis for ``tl.inter_tile`` (the ``axis=`` argument).
+
+        ``LowerInterTile`` partitions tiles by the *value* of this axis key:
+        tiles sharing the value form one group, and the shards that vary
+        *within* a group are reduced (LowerInterTile.cpp buildGroupSets).  So
+        ``axis`` names the spatial (non-reduced) dimension that identifies an
+        output group -- e.g. for ``sum(x, dim=k)`` split across cores, the
+        output-row symbol ``c0`` (group), while the K-shard symbol ``c1`` is the
+        varying reduced axis used for the pick0 store guard.
+
+        Current scope: exactly one spatial split axis (the backend groups by a
+        single axis key).  More than one would need multi-axis grouping the
+        backend does not yet support.
+        """
+        spatial_split = [
+            opspec_sym
+            for triton_sym, opspec_sym in self._triton_to_opspec.items()
+            if not self.range_tree_nodes[triton_sym].prefix.startswith("r")
+            and self._core_division.get(opspec_sym, 1) > 1
+        ]
+        assert len(spatial_split) == 1, (
+            f"_group_axis_name: inter-tile grouping needs exactly one spatial "
+            f"split axis, got {spatial_split}"
+        )
+        return str(spatial_split[0])
 
     def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
         if not self.triton_opspec_map:
@@ -815,7 +1007,16 @@ class SpyreTritonKernel(TritonKernel):
             shape=tuple(str(s) for s in block_shape),
         )
 
-        self._emit_descriptor_store(name, desc_var, offset_var_names, layout, reshaped)
+        # M6: reduce_to_one delivers the cross-core sum to pick0 (the shard whose
+        # reduction-axis slice index == 0); guard the store so only it writes.
+        pick0_axis = (
+            self._reduced_reduction_axis_name()
+            if self._is_inter_core_reduction()
+            else None
+        )
+        self._emit_descriptor_store(
+            name, desc_var, offset_var_names, layout, reshaped, pick0_axis=pick0_axis
+        )
 
     def _emit_tensor_descriptor(
         self,
@@ -1339,12 +1540,30 @@ class SpyreTritonKernel(TritonKernel):
         offset_var_names: list[str],
         layout: "FixedTiledLayout",
         value: CSEVariable,
+        pick0_axis: Optional[str] = None,
     ) -> None:
-        """Emit desc.store([dim0, dim1, ...], value)."""
+        """Emit desc.store([dim0, dim1, ...], value).
+
+        When ``pick0_axis`` is set (M6 reduce_to_one), only the tile whose
+        slice index on that reduction axis is 0 stores -- the HW reduce ring
+        delivers the combined sum to pick0, and the other shards of the group
+        must not write.  The guard and its indented store share the same
+        DeferredLine buffer name so both survive (or both drop) together under
+        removed-buffer DCE.
+        """
         offset_str = ", ".join(offset_var_names)
         store_line = f"{desc_var}.store([{offset_str}], {value})"
 
-        self.stores.writeline(DeferredLine(name, store_line))
+        if pick0_axis is not None:
+            self.stores.writeline(
+                DeferredLine(
+                    name,
+                    f'if tl.wk_slice_coord(work_slices, "{pick0_axis}") == 0:',
+                )
+            )
+            self.stores.writeline(DeferredLine(name, f"    {store_line}"))
+        else:
+            self.stores.writeline(DeferredLine(name, store_line))
         if not self.inside_reduction:
             self.outside_loop_vars.add(value)
         logger.debug("SpyreTritonKernel: store %s -> %s", name, store_line)
@@ -1391,23 +1610,32 @@ class SpyreTritonKernel(TritonKernel):
         for _, opspec_sym in split:
             total_split_cores *= self._core_division[opspec_sym]
 
-        # program_id(0) -> per-split-dim tile index -> tile base offset.
-        # With the innermost split dim varying fastest:
-        #   idx_s = (program_id(0) // inner_cores) % div_s
-        #   base  = idx_s * (range_s // div_s)
-        # The "// inner_cores" is dropped for the innermost dim and the
-        # "% div_s" for the outermost (it is then the identity over [0, ncores)).
+        # Per-split-dim tile index -> tile base offset.  Two sources for the
+        # slice index of each split dim:
+        #   M6 (§4): idx_s = tl.wk_slice_coord(work_slices, "<sym>") -- a direct
+        #     lookup into the baked per-tile table, indexed by program_id(0)
+        #     inside the builtin (no radix arithmetic; matches the backend
+        #     inter_tile_reduce fixtures and gives the reduced coord as a value
+        #     for the pick0 store guard).
+        #   non-M6 (M5): idx_s = (program_id(0) // inner_cores) % div_s, with the
+        #     innermost split dim varying fastest ("// inner_cores" dropped for
+        #     the innermost dim, "% div_s" for the outermost).
+        # In both cases base = idx_s * (range_s // div_s).
+        m6 = self._is_inter_core_reduction()
         inner_cores = 1
         bases: dict[sympy.Symbol, str] = {}
         for _, opspec_sym in reversed(split):  # innermost first
             div = self._core_division[opspec_sym]
             s_range = V.graph.sizevars.size_hint(it_space[opspec_sym])
             extent = max(1, s_range // div)
-            idx_expr = "tl.program_id(0)"
-            if inner_cores > 1:
-                idx_expr = f"({idx_expr} // {inner_cores})"
-            if inner_cores * div != total_split_cores:
-                idx_expr = f"({idx_expr} % {div})"
+            if m6:
+                idx_expr = f'tl.wk_slice_coord(work_slices, "{opspec_sym}")'
+            else:
+                idx_expr = "tl.program_id(0)"
+                if inner_cores > 1:
+                    idx_expr = f"({idx_expr} // {inner_cores})"
+                if inner_cores * div != total_split_cores:
+                    idx_expr = f"({idx_expr} % {div})"
             bases[opspec_sym] = idx_expr if extent == 1 else f"({idx_expr}) * {extent}"
             inner_cores *= div
 
@@ -1419,7 +1647,10 @@ class SpyreTritonKernel(TritonKernel):
             self.prologue.writeline(DeferredLine(name, f"{var_name} = {expr}"))
             self._logical_offset_vars[opspec_sym] = var_name
 
-        # Reduction symbols keep their range-tree offset (r0_offset).
+        # Reduction symbols keep their range-tree offset (r0_offset).  Under M6
+        # a split reduction sym additionally shards onto its outer-stick slice:
+        # ADD coord * extent (extent = range // work_div, stick-aligned per the
+        # Risk-1 check) so each core's reduction window covers its own sticks.
         for triton_sym, opspec_sym in reduction:
             entry = self.range_tree_nodes[triton_sym]
             root = entry.root
@@ -1427,9 +1658,15 @@ class SpyreTritonKernel(TritonKernel):
             index_sym = root.index_sym()
             scalar_expr = sympy_subs(entry.expr, {index_sym: xoffset})
             var_name = str(opspec_sym)
-            self.prologue.writeline(
-                DeferredLine(name, f"{var_name} = {f(scalar_expr)}")
-            )
+            expr_str = f(scalar_expr)
+            if m6 and self._core_division.get(opspec_sym, 1) > 1:
+                work_div = self._core_division[opspec_sym]
+                s_range = V.graph.sizevars.size_hint(it_space[opspec_sym])
+                extent = max(1, s_range // work_div)
+                coord = f'tl.wk_slice_coord(work_slices, "{opspec_sym}")'
+                shard = coord if extent == 1 else f"{coord} * {extent}"
+                expr_str = f"{expr_str} + {shard}"
+            self.prologue.writeline(DeferredLine(name, f"{var_name} = {expr_str}"))
             self._logical_offset_vars[opspec_sym] = var_name
 
     def _emit_scalar_offsets(self, name: str, device_coords: list) -> list[str]:
