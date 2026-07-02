@@ -71,11 +71,17 @@ def _patched_use_native_matmul(mat1, mat2) -> bool:
     m, k, n = mat1.get_size()[-2], mat1.get_size()[-1], mat2.get_size()[-1]
     if any(map(has_free_unbacked_symbols, [m, k, n])):
         return False
-    if (
-        V.graph.sizevars.statically_known_leq(m, 1)
-        or V.graph.sizevars.statically_known_leq(k, 1)
-        or V.graph.sizevars.statically_known_leq(n, 1)
-    ):
+    # Upstream rejects any degenerate dim (m/k/n <= 1) because GPU tl.dot does
+    # not tile a size-1 dimension well.  On Spyre we still want the decode-phase
+    # (seq_len == 1, so m == 1) GEMV-shaped linears to take the native-matmul
+    # (tl.dot) path rather than fall back to extern_kernels.bmm, which cannot run
+    # on-device.  Keep the k/n <= 1 guards (a genuinely degenerate contraction or
+    # output), but allow m == 1 for spyre.
+    if V.graph.sizevars.statically_known_leq(
+        k, 1
+    ) or V.graph.sizevars.statically_known_leq(n, 1):
+        return False
+    if device_type != "spyre" and V.graph.sizevars.statically_known_leq(m, 1):
         return False
     return True
 
