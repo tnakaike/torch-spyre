@@ -163,7 +163,17 @@ class SpyreTritonOverrides(_TritonKernelOverrides):  # type: ignore[misc]
         - batched matmul (bmm): A ``[B, M, Ksticks, Kelems]`` -> ``[B, M, K]``
           and B ``[B, K, Nsticks, Nelems]`` -> ``[B, K, N]`` (batched tl.dot;
           the leading batch dim is preserved).  The batch dim is placed first by
-          ``_batch_symbol_first_permutation`` when the descriptor is built.
+          ``_matmul_operand_permutation`` when the descriptor is built.
+
+        A linear-derived bmm carries a batch dim on the activation but a
+        broadcast (un-batched) weight, so the two collapsed operands differ in
+        rank (e.g. A ``[batch, M, K]`` vs B ``[K, N]``).  ``tl.dot`` requires
+        equal ranks; because the weight is shared across both batch and M, those
+        leading dims are all just matmul rows, so they are folded into a single
+        row dim on the higher-rank operand (``[batch, M, K] -> [batch*M, K]``).
+        The size-1 batch case (``[1, M, K] -> [M, K]``) is the degenerate
+        instance.  The store side reshapes the ``[rows, N]`` result back to the
+        output block shape.
         """
         kernel = V.kernel
 
@@ -181,8 +191,43 @@ class SpyreTritonOverrides(_TritonKernelOverrides):  # type: ignore[misc]
                 shape=tuple(str(s) for s in new_shape),
             )
 
+        def _fold_leading_dims(operand, target_rank):
+            # Fold the leading dims (all but the last, collapsed matrix dim)
+            # into a single row dim so the operand reaches target_rank.  For a
+            # broadcast-weight bmm the leading dims (batch, M) are all matmul
+            # rows sharing the same weight, so [batch, M, K] -> [batch*M, K]
+            # (and the size-1 [1, M, K] -> [M, K]) is exact.  Only used to match
+            # a broadcast operand's lower rank; a real bmm (both batched, equal
+            # rank) never reaches here.
+            shape = getattr(operand, "shape", None)
+            if shape is None or len(shape) <= target_rank or target_rank < 2:
+                return operand
+            dims = [int(s) for s in shape]
+            n_fold = len(dims) - target_rank + 1  # leading dims merged into one
+            row = 1
+            for s in dims[:n_fold]:
+                row *= s
+            new_shape = [row] + dims[n_fold:]
+            return kernel.cse.generate(
+                kernel.compute,
+                f"tl.reshape({operand}, {new_shape})",
+                dtype=operand.dtype,
+                shape=tuple(str(s) for s in new_shape),
+            )
+
         a_mat = _collapse(a)
         b_mat = _collapse(b)
+
+        # Reconcile operand ranks for tl.dot (linear-derived bmm: batched
+        # activation vs broadcast weight).  Fold the higher-rank operand's
+        # leading dims into its row dim.
+        ra = len(getattr(a_mat, "shape", ()) or ())
+        rb = len(getattr(b_mat, "shape", ()) or ())
+        if ra > rb > 0:
+            a_mat = _fold_leading_dims(a_mat, rb)
+        elif rb > ra > 0:
+            b_mat = _fold_leading_dims(b_mat, ra)
+
         return f'tl.dot({a_mat}, {b_mat}, input_precision="ieee")'
 
 
@@ -799,6 +844,55 @@ class SpyreTritonKernel(TritonKernel):
                 return [k] + [i for i in range(len(device_coords)) if i != k]
         return list(range(len(device_coords)))
 
+    @staticmethod
+    def _matmul_operand_permutation(
+        device_coords: list, batch_sym: Optional[sympy.Symbol] = None
+    ) -> list:
+        """Permutation placing the sticked matrix dim's stick pair innermost.
+
+        A Spyre matmul operand's non-leading matrix dim (K for A, N for B) is
+        stored as a stick split: an outer-stick dim (``FloorDiv(sym, stick)``)
+        and the within-stick dim (``Mod(sym, stick)``), the latter always the
+        last device dim.  ``SpyreTritonOverrides.dot()`` collapses the two
+        innermost dims into that matrix dim, so the outer-stick and within-stick
+        dims must be adjacent and innermost, with the remaining dims (the leading
+        matrix dim(s) — batch/M for A, batch/K for B) kept ahead of them.  When
+        a batch dim is present (bmm) it must lead so the block reshapes to a
+        batched matrix ``[B, M, K]`` / ``[B, K, N]`` for a batched tl.dot.
+
+        Anchoring on the stick pair — the two dims that share the within-stick
+        dim's iteration symbol — keeps this correct even when the row dim M is
+        size 1 and its coordinate degenerates to a constant ``0`` (the
+        decode-phase / GEMV case, where the old bare-symbol search found nothing
+        and left the K stick dims non-adjacent).  For a non-degenerate operand
+        it yields the same order the bare-symbol permutation did, so the working
+        matmul/bmm paths are unchanged.
+        """
+        rank = len(device_coords)
+        if rank < 3:
+            return list(range(rank))  # already a (batched) matrix; nothing to move
+        within = rank - 1  # within-stick dim is always the last device dim
+        within_syms = device_coords[within].free_symbols
+        outer = None
+        if within_syms:
+            outer = next(
+                (
+                    k
+                    for k in range(rank - 1)
+                    if device_coords[k].free_symbols & within_syms
+                ),
+                None,
+            )
+        if outer is None:
+            return list(range(rank))  # not stick-split; leave as-is
+        leading = [k for k in range(rank) if k not in (outer, within)]
+        # A batched-matmul operand must lead with its batch dim.
+        if batch_sym is not None:
+            b = next((k for k in leading if device_coords[k] == batch_sym), None)
+            if b is not None:
+                leading = [b] + [k for k in leading if k != b]
+        return leading + [outer, within]
+
     def _batch_symbol(self) -> Optional[sympy.Symbol]:
         """OpSpec symbol of the bmm batch dim (the ``z`` Triton prefix), or None.
 
@@ -896,13 +990,12 @@ class SpyreTritonKernel(TritonKernel):
         if row_sym is not None:
             perm = self._gather_output_permutation(device_coords, row_sym)
         else:
-            batch_sym = self._batch_symbol()
-            if batch_sym is not None and any(c == batch_sym for c in device_coords):
-                # bmm: keep the batch dim leading (then symbol-first) so the
-                # loaded block reshapes to a batched matrix for tl.dot.
-                perm = self._batch_symbol_first_permutation(device_coords, batch_sym)
-            else:
-                perm = self._symbol_first_permutation(device_coords)
+            # Matmul operand: place the sticked matrix dim's (outer-stick,
+            # within-stick) pair adjacent and innermost so dot() collapses them
+            # into the matrix dim, with the batch dim (bmm) kept leading.
+            # Anchoring on the stick pair (not a bare row symbol) stays correct
+            # when M == 1 collapses the row coordinate to a constant.
+            perm = self._matmul_operand_permutation(device_coords, self._batch_symbol())
 
         phys_strides = self._row_major_strides(device_size)
         phys_block_shape = self._device_block_shape(device_size, device_coords)
