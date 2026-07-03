@@ -40,15 +40,6 @@ enabling backend builtins exist under `../triton/third_party/spyre/` but are
 **not upstreamed yet**. Scope: `sum`-only, single split reduction axis,
 standalone `SpyreTritonKernel`. Read it before working on inter-core reduction.
 
-`PLAN-CPU-RuntimeIsolation.md` (same directory) is the **plan** for running the
-Triton **codegen + verify** path on a CPU-only box by isolating
-`torch_spyre._C` from the Spyre runtime. It is **plan only and blocked on
-environment setup** (a CPU box with Spyre SDK *headers* but no runtime libs).
-Chosen approach: a runtime-free `_C` build variant (`TORCH_SPYRE_NO_RUNTIME`)
-that keeps the layout subset (`DataFormats`, `SpyreTensorLayout`,
-`get_elem_in_stick`, …) and stubs the allocator/execution symbols to raise.
-Read it before touching `csrc`/`setup.py` for CPU support.
-
 `NEXT-STEP-extern-bmm.md` (same directory) is the **immediate next step**
 (investigated, fix pending): decode-phase `F.linear` cases (seq_len == 1, so
 `m == 1`) fall back to `extern_kernels.bmm` instead of a Spyre Triton kernel,
