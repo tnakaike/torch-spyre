@@ -461,15 +461,23 @@ class SpyreTritonKernel(TritonKernel):
             self.post_loop_store.clear()
 
     def _compute_spyre_grid(self) -> tuple:
-        """Compute the per-axis program count for SpyreOptions.grid.
+        """Compute the program count for SpyreOptions.grid.
 
-        Returns a tuple (num_x_programs [, num_y_programs]) where:
-          grid[0] = programs on axis 0 (x = tl.program_id(0))
-          grid[1] = programs on axis 1 (y = tl.program_id(1)), if present
+        For native matmul, returns the per-axis tuple
+        (num_x_programs, num_y_programs) — the body genuinely reads both
+        tl.program_id(0) and tl.program_id(1) (e.g. (1, 32) for a kernel with
+        XBLOCK=512/xnumel=512 and YBLOCK=8/ynumel=256).
 
-        For a 1D pointwise kernel with XBLOCK=16384 and xnumel=524288 the
-        result is (32,).  For a 2D matmul kernel with XBLOCK=512/xnumel=512
-        and YBLOCK=8/ynumel=256 the result is (1, 32).
+        For every other (descriptor / M5) kernel the grid is **flat 1D**
+        ``(total,)``.  ``_emit_split_logical_offsets`` linearizes the whole work
+        division onto ``tl.program_id(0)`` (the radix ``(pid // inner) % div``),
+        so the body reads a single program id.  A multi-axis grid would then
+        (a) fail DistributeWork's "grid rank N vs pid dimensionality 1" check
+        and (b) under-cover the work — with grid ``(2, 2)`` ``program_id(0)``
+        only ranges ``[0, 2)`` so the outer ``pid // 2`` tile never runs.  The
+        flat total equals the product of the per-axis program counts (XBLOCK /
+        YBLOCK partition each prefix, so the product is the core count the radix
+        assumes).
         """
         config = self.fixed_config.config if self.fixed_config else {}
         grid = []
@@ -481,7 +489,12 @@ class SpyreTritonKernel(TritonKernel):
             numel_hint = V.graph.sizevars.size_hint(numel)
             grid.append(max(1, (numel_hint + block - 1) // block))
         assert grid, "_compute_spyre_grid: no x-range numel found in self.numels"
-        return tuple(grid)
+        if self.is_native_matmul:
+            return tuple(grid)
+        total = 1
+        for g in grid:
+            total *= g
+        return (total,)
 
     def load(self, name: str, index: sympy.Expr):
         if not self.triton_opspec_map:
