@@ -40,6 +40,16 @@ enabling backend builtins exist under `../triton/third_party/spyre/` but are
 **not upstreamed yet**. Scope: `sum`-only, single split reduction axis,
 standalone `SpyreTritonKernel`. Read it before working on inter-core reduction.
 
+`PLAN-KTIR-CPU-Integration.md` (same directory) is the **plan** for executing
+the emitted KTIR on CPU via `../ktir-cpu` (NumPy interpreter, no Spyre device)
+so we can do a real numerics check instead of stopping at `NoneType…run`. It is
+**plan only and blocked on environment setup**. Key decision: build ktir-cpu's
+`mlir_ktdp` from the `ktir-mlir-frontend` **inside triton**
+(`../triton/third_party/spyre/ktir-mlir-frontend`) so emitter and parser share
+one dialect definition; all four repos are moving targets, so no pinning — fix
+drift on demand. Seam is `SpyreTritonAsyncCompile.triton()` (which currently
+discards `triton.compile()`'s result). Read it before wiring KTIR-CPU execution.
+
 `NEXT-STEP-extern-bmm.md` (same directory) is the **immediate next step**
 (investigated, fix pending): decode-phase `F.linear` cases (seq_len == 1, so
 `m == 1`) fall back to `extern_kernels.bmm` instead of a Spyre Triton kernel,
