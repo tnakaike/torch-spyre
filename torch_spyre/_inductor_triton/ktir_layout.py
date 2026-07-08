@@ -1,0 +1,175 @@
+# Copyright 2025 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Physical-layout (stickification) helpers for the KTIR-CPU execution path.
+
+KTIR runs on the Spyre **physical** ("sticked") device layout. This module
+converts between logical PyTorch tensors and physical-layout tensors, entirely
+on the host, reusing the ``SpyreTensorLayout`` (``device_size`` / ``stride_map``)
+that torch-spyre already computes and bakes into the generated wrapper.
+
+- ``ktir_empty_with_layout`` -- allocate a zeroed physical-layout tensor (the
+  device-free stand-in for ``spyre_empty_with_layout``); allocating an empty
+  buffer in physical shape is the trivial (data-free) case of stickification.
+- ``ktir_stickify`` -- logical PyTorch tensor -> physical-layout tensor (reorder +
+  pad), for real kernel inputs.
+- ``ktir_destickify`` -- physical-layout tensor -> logical PyTorch tensor, for the
+  values returned from the compiled function.
+
+Physical layout is STANDARD element arrangement (no intra-stick permutation).
+The reorder is governed by the identity
+``logical_offset = sum_i device_coord[i] * stride_map[i]`` with ``stride_map[i]``
+of ``-1`` (synthetic/pad) and ``0`` (broadcast) contributing 0. Only the split
+"stick" dimension introduces padding; positions past the logical extent are
+left zero.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Optional, Sequence
+
+import numpy as np
+import torch
+
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+
+logger = get_inductor_logger("ktir_layout")
+
+__all__ = ["ktir_empty_with_layout", "ktir_stickify", "ktir_destickify"]
+
+
+def _row_major_strides(size: Sequence[int]) -> list[int]:
+    strides = [1] * len(size)
+    for k in range(len(size) - 2, -1, -1):
+        strides[k] = strides[k + 1] * int(size[k + 1])
+    return strides
+
+
+def _gather_index_and_mask(
+    logical_size: Sequence[int],
+    device_size: Sequence[int],
+    stride_map: Sequence[int],
+) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    """Map each physical position to a flat logical offset, plus a padding mask.
+
+    Returns ``(idx, mask)`` both shaped ``device_size``: ``idx[p]`` is the flat
+    row-major offset into the logical tensor that physical position ``p`` holds;
+    ``mask[p]`` is False for padding positions (past the logical extent of the
+    split stick dimension), or ``None`` when there is no padding.
+    """
+    device_size = [int(d) for d in device_size]
+    stride_map = [int(s) for s in stride_map]
+    rank = len(device_size)
+    eps = device_size[-1]
+
+    idx = np.zeros(device_size, dtype=np.int64)
+    for i, sm in enumerate(stride_map):
+        if sm > 0:  # -1 (synthetic/pad) and 0 (broadcast) contribute nothing
+            shape = [device_size[i] if d == i else 1 for d in range(rank)]
+            idx = idx + np.arange(device_size[i], dtype=np.int64).reshape(shape) * sm
+
+    # Padding arises only from the split stick dim: the within-stick dim (last)
+    # and an outer dim carry the same logical dim, and the logical extent may not
+    # be a multiple of eps. Identify them via the stride_map and mask the tail.
+    mask: Optional[np.ndarray] = None
+    base = stride_map[-1]
+    if base > 0:
+        host_strides = _row_major_strides(logical_size)
+        sticked = next((k for k, hs in enumerate(host_strides) if hs == base), None)
+        outer = next((i for i, sm in enumerate(stride_map) if sm == eps * base), None)
+        if sticked is not None and outer is not None:
+            extent = int(logical_size[sticked])
+            if extent < device_size[outer] * eps:  # only if actually padded
+                outer_ax = np.arange(device_size[outer], dtype=np.int64).reshape(
+                    [device_size[outer] if d == outer else 1 for d in range(rank)]
+                )
+                within_ax = np.arange(eps, dtype=np.int64).reshape(
+                    [eps if d == rank - 1 else 1 for d in range(rank)]
+                )
+                mask = np.broadcast_to(
+                    (outer_ax * eps + within_ax) < extent, device_size
+                )
+    return idx, mask
+
+
+def ktir_empty_with_layout(
+    size: Sequence[int],
+    stride: Sequence[int],
+    dtype: torch.dtype,
+    device_layout: Any,
+) -> torch.Tensor:
+    """Allocate a zeroed physical-layout tensor (drop-in for
+    ``spyre_empty_with_layout``).
+
+    ``size`` / ``stride`` are the logical shape / stride (unused for allocation);
+    the physical shape is ``device_layout.device_size``. Returns a CPU
+    ``torch.Tensor`` (not a Spyre-device tensor) so the device-free path can
+    operate on it; the runner converts it to NumPy for ktir-cpu.
+    """
+    device_size = [int(d) for d in device_layout.device_size]
+    if not device_size:
+        raise ValueError("ktir_empty_with_layout: device_layout has empty device_size")
+    return torch.zeros(device_size, dtype=dtype)
+
+
+def ktir_stickify(logical: torch.Tensor, device_layout: Any) -> torch.Tensor:
+    """Convert a logical PyTorch tensor to its physical (sticked) layout tensor."""
+    device_size = [int(d) for d in device_layout.device_size]
+    stride_map = [int(s) for s in device_layout.stride_map]
+    idx, mask = _gather_index_and_mask(list(logical.shape), device_size, stride_map)
+
+    src = logical.detach().cpu().contiguous().numpy().reshape(-1)
+    idx_flat = idx.reshape(-1)
+    if mask is not None:
+        m = mask.reshape(-1)
+        safe = np.where(m, idx_flat, 0)
+        phys = np.where(m, src[safe], 0)
+    else:
+        phys = src[idx_flat]
+    phys = np.ascontiguousarray(phys.reshape(device_size))
+    logger.debug(
+        "ktir_stickify: logical %s -> physical %s",
+        tuple(logical.shape),
+        tuple(device_size),
+    )
+    return torch.from_numpy(phys).to(logical.dtype)
+
+
+def ktir_destickify(
+    physical: torch.Tensor,
+    logical_size: Sequence[int],
+    device_layout: Any,
+) -> torch.Tensor:
+    """Convert a physical (sticked) layout tensor back to a logical PyTorch tensor."""
+    device_size = [int(d) for d in device_layout.device_size]
+    stride_map = [int(s) for s in device_layout.stride_map]
+    logical_size = [int(d) for d in logical_size]
+    idx, mask = _gather_index_and_mask(logical_size, device_size, stride_map)
+
+    phys = physical.detach().cpu().contiguous().numpy().reshape(-1)
+    out = np.zeros(math.prod(logical_size) if logical_size else 1, dtype=phys.dtype)
+    idx_flat = idx.reshape(-1)
+    if mask is not None:
+        m = mask.reshape(-1)
+        out[idx_flat[m]] = phys[m]
+    else:
+        out[idx_flat] = phys
+    out = np.ascontiguousarray(out.reshape(logical_size))
+    logger.debug(
+        "ktir_destickify: physical %s -> logical %s",
+        tuple(physical.shape),
+        tuple(logical_size),
+    )
+    return torch.from_numpy(out).to(physical.dtype)
