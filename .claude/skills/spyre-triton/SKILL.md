@@ -50,6 +50,17 @@ one dialect definition; all four repos are moving targets, so no pinning — fix
 drift on demand. Seam is `SpyreTritonAsyncCompile.triton()` (which currently
 discards `triton.compile()`'s result). Read it before wiring KTIR-CPU execution.
 
+`PLAN-FlexRuntimeIsolation.md` (same directory) is a **BACKLOG** plan
+(investigated, file-map verified) for building `torch_spyre._C` with **no libflex
+link** via a `TORCH_SPYRE_NO_RUNTIME` flag — keeping only the layout-decision
+logic (`SpyreTensorLayout` / `DataFormats` / `elems_per_stick`, all from the
+header-only `util/sendefs.h`) and dropping/mocking the runtime. Deferred: the
+preferred near-term approach is a **runtime toggle** that routes execution to
+ktir-cpu while flex stays linked, so the SDSC+flex path remains available for
+comparison in the same build (part of the KTIR-CPU work). This static isolation
+is the fallback for flex-less environments. Read it before touching
+`torch_spyre/csrc` or `setup.py` for a no-runtime build.
+
 `NEXT-STEP-extern-bmm.md` (same directory) is the **immediate next step**
 (investigated, fix pending): decode-phase `F.linear` cases (seq_len == 1, so
 `m == 1`) fall back to `extern_kernels.bmm` instead of a Spyre Triton kernel,
