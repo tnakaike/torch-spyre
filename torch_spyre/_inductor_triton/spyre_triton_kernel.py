@@ -540,10 +540,21 @@ class SpyreTritonKernel(TritonKernel):
             desc_var, offset_var_names, block_shape = (
                 self._emit_symbol_first_tensor_descriptor(name, var, dep, layout)
             )
-        else:
-            desc_var, offset_var_names, block_shape = self._emit_tensor_descriptor(
-                name, var, dep, layout
+            return self._emit_descriptor_load(
+                name, desc_var, offset_var_names, block_shape, layout
             )
+
+        # Pointwise path: align the loaded tile to the output tensor's device-block
+        # order/shape when the operand's device layout differs (broadcast /
+        # heterogeneous stick dim).  See PLAN-BroadcastAlignment.md.
+        if not self.inside_reduction:
+            aligned = self._maybe_emit_aligned_pointwise_load(name, var, dep, layout)
+            if aligned is not None:
+                return aligned
+
+        desc_var, offset_var_names, block_shape = self._emit_tensor_descriptor(
+            name, var, dep, layout
+        )
         return self._emit_descriptor_load(
             name, desc_var, offset_var_names, block_shape, layout
         )
@@ -1705,6 +1716,182 @@ class SpyreTritonKernel(TritonKernel):
                     divisor *= loop_count
             size_hint = V.graph.sizevars.size_hint(device_size[k])
             result.append(max(1, size_hint // max(1, divisor)))
+        return result
+
+    def _pointwise_output_layout(self):
+        """(device_size, coords, block) for the current node's tiled write dep.
+
+        This is the canonical target that pointwise operand tiles are aligned
+        to.  Returns None when there is no ``FixedTiledLayout`` output.
+        """
+        it_space = iteration_space(self.current_node)
+        it_syms = set(it_space.keys())
+        for dep in self.current_node.read_writes.writes:
+            buf = V.graph.get_buffer(dep.name)
+            if buf is None:
+                continue
+            layout = buf.get_layout()
+            if not isinstance(layout, FixedTiledLayout):
+                continue
+            device_size = [int(s) for s in layout.device_layout.device_size]
+            idx = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
+            idx = concretize_index(idx, it_syms)
+            coords = compute_coordinates(
+                device_size, layout.device_layout.stride_map, it_space, idx
+            )
+            block = self._device_block_shape(device_size, coords)
+            return device_size, coords, block
+        return None
+
+    @staticmethod
+    def _dim_info(coord, it_syms) -> tuple[str, Optional[sympy.Symbol]]:
+        """Classify a device-dim coordinate as ``(kind, sym)``.
+
+        ``kind`` is one of ``const`` (no iteration symbol — a broadcast / padded
+        / synthetic dim), ``bare`` (``cN``), ``within`` (``Mod(cN, stick)`` — the
+        within-stick split), ``outer`` (``FloorDiv(cN, stick)`` — the outer-stick
+        split), or ``multi`` (unsupported: >1 iteration symbol).  ``sym`` is the
+        single iteration symbol the dim depends on (``None`` for const/multi).
+        """
+        syms = coord.free_symbols & it_syms
+        if not syms:
+            return ("const", None)
+        if len(syms) > 1:
+            return ("multi", None)
+        sym = next(iter(syms))
+        if isinstance(coord, sympy.Symbol):
+            return ("bare", sym)
+        if isinstance(coord, (sympy.Mod, ModularIndexing)):
+            return ("within", sym)
+        return ("outer", sym)  # FloorDiv(sym, stick) / floor(sym / stick)
+
+    def _maybe_emit_aligned_pointwise_load(self, name, var, dep, layout):
+        """Load a pointwise operand aligned to the output's device-block order.
+
+        Returns ``None`` (caller falls back to the normal descriptor load) when
+        the operand's device layout matches the output's — keeping same-layout
+        kernels (e.g. add.py) byte-identical.  Otherwise load the operand's full
+        device block (the within-stick dim stays ``device_size[-1]`` — a
+        broadcast operand's stick is replicated across all elements at host→device
+        transfer, so reading position ``n`` yields the broadcast value), then
+        reshape + broadcast into the output device-block order/shape so the
+        pointwise compute and the store line up.  See PLAN-BroadcastAlignment.md.
+        """
+        out = self._pointwise_output_layout()
+        if out is None:
+            return None
+        _out_size, out_coords, out_block = out
+
+        it_space = iteration_space(self.current_node)
+        it_syms = set(it_space.keys())
+        device_size = [int(s) for s in layout.device_layout.device_size]
+        idx = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
+        idx = concretize_index(idx, it_syms)
+        op_coords = compute_coordinates(
+            device_size, layout.device_layout.stride_map, it_space, idx
+        )
+
+        # Fast path: identical device order -> no alignment needed.
+        if len(op_coords) == len(out_coords) and all(
+            a == b for a, b in zip(op_coords, out_coords)
+        ):
+            return None
+
+        desc_var, offset_var_names, op_block = self._emit_tensor_descriptor(
+            name, var, dep, layout
+        )
+        loaded = self._emit_descriptor_load(
+            name, desc_var, offset_var_names, op_block, layout
+        )
+        return self._align_tile_to_output(
+            loaded, op_coords, op_block, out_coords, out_block, it_syms
+        )
+
+    def _align_tile_to_output(
+        self, loaded, op_coords, op_block, out_coords, out_block, it_syms
+    ):
+        """Reshape + broadcast a loaded operand tile into the output block shape.
+
+        The within-stick dim (device_rank-1) always maps last→last: both are
+        ``device_size[-1]`` (never split), and a broadcast operand's stick is
+        replicated at transfer time, so reading it at the output's within-stick
+        position is correct.  Each remaining (outer) output dim is matched to the
+        operand outer dim with the same ``(kind, sym)``; unmatched output dims are
+        broadcast (extent 1 → ``tl.broadcast_to``).
+        """
+        rank_op = len(op_coords)
+        rank_out = len(out_coords)
+        if rank_op != rank_out:
+            raise NotImplementedError(
+                "broadcast alignment requires equal device rank: "
+                f"op_coords={op_coords} vs out_coords={out_coords}"
+            )
+
+        op_info = [self._dim_info(c, it_syms) for c in op_coords]
+        out_info = [self._dim_info(c, it_syms) for c in out_coords]
+
+        intermediate: list[int] = [1] * rank_out
+        out_to_op: list[Optional[int]] = [None] * rank_out
+
+        # Within-stick (last) dim: always last->last.
+        intermediate[rank_out - 1] = int(op_block[rank_op - 1])
+        out_to_op[rank_out - 1] = rank_op - 1
+        used: set[int] = {rank_op - 1}
+
+        # Outer dims: match by (kind, sym); unmatched -> broadcast (extent 1).
+        for o in range(rank_out - 1):
+            kind, sym = out_info[o]
+            if kind in ("const", "multi"):
+                continue
+            for a in range(rank_op - 1):
+                if a not in used and op_info[a] == (kind, sym):
+                    used.add(a)
+                    out_to_op[o] = a
+                    intermediate[o] = int(op_block[a])
+                    break
+
+        def _prod(xs):
+            p = 1
+            for x in xs:
+                p *= int(x)
+            return p
+
+        # Reshape must preserve element count: every operand dim with extent > 1
+        # must have been matched (else we would silently drop data).
+        if _prod(intermediate) != _prod(op_block):
+            raise NotImplementedError(
+                "broadcast alignment could not map every operand dim: "
+                f"op_coords={op_coords}, op_block={op_block}, out_coords={out_coords}"
+            )
+
+        # A pure tl.reshape preserves values only when the matched operand dims
+        # (extent > 1) keep their relative order in the output; a genuine
+        # transpose needs tl.permute -- deferred (PLAN-BroadcastAlignment.md M4).
+        matched_in_out_order = [
+            out_to_op[o]
+            for o in range(rank_out)
+            if out_to_op[o] is not None and int(op_block[out_to_op[o]]) > 1
+        ]
+        if matched_in_out_order != sorted(matched_in_out_order):
+            raise NotImplementedError(
+                "broadcast alignment needs a transpose (tl.permute); "
+                f"op_coords={op_coords} -> out_coords={out_coords}"
+            )
+
+        reshaped = self.cse.generate(
+            self.compute,
+            f"tl.reshape({loaded}, {self.index_to_str(intermediate)})",
+            dtype=loaded.dtype,
+            shape=tuple(str(s) for s in intermediate),
+        )
+        if intermediate == [int(s) for s in out_block]:
+            return reshaped
+        result = self.cse.generate(
+            self.compute,
+            f"tl.broadcast_to({reshaped}, {self.index_to_str(out_block)})",
+            dtype=loaded.dtype,
+            shape=tuple(str(s) for s in out_block),
+        )
         return result
 
     @staticmethod
