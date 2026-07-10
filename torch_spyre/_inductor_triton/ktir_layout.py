@@ -88,10 +88,28 @@ def _gather_index_and_mask(
     if base > 0:
         host_strides = _row_major_strides(logical_size)
         sticked = next((k for k, hs in enumerate(host_strides) if hs == base), None)
-        outer = next((i for i, sm in enumerate(stride_map) if sm == eps * base), None)
-        if sticked is not None and outer is not None:
+        # Padding exists only when the sticked logical dim does not fill whole
+        # sticks (its extent is not a multiple of the stick width ``eps``). When
+        # it divides evenly every stick is full, so there is no tail to mask --
+        # regardless of any stride coincidence with an unrelated dim.
+        if sticked is not None and int(logical_size[sticked]) % eps != 0:
             extent = int(logical_size[sticked])
-            if extent < device_size[outer] * eps:  # only if actually padded
+            num_sticks = -(-extent // eps)  # ceil(extent / eps)
+            # The outer-stick dim carries stride ``eps * base`` AND has exactly
+            # ``num_sticks`` entries. Matching both disambiguates it from an
+            # unrelated dim that merely shares the stride -- e.g. a leading head
+            # dim whose logical stride equals ``eps`` when ``head_dim == eps``,
+            # which would otherwise be mistaken for the outer-stick dim and
+            # wrongly zero out all but its first slice.
+            outer = next(
+                (
+                    i
+                    for i, sm in enumerate(stride_map)
+                    if sm == eps * base and int(device_size[i]) == num_sticks
+                ),
+                None,
+            )
+            if outer is not None:
                 outer_ax = np.arange(device_size[outer], dtype=np.int64).reshape(
                     [device_size[outer] if d == outer else 1 for d in range(rank)]
                 )
