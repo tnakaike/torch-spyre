@@ -61,26 +61,21 @@ comparison in the same build (part of the KTIR-CPU work). This static isolation
 is the fallback for flex-less environments. Read it before touching
 `torch_spyre/csrc` or `setup.py` for a no-runtime build.
 
-`NEXT-STEP-extern-bmm.md` (same directory) is the **immediate next step**
-(investigated, fix pending): decode-phase `F.linear` cases (seq_len == 1, so
-`m == 1`) fall back to `extern_kernels.bmm` instead of a Spyre Triton kernel,
-because the `m <= 1` guard in `_patched_use_native_matmul`
-(`spyre_triton_patches.py`) disables native matmul. Read it before touching the
-matmul / `use_native_matmul` path.
-
-`PLAN-BroadcastAlignment.md` (same directory) covers general broadcast-pointwise
-layout alignment in `SpyreTritonKernel` — **IMPLEMENTED for the broadcast case**
-(the transpose case is deferred/guarded). The pointwise path used to load each
-operand's raw device block and compute on it directly, which only works when all
-tensors share a device layout (e.g. `add.py`); broadcast / heterogeneous layouts
-(the K==1 matmul→`mul` case, `my-examples/bmm_k1.py`, and `add_broadcast.py`)
-mis-shaped the tile. `load()` now calls `_maybe_emit_aligned_pointwise_load`,
-which fast-paths same-layout operands (byte-identical codegen) and otherwise
-reshapes + `tl.broadcast_to`s each operand into the output's device-block order
-(within-stick maps last→last, kept full since the broadcast stick is replicated
-at host→device transfer). Verified end-to-end via ktir-cpu (add_broadcast 0.00098,
-bmm_k1 0.0078; matmul/bmm/add unchanged). Read it before touching the pointwise
-`load`/`store` / `_device_block_shape` path or the deferred transpose (M4) case.
+`PLAN-Restickify.md` (same directory) merges the former `NEXT-STEP-extern-bmm.md`
+and `PLAN-BroadcastAlignment.md`: their remaining work is one **ReStickify** issue
+— a transpose whose *within-stick* dimension symbol changes, which moves data
+across sticks so `tl.permute`/`tl.reshape` cannot express it. **Landed &
+verified:** the `extern_kernels.bmm` guard relaxation + `m == 1` matmul `tl.dot`
+codegen (`_matmul_operand_permutation` / `dot()._fold_leading_dims`), and
+broadcast-pointwise alignment (`_maybe_emit_aligned_pointwise_load` /
+`_align_tile_to_output`, byte-identical fast path for same-layout kernels like
+`add.py`; verified via ktir-cpu — add_broadcast 0.00098, bmm_k1 0.0078,
+matmul/bmm/add unchanged). **Open (backlog):** the ReStickify itself — seen as
+both the broadcast-alignment M4b case and the linear `F.linear` `kernel_0`
+weight-transpose — currently raises loud; its tractable sibling M4a (outer-dim
+`tl.permute`) and a separate non-pow2 `tl.arange` blocker are also tracked there.
+Read it before touching the matmul / `use_native_matmul` path or the pointwise
+`load`/`store` / `_device_block_shape` / transpose path.
 
 ## Quick-start
 
