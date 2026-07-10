@@ -81,6 +81,17 @@ def _normalize_floor_div(expr: sympy.Expr) -> sympy.Expr:
 
 logger = get_inductor_logger("spyre_triton_kernel")
 
+# Device-dim classification kinds returned by ``_dim_info``.  A Spyre tensor is
+# stored in 128-byte sticks; the last device dim is the *inner-stick* dim
+# (``var % stick``) and a split iteration dim also has an *outer-stick* dim
+# (``var // stick``).  A device coordinate depends on at most one iteration
+# symbol; the kind records how it does so.
+CONST = "const"  # no iteration symbol (broadcast / padded / synthetic dim)
+MULTI = "multi"  # >1 iteration symbol (unsupported)
+BARE = "bare"  # the bare symbol ``cN`` (a whole, un-split iteration dim)
+INNER_STICK = "inner_stick"  # ``Mod(cN, stick)`` — the inner-stick split
+OUTER_STICK = "outer_stick"  # ``FloorDiv(cN, stick)`` — the outer-stick split
+
 # TritonKernelOverrides is not publicly exported; access it via the class attr.
 _TritonKernelOverrides: type[Any] = TritonKernel.overrides
 
@@ -876,15 +887,15 @@ class SpyreTritonKernel(TritonKernel):
 
         A Spyre matmul operand's non-leading matrix dim (K for A, N for B) is
         stored as a stick split: an outer-stick dim (``FloorDiv(sym, stick)``)
-        and the within-stick dim (``Mod(sym, stick)``), the latter always the
+        and the inner-stick dim (``Mod(sym, stick)``), the latter always the
         last device dim.  ``SpyreTritonOverrides.dot()`` collapses the two
-        innermost dims into that matrix dim, so the outer-stick and within-stick
+        innermost dims into that matrix dim, so the outer-stick and inner-stick
         dims must be adjacent and innermost, with the remaining dims (the leading
         matrix dim(s) — batch/M for A, batch/K for B) kept ahead of them.  When
         a batch dim is present (bmm) it must lead so the block reshapes to a
         batched matrix ``[B, M, K]`` / ``[B, K, N]`` for a batched tl.dot.
 
-        Anchoring on the stick pair — the two dims that share the within-stick
+        Anchoring on the stick pair — the two dims that share the inner-stick
         dim's iteration symbol — keeps this correct even when the row dim M is
         size 1 and its coordinate degenerates to a constant ``0`` (the
         decode-phase / GEMV case, where the old bare-symbol search found nothing
@@ -895,27 +906,27 @@ class SpyreTritonKernel(TritonKernel):
         rank = len(device_coords)
         if rank < 3:
             return list(range(rank))  # already a (batched) matrix; nothing to move
-        within = rank - 1  # within-stick dim is always the last device dim
-        within_syms = device_coords[within].free_symbols
-        outer = None
-        if within_syms:
-            outer = next(
+        inner_stick = rank - 1  # inner-stick dim is always the last device dim
+        inner_stick_syms = device_coords[inner_stick].free_symbols
+        outer_stick = None
+        if inner_stick_syms:
+            outer_stick = next(
                 (
                     k
                     for k in range(rank - 1)
-                    if device_coords[k].free_symbols & within_syms
+                    if device_coords[k].free_symbols & inner_stick_syms
                 ),
                 None,
             )
-        if outer is None:
+        if outer_stick is None:
             return list(range(rank))  # not stick-split; leave as-is
-        leading = [k for k in range(rank) if k not in (outer, within)]
+        leading = [k for k in range(rank) if k not in (outer_stick, inner_stick)]
         # A batched-matmul operand must lead with its batch dim.
         if batch_sym is not None:
             b = next((k for k in leading if device_coords[k] == batch_sym), None)
             if b is not None:
                 leading = [b] + [k for k in leading if k != b]
-        return leading + [outer, within]
+        return leading + [outer_stick, inner_stick]
 
     def _batch_symbol(self) -> Optional[sympy.Symbol]:
         """OpSpec symbol of the bmm batch dim (the ``z`` Triton prefix), or None.
@@ -1015,7 +1026,7 @@ class SpyreTritonKernel(TritonKernel):
             perm = self._gather_output_permutation(device_coords, row_sym)
         else:
             # Matmul operand: place the sticked matrix dim's (outer-stick,
-            # within-stick) pair adjacent and innermost so dot() collapses them
+            # inner-stick) pair adjacent and innermost so dot() collapses them
             # into the matrix dim, with the batch dim (bmm) kept leading.
             # Anchoring on the stick pair (not a bare row symbol) stays correct
             # when M == 1 collapses the row coordinate to a constant.
@@ -1747,23 +1758,24 @@ class SpyreTritonKernel(TritonKernel):
     def _dim_info(coord, it_syms) -> tuple[str, Optional[sympy.Symbol]]:
         """Classify a device-dim coordinate as ``(kind, sym)``.
 
-        ``kind`` is one of ``const`` (no iteration symbol — a broadcast / padded
-        / synthetic dim), ``bare`` (``cN``), ``within`` (``Mod(cN, stick)`` — the
-        within-stick split), ``outer`` (``FloorDiv(cN, stick)`` — the outer-stick
-        split), or ``multi`` (unsupported: >1 iteration symbol).  ``sym`` is the
-        single iteration symbol the dim depends on (``None`` for const/multi).
+        ``kind`` is one of ``CONST`` (no iteration symbol — a broadcast / padded
+        / synthetic dim), ``BARE`` (``cN``), ``INNER_STICK`` (``Mod(cN, stick)``
+        — the inner-stick split), ``OUTER_STICK`` (``FloorDiv(cN, stick)`` — the
+        outer-stick split), or ``MULTI`` (unsupported: >1 iteration symbol).
+        ``sym`` is the single iteration symbol the dim depends on (``None`` for
+        ``CONST`` / ``MULTI``).
         """
         syms = coord.free_symbols & it_syms
         if not syms:
-            return ("const", None)
+            return (CONST, None)
         if len(syms) > 1:
-            return ("multi", None)
+            return (MULTI, None)
         sym = next(iter(syms))
         if isinstance(coord, sympy.Symbol):
-            return ("bare", sym)
+            return (BARE, sym)
         if isinstance(coord, (sympy.Mod, ModularIndexing)):
-            return ("within", sym)
-        return ("outer", sym)  # FloorDiv(sym, stick) / floor(sym / stick)
+            return (INNER_STICK, sym)
+        return (OUTER_STICK, sym)  # FloorDiv(sym, stick) / floor(sym / stick)
 
     def _maybe_emit_aligned_pointwise_load(self, name, var, dep, layout):
         """Load a pointwise operand aligned to the output's device-block order.
@@ -1771,7 +1783,7 @@ class SpyreTritonKernel(TritonKernel):
         Returns ``None`` (caller falls back to the normal descriptor load) when
         the operand's device layout matches the output's — keeping same-layout
         kernels (e.g. add.py) byte-identical.  Otherwise load the operand's full
-        device block (the within-stick dim stays ``device_size[-1]`` — a
+        device block (the inner-stick dim stays ``device_size[-1]`` — a
         broadcast operand's stick is replicated across all elements at host→device
         transfer, so reading position ``n`` yields the broadcast value), then
         reshape + broadcast into the output device-block order/shape so the
@@ -1787,67 +1799,67 @@ class SpyreTritonKernel(TritonKernel):
         device_size = [int(s) for s in layout.device_layout.device_size]
         idx = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
         idx = concretize_index(idx, it_syms)
-        op_coords = compute_coordinates(
+        in_coords = compute_coordinates(
             device_size, layout.device_layout.stride_map, it_space, idx
         )
 
         # Fast path: identical device order -> no alignment needed.
-        if len(op_coords) == len(out_coords) and all(
-            a == b for a, b in zip(op_coords, out_coords)
+        if len(in_coords) == len(out_coords) and all(
+            a == b for a, b in zip(in_coords, out_coords)
         ):
             return None
 
-        desc_var, offset_var_names, op_block = self._emit_tensor_descriptor(
+        desc_var, offset_var_names, in_block = self._emit_tensor_descriptor(
             name, var, dep, layout
         )
         loaded = self._emit_descriptor_load(
-            name, desc_var, offset_var_names, op_block, layout
+            name, desc_var, offset_var_names, in_block, layout
         )
         return self._align_tile_to_output(
-            loaded, op_coords, op_block, out_coords, out_block, it_syms
+            loaded, in_coords, in_block, out_coords, out_block, it_syms
         )
 
     def _align_tile_to_output(
-        self, loaded, op_coords, op_block, out_coords, out_block, it_syms
+        self, loaded, in_coords, in_block, out_coords, out_block, it_syms
     ):
-        """Reshape + broadcast a loaded operand tile into the output block shape.
+        """Reshape + broadcast a loaded input tile into the output block shape.
 
-        The within-stick dim (device_rank-1) always maps last→last: both are
-        ``device_size[-1]`` (never split), and a broadcast operand's stick is
-        replicated at transfer time, so reading it at the output's within-stick
+        The inner-stick dim (device_rank-1) always maps last→last: both are
+        ``device_size[-1]`` (never split), and a broadcast input's stick is
+        replicated at transfer time, so reading it at the output's inner-stick
         position is correct.  Each remaining (outer) output dim is matched to the
-        operand outer dim with the same ``(kind, sym)``; unmatched output dims are
+        input outer dim with the same ``(kind, sym)``; unmatched output dims are
         broadcast (extent 1 → ``tl.broadcast_to``).
         """
-        rank_op = len(op_coords)
-        rank_out = len(out_coords)
-        if rank_op != rank_out:
+        in_rank = len(in_coords)
+        out_rank = len(out_coords)
+        if in_rank != out_rank:
             raise NotImplementedError(
                 "broadcast alignment requires equal device rank: "
-                f"op_coords={op_coords} vs out_coords={out_coords}"
+                f"in_coords={in_coords} vs out_coords={out_coords}"
             )
 
-        op_info = [self._dim_info(c, it_syms) for c in op_coords]
+        in_info = [self._dim_info(c, it_syms) for c in in_coords]
         out_info = [self._dim_info(c, it_syms) for c in out_coords]
 
-        intermediate: list[int] = [1] * rank_out
-        out_to_op: list[Optional[int]] = [None] * rank_out
+        intermediate: list[int] = [1] * out_rank
+        out_to_in: list[Optional[int]] = [None] * out_rank
 
-        # Within-stick (last) dim: always last->last.
-        intermediate[rank_out - 1] = int(op_block[rank_op - 1])
-        out_to_op[rank_out - 1] = rank_op - 1
-        used: set[int] = {rank_op - 1}
+        # Inner-stick (last) dim: always last->last.
+        intermediate[out_rank - 1] = int(in_block[in_rank - 1])
+        out_to_in[out_rank - 1] = in_rank - 1
+        used: set[int] = {in_rank - 1}
 
         # Outer dims: match by (kind, sym); unmatched -> broadcast (extent 1).
-        for o in range(rank_out - 1):
+        for o in range(out_rank - 1):
             kind, sym = out_info[o]
-            if kind in ("const", "multi"):
+            if kind in (CONST, MULTI):
                 continue
-            for a in range(rank_op - 1):
-                if a not in used and op_info[a] == (kind, sym):
+            for a in range(in_rank - 1):
+                if a not in used and in_info[a] == (kind, sym):
                     used.add(a)
-                    out_to_op[o] = a
-                    intermediate[o] = int(op_block[a])
+                    out_to_in[o] = a
+                    intermediate[o] = int(in_block[a])
                     break
 
         def _prod(xs):
@@ -1856,26 +1868,27 @@ class SpyreTritonKernel(TritonKernel):
                 p *= int(x)
             return p
 
-        # Reshape must preserve element count: every operand dim with extent > 1
-        # must have been matched (else we would silently drop data).
-        if _prod(intermediate) != _prod(op_block):
-            raise NotImplementedError(
-                "broadcast alignment could not map every operand dim: "
-                f"op_coords={op_coords}, op_block={op_block}, out_coords={out_coords}"
+        # Reshape must preserve element count: every input dim with extent > 1
+        # must have been matched.  When it does not, the input's inner-stick
+        # dimension is a *different* iteration symbol than the output's -- a
+        # cross-stick transpose (ReStickify) that reshape+broadcast cannot
+        # express.  Route it to the factor-based restickify emitter.
+        if _prod(intermediate) != _prod(in_block):
+            return self._emit_restickify_tile(
+                loaded, in_coords, in_block, out_coords, out_block, it_syms
             )
 
-        # A pure tl.reshape preserves values only when the matched operand dims
+        # A pure tl.reshape preserves values only when the matched input dims
         # (extent > 1) keep their relative order in the output; a genuine
-        # transpose needs tl.permute -- deferred (PLAN-BroadcastAlignment.md M4).
+        # transpose needs tl.permute -- handled by the restickify emitter.
         matched_in_out_order = [
-            out_to_op[o]
-            for o in range(rank_out)
-            if out_to_op[o] is not None and int(op_block[out_to_op[o]]) > 1
+            out_to_in[o]
+            for o in range(out_rank)
+            if out_to_in[o] is not None and int(in_block[out_to_in[o]]) > 1
         ]
         if matched_in_out_order != sorted(matched_in_out_order):
-            raise NotImplementedError(
-                "broadcast alignment needs a transpose (tl.permute); "
-                f"op_coords={op_coords} -> out_coords={out_coords}"
+            return self._emit_restickify_tile(
+                loaded, in_coords, in_block, out_coords, out_block, it_syms
             )
 
         reshaped = self.cse.generate(
@@ -1893,6 +1906,107 @@ class SpyreTritonKernel(TritonKernel):
             shape=tuple(str(s) for s in out_block),
         )
         return result
+
+    def _emit_restickify_tile(
+        self, loaded, in_coords, in_block, out_coords, out_block, it_syms
+    ):
+        """Bridge a loaded tile to the output when the inner-stick dimension is a
+        *different* iteration symbol (a cross-stick transpose / ReStickify).
+
+        Neither ``tl.reshape`` nor ``tl.broadcast_to`` alone can express this --
+        the 64 inner-stick elements physically move to a different stick.  We
+        factor each iteration symbol into its inner-stick and outer-stick atoms so
+        both the input and output tiles become products of the *same* per-symbol
+        atoms, then emit ``tl.reshape`` (split bare dims) -> ``tl.permute``
+        (reorder to the output atom order) -> ``tl.reshape`` (merge to the output
+        block).  These lower to ``tensor.reshape`` / ``linalg.transpose`` in KTIR.
+        """
+        in_info = [self._dim_info(c, it_syms) for c in in_coords]
+        out_info = [self._dim_info(c, it_syms) for c in out_coords]
+
+        # ReStickify is a bijection; broadcast/padding (const) dims with extent
+        # > 1 or multi-symbol dims are out of scope for this path.
+        for info, block in ((in_info, in_block), (out_info, out_block)):
+            for (kind, _sym), ext in zip(info, block):
+                if kind in (CONST, MULTI) and int(ext) != 1:
+                    raise NotImplementedError(
+                        "restickify with broadcast/multi-symbol dims unsupported: "
+                        f"in_coords={in_coords} -> out_coords={out_coords}"
+                    )
+
+        stick = int(out_block[-1])
+        # A symbol that appears as inner-stick on *either* side is sticked, so it
+        # must be factored into its OUTER_STICK (var // stick) and INNER_STICK
+        # (var % stick) atoms; symbols sticked on neither side stay BARE.
+        split_syms = {
+            sym for (kind, sym) in (in_info + out_info) if kind == INNER_STICK
+        }
+
+        def _stick_atoms(info, block):
+            """Factor each device dim into per-symbol stick atoms.
+
+            Returns ``(atoms, shape)`` where ``atoms[i] = (str(sym), role)`` and
+            ``role`` is ``INNER_STICK`` / ``OUTER_STICK`` / ``BARE``; size-1 const
+            dims are dropped.  A ``BARE`` symbol sticked on the *other* side is
+            split into its ``OUTER_STICK`` + ``INNER_STICK`` atoms; an
+            already-split dim's kind is itself its atom role.
+            """
+            atoms: list = []
+            shape: list[int] = []
+            for (kind, sym), ext in zip(info, block):
+                ext = int(ext)
+                if kind == CONST:
+                    continue  # size-1: carries no data
+                if kind == BARE:
+                    if sym in split_syms:
+                        atoms.append((str(sym), OUTER_STICK))
+                        shape.append(ext // stick)
+                        atoms.append((str(sym), INNER_STICK))
+                        shape.append(stick)
+                    else:
+                        atoms.append((str(sym), BARE))
+                        shape.append(ext)
+                else:  # INNER_STICK / OUTER_STICK: the kind is itself the role
+                    atoms.append((str(sym), kind))
+                    shape.append(ext)
+            return atoms, shape
+
+        in_stick_atoms, in_shape = _stick_atoms(in_info, in_block)
+        out_stick_atoms, out_shape = _stick_atoms(out_info, out_block)
+
+        assert sorted(in_stick_atoms) == sorted(out_stick_atoms), (
+            f"restickify atom mismatch: {in_stick_atoms} vs {out_stick_atoms} "
+            f"(in_coords={in_coords}, out_coords={out_coords})"
+        )
+
+        var = loaded
+        # 1. Split the loaded tile into per-symbol atoms.
+        if in_shape != [int(s) for s in in_block]:
+            var = self.cse.generate(
+                self.compute,
+                f"tl.reshape({var}, {self.index_to_str(in_shape)})",
+                dtype=loaded.dtype,
+                shape=tuple(str(s) for s in in_shape),
+            )
+        # 2. Permute the input atoms into the output atom order:
+        #    result axis i == input axis perm[i].
+        perm = [in_stick_atoms.index(a) for a in out_stick_atoms]
+        if perm != list(range(len(perm))):
+            var = self.cse.generate(
+                self.compute,
+                f"tl.permute({var}, {self.index_to_str(perm)})",
+                dtype=loaded.dtype,
+                shape=tuple(str(s) for s in out_shape),
+            )
+        # 3. Merge atoms into the output block shape.
+        if out_shape != [int(s) for s in out_block]:
+            var = self.cse.generate(
+                self.compute,
+                f"tl.reshape({var}, {self.index_to_str(out_block)})",
+                dtype=loaded.dtype,
+                shape=tuple(str(s) for s in out_block),
+            )
+        return var
 
     @staticmethod
     def _row_major_strides(device_size: list) -> list:
