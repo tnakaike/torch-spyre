@@ -1,0 +1,50 @@
+name: Build torch-spyre with KTIR path
+description: |
+  Builds the full Triton / KTIR / ktir-cpu compilation path.
+
+  Reuses the `build-torch-spyre` action to (re)build torch-spyre from the
+  checked-out source into its pre-baked venv, then runs
+  `torch_spyre/_inductor_triton/scripts/build-ktir-path.sh` to build LLVM,
+  triton, and ktir-cpu into that same venv.
+
+  torch-spyre is expected to be checked out via `checkout-prebuilt-torch-spyre`
+  (default /home/senuser/torch-spyre); PROJECT_ROOT is its parent directory.
+
+inputs:
+  torch_spyre_dir:
+    description: Path to the pre-cloned torch-spyre directory
+    required: false
+    type: string
+    default: /home/senuser/torch-spyre
+
+runs:
+  using: composite
+  steps:
+    # Build torch-spyre from the checked-out source into the pre-baked venv.
+    - name: Build torch-spyre
+      uses: ./.github/actions/build-torch-spyre
+      with:
+        torch_spyre_dir: ${{ inputs.torch_spyre_dir }}
+
+    # Build LLVM + triton + ktir-cpu into the same venv torch-spyre uses.
+    - name: Build triton and ktir-cpu
+      shell: bash
+      env:
+        TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+
+        [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
+        echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
+
+        # PROJECT_ROOT is the parent of torch-spyre (holds triton, ktir-cpu,
+        # llvm-project-triton, and the build/ output dir).
+        export PROJECT_ROOT="$(dirname "$TORCH_SPYRE_DIR")"
+        echo "PROJECT_ROOT $PROJECT_ROOT"
+
+        # Install triton + ktir-cpu into the venv build-torch-spyre populated.
+        export VENV_DIR="${TORCH_SPYRE_DIR}/.venv"
+        echo "VENV_DIR $VENV_DIR"
+
+        bash "${TORCH_SPYRE_DIR}/torch_spyre/_inductor_triton/scripts/build-ktir-path.sh"
