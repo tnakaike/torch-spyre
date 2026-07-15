@@ -77,6 +77,18 @@ weight-transpose — currently raises loud; its tractable sibling M4a (outer-dim
 Read it before touching the matmul / `use_native_matmul` path or the pointwise
 `load`/`store` / `_device_block_shape` / transpose path.
 
+`PLAN-Pow2Elimination.md` (same directory) is the **BACKLOG** plan to eliminate
+the power-of-2 limitation **generally** (any non-pow2 shape), **not** by padding.
+Root cause: pow2 is a GPU-frontend artifact (`LinearLayout`/warp tiling) — the
+Triton IR verifier does not require it and the Spyre KTIR/KTDP lowering handles
+arbitrary sizes. Fix: Spyre-gate the **two `../triton` frontend gates** —
+`tl.arange` (`semantic.py:591-592`) and descriptor/block-shape
+(`_utils.validate_block_shape`) — via the existing `target_info.is_spyre()`
+mechanism (as already done for the descriptor / 16-byte relaxations in
+`semantic.py`). `torch-spyre` needs **no change** (it already emits true sizes);
+the fix lives entirely in `../triton`. No elimination code has landed. Read it
+before working on non-pow2 shape support or the matmul grid / `tl.arange` path.
+
 ## Quick-start
 
 ```bash
