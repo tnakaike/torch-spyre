@@ -471,6 +471,86 @@ class SpyreTritonKernel(TritonKernel):
         if hasattr(self, "post_loop_store"):
             self.post_loop_store.clear()
 
+    def codegen_range_tree(self):
+        """Emit only the reduction range-tree indexing; skip the spatial header.
+
+        The base ``TritonKernel`` writes a per-(x/y/z)-tree header
+
+            xoffset = tl.program_id(0) * XBLOCK
+            xindex  = xoffset + tl.arange(0, XBLOCK)[:]
+            xmask   = tl.full([XBLOCK], True, tl.int1)[:]
+
+        but Spyre never consumes any of it: logical offsets are derived straight
+        from ``tl.program_id`` in the ``# Triton -> Logical layouts`` prologue
+        (see :meth:`_emit_scalar_offsets` / :meth:`_emit_split_logical_offsets`),
+        and loads/stores go through tensor descriptors rather than
+        ``xindex``/``xmask``.  So the spatial header is dead code — we drop it.
+
+        The reduction path is preserved verbatim: the reduction lowering still
+        relies on ``roffset``/``rbase``/``rindex`` from the base header and the
+        reduction-index helpers.
+        """
+        for tree in self.range_trees:
+            if not tree.is_loop:
+                # Keep the header for reduction (r-prefix) trees; the spatial
+                # (x/y/z) header is dead on Spyre and intentionally omitted.
+                if tree.prefix.startswith("r"):
+                    self.iteration_ranges_codegen_header(tree, self.body)
+            elif self.inside_reduction:
+                self.body.writeline(
+                    f"{tree.prefix}base = {self.iteration_ranges_ranges_code(tree)}"
+                )
+
+        if self.inside_reduction:
+            if any(tree.is_loop for tree in self.range_trees):
+                rn_bases = self._get_reduction_symbols(
+                    "base", integer=True, nonnegative=True
+                )
+                rbase = self._flatten_reduction_indices(rn_bases)
+                self.body.splice(f"rbase = {self.index_to_str(rbase)}")
+            else:
+                self.codegen_reduction_indices(self.body)
+
+    def codegen_static_numels(self, code):
+        """Drop the static ``xnumel``/``ynumel`` spatial constants.
+
+        The base emits ``xnumel = <N>`` only so that the base ``xmask``
+        (``xindex < xnumel``) has a static bound.  Spyre emits neither
+        ``xindex`` nor ``xmask`` (see :meth:`codegen_range_tree`), so the
+        spatial numel constants are dead.  Reduction numels and
+        persistent-reduction ``R*BLOCK`` constexprs are preserved — the
+        reduction lowering still needs them — by re-emitting everything the
+        base produces except the spatial ``*numel =`` lines.
+        """
+        tmp = IndentedBuffer()
+        super().codegen_static_numels(tmp)
+        spatial_prefixes = tuple(
+            f"{tree.prefix}numel ="
+            for tree in self.range_trees
+            if not tree.prefix.startswith("r")
+        )
+        for line in tmp.getvalue().splitlines():
+            if spatial_prefixes and line.strip().startswith(spatial_prefixes):
+                continue
+            code.writeline(line)
+
+    def _program_id_offset_map(self) -> dict[str, str]:
+        """Map each block-offset name to its inline ``tl.program_id`` definition.
+
+        Returns e.g. ``{"xoffset": "(tl.program_id(0) * XBLOCK)", "yoffset":
+        "(tl.program_id(1) * YBLOCK)"}``.  Used by the native-matmul / tiling
+        offset path to inline what the base header used to define, so no
+        separate ``xoffset = ...`` assignment is needed.
+        """
+        mapping: dict[str, str] = {}
+        for tree in self.range_trees:
+            if tree.grid_dim is None:
+                continue
+            off_sym = TritonSymbols.block_offsets[tree.symt]
+            pid = self.iteration_ranges_get_pid(tree)
+            mapping[off_sym.name] = f"({pid} * {tree.prefix.upper()}BLOCK)"
+        return mapping
+
     def _compute_spyre_grid(self) -> tuple:
         """Compute the program count for SpyreOptions.grid.
 
@@ -1490,15 +1570,22 @@ class SpyreTritonKernel(TritonKernel):
             if not self.is_native_matmul and self._tiling_loop_count is None:
                 self._emit_split_logical_offsets(name)
             else:
+                # The block-offset symbols (xoffset/yoffset/...) print by name;
+                # inline each as (tl.program_id(gd) * PBLOCK) so the offset
+                # expressions stand alone without the base header's assignments.
+                inline = self._program_id_offset_map()
                 for triton_sym, opspec_sym in self._triton_to_opspec.items():
                     entry = self.range_tree_nodes[triton_sym]
                     root = entry.root
-                    xoffset = TritonSymbols.block_offsets[root.symt]
+                    block_offset = TritonSymbols.block_offsets[root.symt]
                     index_sym = root.index_sym()
-                    scalar_expr = sympy_subs(entry.expr, {index_sym: xoffset})
+                    scalar_expr = sympy_subs(entry.expr, {index_sym: block_offset})
+                    expr_str = f(scalar_expr)
+                    for off_name, repl in inline.items():
+                        expr_str = expr_str.replace(off_name, repl)
                     var_name = str(opspec_sym)  # "c0", "c1", etc.
                     self.prologue.writeline(
-                        DeferredLine(name, f"{var_name} = {f(scalar_expr)}")
+                        DeferredLine(name, f"{var_name} = {expr_str}")
                     )
                     self._logical_offset_vars[opspec_sym] = var_name
 
