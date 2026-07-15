@@ -54,11 +54,17 @@ def _spyre_triton_decomp_layer_norm(
     ``spyre.exx2`` / ``spyre.layernormscale`` / ``spyre.layernormnorm``, which
     have SDSC codegen handlers but no ``SpyreTritonOverrides`` ops-handler
     method (so the Triton path fails with ``AttributeError: ... layernormscale``).
-    Decompose instead into explicit ``mean``/``rsqrt``/pointwise aten ops
-    (mirroring ``spyre_rms_norm``) -- single-output reductions that TritonKernel
-    lowers cleanly, unlike PyTorch's native ``aten.var_mean`` decomposition
-    (whose multi-output reduction hits ``TritonCSEVariable is not subscriptable``
-    in the Spyre reduction codegen).
+    Decompose instead into explicit reduction+pointwise aten ops that
+    TritonKernel lowers cleanly.
+
+    The mean is written as ``sum(...) / N`` rather than ``torch.mean`` on
+    purpose: ``aten.mean.dim`` reaches codegen as an ``ops.reduction(..., 'mean')``
+    that ``get_triton_reduction_function`` maps to ``tl.mean`` -- an op the Spyre
+    Triton backend does not provide, so the bundle fails TTIR generation.
+    ``sum`` maps to the supported ``tl.sum`` and the ``/ N`` is a plain pointwise
+    op.  (PyTorch's native ``aten.var_mean`` decomposition is likewise avoided --
+    its multi-output reduction hits ``TritonCSEVariable is not subscriptable`` in
+    the Spyre reduction codegen.)
     """
     if len(normalized_shape) != 1:
         raise Unsupported(
@@ -70,9 +76,10 @@ def _spyre_triton_decomp_layer_norm(
         weight = input.new_ones(normalized_shape)
     if bias is None:
         bias = input.new_zeros(normalized_shape)
-    mean = torch.mean(input, dim=-1, keepdim=True)
+    n = normalized_shape[0]
+    mean = torch.sum(input, dim=-1, keepdim=True) / n
     centered = input - mean
-    var = torch.mean(centered * centered, dim=-1, keepdim=True)
+    var = torch.sum(centered * centered, dim=-1, keepdim=True) / n
     rstd = torch.rsqrt(var + eps)
     return centered * rstd * weight + bias
 

@@ -49,7 +49,7 @@ from torch_spyre._inductor.spyre_kernel import (
     _iter_op_specs,
     simplify_op_spec,
 )
-from torch_spyre._inductor.views import compute_coordinates
+from torch_spyre._inductor.views import align_tensors, compute_coordinates
 
 
 def _normalize_floor_div(expr: sympy.Expr) -> sympy.Expr:
@@ -302,6 +302,11 @@ class SpyreTritonKernel(TritonKernel):
         self._triton_to_opspec: dict[sympy.Symbol, sympy.Symbol] = {}
         # Core divisors per OpSpec symbol (how many cores split each dimension).
         self._core_division: dict[sympy.Symbol, int] = {}
+        # Per-node aligned device layouts (from align_tensors, the same normalization
+        # SDSC uses via simplify_op_spec).  Keyed by (buffer_name, str(dep.index)) ->
+        # (device_size, coordinates).  Rebuilt each time set_current_node changes node;
+        # empty when the align guard trips (falls back to the raw layout).
+        self._aligned_layouts: dict[tuple, tuple[list, list]] = {}
         # Caches emitted Level-2 variable names: opspec_sym -> var_name (e.g. c0 -> "c0").
         # Populated by _emit_scalar_offsets on first call; shared across all buffers.
         self._logical_offset_vars: dict[sympy.Symbol, str] = {}
@@ -370,7 +375,90 @@ class SpyreTritonKernel(TritonKernel):
                 logger.debug(
                     "SpyreTritonKernel: fixed_config=%s", self.fixed_config.config
                 )
+            # Align this node's tensors once (per node -- alignment is per-op) so the
+            # descriptor/coordinate paths consume the same normalized device layouts
+            # SDSC uses (see _build_aligned_layouts).  Must run after _core_division
+            # is built (it feeds the aligned iteration space).
+            self._build_aligned_layouts()
             yield
+
+    def _raw_size_coords(self, dep, it_space, it_keys) -> Optional[dict]:
+        """Raw ``{"size","coordinates"}`` for a dep, or None if not FixedTiledLayout."""
+        if not isinstance(dep, MemoryDep):
+            return None
+        buf = V.graph.get_buffer(dep.name)
+        if buf is None:
+            return None
+        layout = buf.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            return None
+        idx = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
+        idx = concretize_index(idx, it_keys)
+        device_size = [int(s) for s in layout.device_layout.device_size]
+        coords = compute_coordinates(
+            device_size, layout.device_layout.stride_map, it_space, idx
+        )
+        return {"size": device_size, "coordinates": coords}
+
+    def _build_aligned_layouts(self) -> None:
+        """Cache align_tensors-normalized device layouts for the current node.
+
+        Mirrors ``simplify_op_spec`` (spyre_kernel.py): gather the node's read +
+        (first) write FixedTiledLayout deps, build the ``{"size","coordinates"}``
+        list, run ``align_tensors`` (the same joint whole-op normalization SDSC
+        adopts), and cache the aligned ``(device_size, coordinates)`` keyed by
+        ``(buffer_name, str(dep.index))``.  The pointwise/reduction descriptor and
+        coordinate paths consume this via :meth:`_aligned_for`, so their device
+        layouts match the SDSC/OpSpec representation instead of the raw LoopLevel
+        layout (which pads reduced/degenerate tensors with inconsistent size-1 dims).
+
+        Rebuilt every time the node changes (alignment is per-op).  If align_tensors
+        introduces a synthetic iteration var (a stick split -- unseen in the current
+        suite), the cache is left empty so consumers fall back to the raw layout.
+        """
+        self._aligned_layouts = {}
+        node = self.current_node
+        if node is None or not self.triton_opspec_map:
+            return
+        try:
+            it_space = iteration_space(node)
+            it_keys = set(it_space.keys())
+            it_space_tuples = {
+                sym: (rng, self._core_division.get(sym, 1))
+                for sym, rng in it_space.items()
+            }
+            deps = list(node.read_writes.reads)
+            deps.append(next(iter(node.read_writes.writes)))
+            keys: list[tuple] = []
+            tensors: list[dict] = []
+            for dep in deps:
+                entry = self._raw_size_coords(dep, it_space, it_keys)
+                if entry is None:
+                    continue
+                keys.append((dep.name, str(dep.index)))
+                tensors.append(entry)
+            if not tensors:
+                return
+            new_it_space, new_tensors = align_tensors(it_space_tuples, tensors)
+            if not set(new_it_space.keys()) <= it_keys:
+                logger.debug(
+                    "SpyreTritonKernel: align_tensors added vars %s; using raw layout",
+                    set(new_it_space.keys()) - it_keys,
+                )
+                self._aligned_layouts = {}
+                return
+            for key, t in zip(keys, new_tensors):
+                self._aligned_layouts[key] = (
+                    [int(s) for s in t["size"]],
+                    list(t["coordinates"]),
+                )
+        except Exception as e:  # noqa: BLE001 -- alignment is best-effort; fall back.
+            logger.debug("SpyreTritonKernel: _build_aligned_layouts skipped: %s", e)
+            self._aligned_layouts = {}
+
+    def _aligned_for(self, name: str, dep) -> Optional[tuple[list, list]]:
+        """align_tensors-normalized ``(device_size, coordinates)`` for a dep, or None."""
+        return self._aligned_layouts.get((name, str(dep.index)))
 
     def codegen_kernel(self, name=None, as_bundled_kernel=False) -> str:
         src = super().codegen_kernel(name)
@@ -728,14 +816,20 @@ class SpyreTritonKernel(TritonKernel):
             if not isinstance(layout, FixedTiledLayout):
                 continue
 
-            device_size = [int(s) for s in layout.device_layout.device_size]
-            dep_idx = sympy_subs(
-                read_dep.index, V.graph.sizevars.precomputed_replacements
-            )
-            dep_idx = concretize_index(dep_idx, set(it_space.keys()))
-            device_coords = compute_coordinates(
-                device_size, layout.device_layout.stride_map, it_space, dep_idx
-            )
+            # Prefer the align_tensors-normalized coords so the reduction axis
+            # matches the aligned loaded tile emitted by _emit_tensor_descriptor.
+            aligned = self._aligned_for(read_dep.name, read_dep)
+            if aligned is not None:
+                _device_size, device_coords = aligned
+            else:
+                device_size = [int(s) for s in layout.device_layout.device_size]
+                dep_idx = sympy_subs(
+                    read_dep.index, V.graph.sizevars.precomputed_replacements
+                )
+                dep_idx = concretize_index(dep_idx, set(it_space.keys()))
+                device_coords = compute_coordinates(
+                    device_size, layout.device_layout.stride_map, it_space, dep_idx
+                )
 
             for r_sym in reduction_syms:
                 for k, coord in enumerate(device_coords):
@@ -881,6 +975,12 @@ class SpyreTritonKernel(TritonKernel):
     ) -> tuple[str, list[str], list]:
         """Emit tl.make_tensor_descriptor to prologue (hoisted, loop-invariant).
 
+        The device_size/coordinates come from the align_tensors-normalized cache
+        (:meth:`_build_aligned_layouts`) when available -- the same joint whole-op
+        normalization SDSC uses, which places leading/interior size-1 dims
+        consistently across an op's operands.  Falls back to the raw LoopLevel
+        layout when the tensor was not aligned (e.g. the align guard tripped).
+
         Scalar offset variables are emitted before the descriptor so the kernel
         body reads:
 
@@ -897,18 +997,21 @@ class SpyreTritonKernel(TritonKernel):
         ["dim0", "dim1", "dim2"]) reused by _emit_descriptor_load /
         _emit_descriptor_store.
         """
-        it_space = iteration_space(self.current_node)
-        device_size = [int(s) for s in layout.device_layout.device_size]
-
-        dep_index = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
-        dep_index = concretize_index(dep_index, set(it_space.keys()))
-
-        device_coords = compute_coordinates(
-            device_size,
-            layout.device_layout.stride_map,
-            it_space,
-            dep_index,
-        )
+        aligned = self._aligned_for(name, dep)
+        if aligned is not None:
+            device_size, device_coords = aligned
+            device_size = [int(s) for s in device_size]
+        else:
+            it_space = iteration_space(self.current_node)
+            device_size = [int(s) for s in layout.device_layout.device_size]
+            dep_index = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
+            dep_index = concretize_index(dep_index, set(it_space.keys()))
+            device_coords = compute_coordinates(
+                device_size,
+                layout.device_layout.stride_map,
+                it_space,
+                dep_index,
+            )
 
         block_shape = self._device_block_shape(device_size, device_coords)
         strides = self._row_major_strides(device_size)
@@ -1635,150 +1738,6 @@ class SpyreTritonKernel(TritonKernel):
         self._device_offset_vars[coords_key] = offset_var_names
         return offset_var_names
 
-    def _dump_opspec(self, write_name: str, write_dep) -> None:
-        """Dump this kernel's OpSpec to a per-kernel file in the debug directory.
-
-        The dump matches the SDSC path's serialized form (``OpSpec`` / ``TensorArg``
-        with ``sympify('...')``-wrapped exprs -- see ``spyre_kernel.codegen_kernel``)
-        by building real OpSpec/TensorArg objects and reusing the same
-        ``_codegen_op_spec_list`` serializer, so the two paths' op-specs are
-        directly comparable.  One file per kernel (named by the scheduler node) so
-        a bundle's kernels do not overwrite each other.  Lands next to
-        ir_post_fusion.txt; only written when TORCH_COMPILE_DEBUG=1.
-        """
-        debug = getattr(V, "debug", None)
-        if debug is None or not getattr(debug, "_path", None):
-            return
-
-        it_space = iteration_space(self.current_node)
-        # arg_index = position in this kernel's runtime args (mirrors SDSC's
-        # actuals.index(name)); -1 if the buffer is not a kernel argument.
-        actuals = self.args.python_argdefs()[1]
-
-        # Build {indirect_sym -> IndirectAccess(index_buffer_name)} so a gather's
-        # value coordinates print IndirectAccess(...) instead of the raw tmpN,
-        # matching the
-        # SDSC op-spec.  The index buffer is the int32 FixedTiledLayout read dep;
-        # the indirect symbols are the SymT.TMP atoms in the read indices.
-        indirect_subs: dict = {}
-        idx_name = next(
-            (
-                d.name
-                for d in self.current_node.read_writes.reads
-                if V.graph.get_dtype(d.name) == torch.int32
-                and isinstance(
-                    getattr(V.graph.get_buffer(d.name), "get_layout", lambda: None)(),
-                    FixedTiledLayout,
-                )
-            ),
-            None,
-        )
-        if idx_name is not None:
-            for d in self.current_node.read_writes.reads:
-                d_idx = sympy_subs(d.index, V.graph.sizevars.precomputed_replacements)
-                for s in d_idx.free_symbols:
-                    if symbol_is_type(s, SymT.TMP):
-                        indirect_subs[s] = IndirectAccess(sympy.Symbol(idx_name))
-
-        def _tensor_arg(name: str, dep, is_input: bool) -> TensorArg | None:
-            if not isinstance(dep, MemoryDep):
-                return None
-            buf = V.graph.get_buffer(name)
-            if buf is None:
-                return None
-            layout = buf.get_layout()
-            if not isinstance(layout, FixedTiledLayout):
-                return None
-            idx = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
-            idx = concretize_index(idx, set(it_space.keys()))
-            coords = compute_coordinates(
-                list(layout.device_layout.device_size),
-                layout.device_layout.stride_map,
-                it_space,
-                idx,
-                indirect_subs or None,
-            )
-            # Strip the redundant floor the Triton-path coordinate decomposition
-            # adds around the (integer-valued) IndirectAccess on the indirect dim
-            # (FloorDiv-by-1).  Genuine floors (e.g. floor(c1/64)) are untouched.
-            coords = [
-                c.replace(
-                    lambda x: isinstance(x, sympy.floor)
-                    and isinstance(x.args[0], IndirectAccess),
-                    lambda x: x.args[0],
-                )
-                for c in coords
-            ]
-            return TensorArg(
-                is_input=is_input,
-                arg_index=actuals.index(name) if name in actuals else -1,
-                device_dtype=layout.device_layout.device_dtype,
-                device_size=[int(s) for s in layout.device_layout.device_size],
-                device_coordinates=coords,
-                allocation=dict(layout.allocation),
-                per_tile_fixed=getattr(layout, "per_tile_fixed", False),
-                name=self._opspec_name or self.current_node.get_name(),
-            )
-
-        args = []
-        for dep in self.current_node.read_writes.reads:
-            ta = _tensor_arg(dep.name, dep, is_input=True)
-            if ta:
-                args.append(ta)
-        ta = _tensor_arg(write_name, write_dep, is_input=False)
-        if ta:
-            args.append(ta)
-
-        # op name: the reduction type ('sum', ...) when this is a reduction (to
-        # match the SDSC op field), else the scheduler node name.
-        # Identify the opspec by the kernel name (triton_bundle_N_kernel_M for
-        # bundle members, kernel_N for standalone kernels) so the dump's op field
-        # and file name correlate with the kernel.  Fall back to the scheduler
-        # node name only if the scheduler left _opspec_name unset.
-        op_name = self._opspec_name or self.current_node.get_name()
-
-        opspec: Any = OpSpec(
-            op=op_name,
-            is_reduction=self.current_node.is_reduction(),
-            iteration_space={
-                sym: (rng, self._core_division.get(sym, 1))
-                for sym, rng in it_space.items()
-            },
-            args=args,
-            op_info={},
-            tiled_symbols=list(self._tiling_loop_tiled_syms),
-        )
-
-        # Under a tiling loop (CountedLoopSchedulerNode path) the op is wrapped in
-        # a LoopSpec; mirror that so the dump matches the runtime structure.
-        if self._tiling_loop_count is not None:
-            opspec = LoopSpec(
-                count=sympy.Integer(int(self._tiling_loop_count)),
-                body=[opspec],
-                tiled_symbols=list(self._tiling_loop_tiled_syms),
-            )
-
-        # Serialize exactly like the SDSC path (sympify('...')-wrapped exprs).
-        def sympy_str(x: Any) -> str:
-            if isinstance(x, IndirectAccess):
-                return f"IndirectAccess('{x.args[0]}')"
-            return "sympify('" + str(x) + "')"
-
-        specs = [opspec]
-        for s in _iter_op_specs(specs):
-            simplify_op_spec(s)
-        out = IndentedBuffer()
-        out.writeline("[")
-        with out.indent():
-            _codegen_op_spec_list(specs, out, sympy_str)
-        out.writeline("]")
-
-        fname = f"opspec_{op_name}.py"
-        with debug.fopen_context(fname) as f:
-            f.write(out.getvalue())
-        logger.debug("SpyreTritonKernel: dumped opspec to %s/%s", debug._path, fname)
-        logger.debug("SpyreTritonKernel: dumped opspec to %s/opspec.json", debug._path)
-
     def _device_block_shape(self, device_size: list, device_coords: list) -> list:
         """Per-core block shape for tl.make_tensor_descriptor block_shape parameter.
 
@@ -1831,12 +1790,17 @@ class SpyreTritonKernel(TritonKernel):
             layout = buf.get_layout()
             if not isinstance(layout, FixedTiledLayout):
                 continue
-            device_size = [int(s) for s in layout.device_layout.device_size]
-            idx = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
-            idx = concretize_index(idx, it_syms)
-            coords = compute_coordinates(
-                device_size, layout.device_layout.stride_map, it_space, idx
-            )
+            aligned = self._aligned_for(dep.name, dep)
+            if aligned is not None:
+                device_size, coords = aligned
+                device_size = [int(s) for s in device_size]
+            else:
+                device_size = [int(s) for s in layout.device_layout.device_size]
+                idx = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
+                idx = concretize_index(idx, it_syms)
+                coords = compute_coordinates(
+                    device_size, layout.device_layout.stride_map, it_space, idx
+                )
             block = self._device_block_shape(device_size, coords)
             return device_size, coords, block
         return None
@@ -1883,12 +1847,17 @@ class SpyreTritonKernel(TritonKernel):
 
         it_space = iteration_space(self.current_node)
         it_syms = set(it_space.keys())
-        device_size = [int(s) for s in layout.device_layout.device_size]
-        idx = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
-        idx = concretize_index(idx, it_syms)
-        in_coords = compute_coordinates(
-            device_size, layout.device_layout.stride_map, it_space, idx
-        )
+        aligned = self._aligned_for(name, dep)
+        if aligned is not None:
+            device_size, in_coords = aligned
+            device_size = [int(s) for s in device_size]
+        else:
+            device_size = [int(s) for s in layout.device_layout.device_size]
+            idx = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
+            idx = concretize_index(idx, it_syms)
+            in_coords = compute_coordinates(
+                device_size, layout.device_layout.stride_map, it_space, idx
+            )
 
         # Fast path: identical device order -> no alignment needed.
         if len(in_coords) == len(out_coords) and all(
@@ -1896,6 +1865,10 @@ class SpyreTritonKernel(TritonKernel):
         ):
             return None
 
+        # align_tensors has already reconciled this operand's device rank with the
+        # output's (leading/interior size-1 dims placed consistently), so the
+        # descriptor is emitted at the aligned rank and _align_tile_to_output only
+        # needs to reshape + broadcast the loaded tile to the output block.
         desc_var, offset_var_names, in_block = self._emit_tensor_descriptor(
             name, var, dep, layout
         )
@@ -1918,13 +1891,12 @@ class SpyreTritonKernel(TritonKernel):
         input outer dim with the same ``(kind, sym)``; unmatched output dims are
         broadcast (extent 1 → ``tl.broadcast_to``).
         """
-        in_rank = len(in_coords)
         out_rank = len(out_coords)
-        if in_rank != out_rank:
-            raise NotImplementedError(
-                "broadcast alignment requires equal device rank: "
-                f"in_coords={in_coords} vs out_coords={out_coords}"
-            )
+        # align_tensors (see _build_aligned_layouts) has already reconciled every
+        # operand of the op to a common device rank with size-1 dims placed
+        # consistently, so in_coords / out_coords are equal rank here; this method
+        # only reshapes + broadcasts the loaded tile into the output block.
+        in_rank = len(in_coords)
 
         in_info = [self._dim_info(c, it_syms) for c in in_coords]
         out_info = [self._dim_info(c, it_syms) for c in out_coords]
@@ -2298,3 +2270,147 @@ class SpyreTritonKernel(TritonKernel):
 
         logger.debug("triton_block_size=%s", result)
         return result
+
+    def _dump_opspec(self, write_name: str, write_dep) -> None:
+        """Dump this kernel's OpSpec to a per-kernel file in the debug directory.
+
+        The dump matches the SDSC path's serialized form (``OpSpec`` / ``TensorArg``
+        with ``sympify('...')``-wrapped exprs -- see ``spyre_kernel.codegen_kernel``)
+        by building real OpSpec/TensorArg objects and reusing the same
+        ``_codegen_op_spec_list`` serializer, so the two paths' op-specs are
+        directly comparable.  One file per kernel (named by the scheduler node) so
+        a bundle's kernels do not overwrite each other.  Lands next to
+        ir_post_fusion.txt; only written when TORCH_COMPILE_DEBUG=1.
+        """
+        debug = getattr(V, "debug", None)
+        if debug is None or not getattr(debug, "_path", None):
+            return
+
+        it_space = iteration_space(self.current_node)
+        # arg_index = position in this kernel's runtime args (mirrors SDSC's
+        # actuals.index(name)); -1 if the buffer is not a kernel argument.
+        actuals = self.args.python_argdefs()[1]
+
+        # Build {indirect_sym -> IndirectAccess(index_buffer_name)} so a gather's
+        # value coordinates print IndirectAccess(...) instead of the raw tmpN,
+        # matching the
+        # SDSC op-spec.  The index buffer is the int32 FixedTiledLayout read dep;
+        # the indirect symbols are the SymT.TMP atoms in the read indices.
+        indirect_subs: dict = {}
+        idx_name = next(
+            (
+                d.name
+                for d in self.current_node.read_writes.reads
+                if V.graph.get_dtype(d.name) == torch.int32
+                and isinstance(
+                    getattr(V.graph.get_buffer(d.name), "get_layout", lambda: None)(),
+                    FixedTiledLayout,
+                )
+            ),
+            None,
+        )
+        if idx_name is not None:
+            for d in self.current_node.read_writes.reads:
+                d_idx = sympy_subs(d.index, V.graph.sizevars.precomputed_replacements)
+                for s in d_idx.free_symbols:
+                    if symbol_is_type(s, SymT.TMP):
+                        indirect_subs[s] = IndirectAccess(sympy.Symbol(idx_name))
+
+        def _tensor_arg(name: str, dep, is_input: bool) -> TensorArg | None:
+            if not isinstance(dep, MemoryDep):
+                return None
+            buf = V.graph.get_buffer(name)
+            if buf is None:
+                return None
+            layout = buf.get_layout()
+            if not isinstance(layout, FixedTiledLayout):
+                return None
+            idx = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
+            idx = concretize_index(idx, set(it_space.keys()))
+            coords = compute_coordinates(
+                list(layout.device_layout.device_size),
+                layout.device_layout.stride_map,
+                it_space,
+                idx,
+                indirect_subs or None,
+            )
+            # Strip the redundant floor the Triton-path coordinate decomposition
+            # adds around the (integer-valued) IndirectAccess on the indirect dim
+            # (FloorDiv-by-1).  Genuine floors (e.g. floor(c1/64)) are untouched.
+            coords = [
+                c.replace(
+                    lambda x: isinstance(x, sympy.floor)
+                    and isinstance(x.args[0], IndirectAccess),
+                    lambda x: x.args[0],
+                )
+                for c in coords
+            ]
+            return TensorArg(
+                is_input=is_input,
+                arg_index=actuals.index(name) if name in actuals else -1,
+                device_dtype=layout.device_layout.device_dtype,
+                device_size=[int(s) for s in layout.device_layout.device_size],
+                device_coordinates=coords,
+                allocation=dict(layout.allocation),
+                per_tile_fixed=getattr(layout, "per_tile_fixed", False),
+                name=self._opspec_name or self.current_node.get_name(),
+            )
+
+        args = []
+        for dep in self.current_node.read_writes.reads:
+            ta = _tensor_arg(dep.name, dep, is_input=True)
+            if ta:
+                args.append(ta)
+        ta = _tensor_arg(write_name, write_dep, is_input=False)
+        if ta:
+            args.append(ta)
+
+        # op name: the reduction type ('sum', ...) when this is a reduction (to
+        # match the SDSC op field), else the scheduler node name.
+        # Identify the opspec by the kernel name (triton_bundle_N_kernel_M for
+        # bundle members, kernel_N for standalone kernels) so the dump's op field
+        # and file name correlate with the kernel.  Fall back to the scheduler
+        # node name only if the scheduler left _opspec_name unset.
+        op_name = self._opspec_name or self.current_node.get_name()
+
+        opspec: Any = OpSpec(
+            op=op_name,
+            is_reduction=self.current_node.is_reduction(),
+            iteration_space={
+                sym: (rng, self._core_division.get(sym, 1))
+                for sym, rng in it_space.items()
+            },
+            args=args,
+            op_info={},
+            tiled_symbols=list(self._tiling_loop_tiled_syms),
+        )
+
+        # Under a tiling loop (CountedLoopSchedulerNode path) the op is wrapped in
+        # a LoopSpec; mirror that so the dump matches the runtime structure.
+        if self._tiling_loop_count is not None:
+            opspec = LoopSpec(
+                count=sympy.Integer(int(self._tiling_loop_count)),
+                body=[opspec],
+                tiled_symbols=list(self._tiling_loop_tiled_syms),
+            )
+
+        # Serialize exactly like the SDSC path (sympify('...')-wrapped exprs).
+        def sympy_str(x: Any) -> str:
+            if isinstance(x, IndirectAccess):
+                return f"IndirectAccess('{x.args[0]}')"
+            return "sympify('" + str(x) + "')"
+
+        specs = [opspec]
+        for s in _iter_op_specs(specs):
+            simplify_op_spec(s)
+        out = IndentedBuffer()
+        out.writeline("[")
+        with out.indent():
+            _codegen_op_spec_list(specs, out, sympy_str)
+        out.writeline("]")
+
+        fname = f"opspec_{op_name}.py"
+        with debug.fopen_context(fname) as f:
+            f.write(out.getvalue())
+        logger.debug("SpyreTritonKernel: dumped opspec to %s/%s", debug._path, fname)
+        logger.debug("SpyreTritonKernel: dumped opspec to %s/opspec.json", debug._path)
