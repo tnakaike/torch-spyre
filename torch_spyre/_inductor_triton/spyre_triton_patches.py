@@ -15,26 +15,102 @@
 import sys
 from contextlib import contextmanager
 from types import ModuleType
-from typing import Any
+from typing import Any, Optional, Sequence
 
 import torch
-import torch._inductor.lowering as pt_lowering
+import torch._inductor.lowering as original_lowerings
 from torch._inductor import config
 from torch._inductor.utils import get_current_backend
 from torch._inductor.virtualized import V
 from torch.fx.experimental.symbolic_shapes import has_free_unbacked_symbols
 
+from torch_spyre._inductor.decompositions import spyre_decompositions
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.lowering import spyre_lowerings
 
+# ---------------------------------------------------------------------------
+# Triton-specific decompositions
+#
+# Some Spyre decompositions (in torch_spyre._inductor.decompositions) lower to
+# fused Spyre HW ops that SDSC codegen handles but SpyreTritonOverrides does
+# not.  For the Triton path we swap in decompositions built from standard
+# reduction+pointwise aten ops, which TritonKernel can lower.  These are
+# installed into ``spyre_decompositions`` only while spyre_triton_patches() is
+# active (i.e. only when TORCH_SPYRE_TRITON=1) and restored on exit, so the
+# SDSC decomposition table is left untouched.
+# ---------------------------------------------------------------------------
+
+
+def _spyre_triton_decomp_layer_norm(
+    input: torch.Tensor,
+    normalized_shape: Sequence[int],
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """layer_norm decomposition for the Triton path.
+
+    The SDSC decomposition (``spyre_layer_norm``) emits the fused HW ops
+    ``spyre.exx2`` / ``spyre.layernormscale`` / ``spyre.layernormnorm``, which
+    have SDSC codegen handlers but no ``SpyreTritonOverrides`` ops-handler
+    method (so the Triton path fails with ``AttributeError: ... layernormscale``).
+    Decompose instead into explicit ``mean``/``rsqrt``/pointwise aten ops
+    (mirroring ``spyre_rms_norm``) -- single-output reductions that TritonKernel
+    lowers cleanly, unlike PyTorch's native ``aten.var_mean`` decomposition
+    (whose multi-output reduction hits ``TritonCSEVariable is not subscriptable``
+    in the Spyre reduction codegen).
+    """
+    if len(normalized_shape) != 1:
+        raise Unsupported(
+            f"_spyre_triton_decomp_layer_norm: only supports normalized_shape of length 1, "
+            f"got {normalized_shape}"
+        )
+    # F.layer_norm treats weight=None as identity and bias=None as zero.
+    if weight is None:
+        weight = input.new_ones(normalized_shape)
+    if bias is None:
+        bias = input.new_zeros(normalized_shape)
+    mean = torch.mean(input, dim=-1, keepdim=True)
+    centered = input - mean
+    var = torch.mean(centered * centered, dim=-1, keepdim=True)
+    rstd = torch.rsqrt(var + eps)
+    return centered * rstd * weight + bias
+
+
+# Op -> Triton-path decomposition.  Swapped into spyre_decompositions for the
+# duration of the Triton compile; the SDSC entries are restored on exit.
+_SPYRE_TRITON_DECOMPOSITIONS = {
+    torch.ops.aten.layer_norm.default: _spyre_triton_decomp_layer_norm,
+}
+
+
+def _install_spyre_triton_decompositions() -> dict:
+    """Swap Triton decompositions into ``spyre_decompositions``; return saved state."""
+    saved: dict = {}
+    for op, fn in _SPYRE_TRITON_DECOMPOSITIONS.items():
+        saved[op] = spyre_decompositions.get(op)
+        spyre_decompositions[op] = fn
+    return saved
+
+
+def _restore_decompositions(saved: dict) -> None:
+    """Restore the SDSC decompositions swapped out by _install_spyre_triton_decompositions."""
+    for op, fn in saved.items():
+        if fn is not None:
+            spyre_decompositions[op] = fn
+        else:
+            spyre_decompositions.pop(op, None)
+
+
+# ---------------------------------------------------------------------------
+# Triton-specific lowerings
+#
 # Spyre mm lowerings use BATCH_MATMUL_OP with a tuple-valued inner_fn, which
 # SpyreKernel (SDSC) understands but TritonKernel cannot codegen.  The Triton
 # path relies on PyTorch's standard aten.mm lowering so that use_native_matmul
 # converts it to tl.dot.  These ops are popped from spyre_lowerings before
 # enable_spyre_lowerings() installs them, and restored on context exit.
-_TRITON_SKIP_MM_OPS = [
-    torch.ops.aten.mm.default,
-    torch.ops.aten.bmm.default,
-]
+# ---------------------------------------------------------------------------
 
 
 def _patched_use_native_matmul(mat1, mat2) -> bool:
@@ -89,7 +165,7 @@ def _patched_use_native_matmul(mat1, mat2) -> bool:
     return True
 
 
-def _make_k1_matmul_shortcut(native_fn: Any) -> Any:
+def _spyre_triton_lowering_mm(native_fn: Any) -> Any:
     """Wrap a native matmul lowering with the degenerate-contraction shortcut.
 
     A matmul whose contraction dim ``K == 1`` is an outer product, so it reduces
@@ -106,10 +182,50 @@ def _make_k1_matmul_shortcut(native_fn: Any) -> Any:
     def _lowering(x, y, *args, **kwargs):
         # K is the last dim of the first operand for both mm and bmm.
         if V.graph.sizevars.statically_known_equals(x.get_size()[-1], 1):
-            return pt_lowering.mul(x, y)
+            return original_lowerings.mul(x, y)
         return native_fn(x, y, *args, **kwargs)
 
     return _lowering
+
+
+# Op -> factory that builds the Triton-path lowering (wrapping the captured
+# native tl.dot lowering), analogous to _SPYRE_TRITON_DECOMPOSITIONS.  Swapped
+# into spyre_lowerings for the duration of the Triton compile; the SDSC entries
+# are restored on exit.
+_SPYRE_TRITON_LOWERINGS = {
+    torch.ops.aten.mm.default: _spyre_triton_lowering_mm,
+    torch.ops.aten.bmm.default: _spyre_triton_lowering_mm,
+}
+
+
+def _install_spyre_triton_lowerings() -> dict:
+    """Swap Triton mm/bmm lowerings into ``spyre_lowerings``; return saved state.
+
+    Removes Spyre's BATCH_MATMUL_OP mm/bmm lowerings (SpyreKernel's tuple-valued
+    inner_fn cannot be codegen'd by TritonKernel) and installs the factory-built
+    wrapper (see _spyre_triton_lowering_mm) that shortcuts the K==1 degenerate
+    contraction to a pointwise mul while deferring to the native tl.dot lowering
+    for K > 1.  The native lowering (tuned_mm / tuned_bmm) currently sits in
+    original_lowerings.lowerings; capture it now, before enable_spyre_lowerings()
+    installs our wrapper over it.
+    """
+    saved: dict = {}
+    for op, make_lowering in _SPYRE_TRITON_LOWERINGS.items():
+        saved[op] = spyre_lowerings.pop(op, None)
+        native_fn = original_lowerings.lowerings.get(op)
+        if native_fn is not None:
+            spyre_lowerings[op] = make_lowering(native_fn)
+    return saved
+
+
+def _restore_lowerings(saved: dict) -> None:
+    """Restore the Spyre lowerings swapped out by _install_spyre_triton_lowerings."""
+    for op, fn in saved.items():
+        if fn is not None:
+            spyre_lowerings[op] = fn
+        else:
+            # We may have installed a K==1 shortcut wrapper above; drop it.
+            spyre_lowerings.pop(op, None)
 
 
 def _load_module(name: str) -> ModuleType:
@@ -151,22 +267,13 @@ class SpyreTritonPatches:
 @contextmanager
 def spyre_triton_patches():
     """Context manager to apply Spyre-specific monkey patches for Triton compilation."""
-    # Remove Spyre's BATCH_MATMUL_OP mm lowerings before enable_spyre_lowerings()
-    # installs them (SpyreKernel's tuple-valued inner_fn cannot be codegen'd by
-    # TritonKernel).  spyre_triton_patches() is entered before
-    # enable_spyre_lowerings() in patches.py, so this takes effect when the
-    # lowering pass runs.  Instead of leaving mm/bmm to the native (tl.dot)
-    # lowering unconditionally, install a thin wrapper that shortcuts the K==1
-    # degenerate contraction to a pointwise mul (see _make_k1_matmul_shortcut)
-    # and defers to native tl.dot for K > 1.  The native lowering
-    # (tuned_mm / tuned_bmm) currently sits in pt_lowering.lowerings; capture it
-    # now, before enable_spyre_lowerings() installs our wrapper over it.
-    saved_mm = {}
-    for op in _TRITON_SKIP_MM_OPS:
-        saved_mm[op] = spyre_lowerings.pop(op, None)
-        native_fn = pt_lowering.lowerings.get(op)
-        if native_fn is not None:
-            spyre_lowerings[op] = _make_k1_matmul_shortcut(native_fn)
+    # Install the Triton-specific lowerings and decompositions (see the
+    # registries above).  spyre_triton_patches() is entered before
+    # enable_spyre_lowerings() / enable_spyre_decompositions() in patches.py, so
+    # these swaps are in place when those passes copy the tables into the active
+    # compile.  Both are restored on context exit, leaving the SDSC tables intact.
+    saved_mm = _install_spyre_triton_lowerings()
+    saved_decompositions = _install_spyre_triton_decompositions()
 
     # Enable native matmul for the Spyre Triton path.  The default value is
     # False (TORCHINDUCTOR_NATIVE_MATMUL=0), but Spyre's Triton kernels always
@@ -208,11 +315,7 @@ def spyre_triton_patches():
     finally:
         for mod, orig in saved:
             mod.use_native_matmul = orig
-        for op, fn in saved_mm.items():
-            if fn is not None:
-                spyre_lowerings[op] = fn
-            else:
-                # We may have installed a K==1 shortcut wrapper above; drop it.
-                spyre_lowerings.pop(op, None)
+        _restore_lowerings(saved_mm)
+        _restore_decompositions(saved_decompositions)
         config.triton.native_matmul = saved_native_matmul
         CustomPreSchedulingPasses.__call__ = saved_pre_call  # type: ignore[method-assign]
