@@ -20,6 +20,7 @@ from torch._inductor import config
 from torch._inductor.codegen.common import RemovedArg
 from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.codegen.triton import FixedTritonConfig, TritonScheduling
+from torch._inductor.codegen.wrapper import ReuseLine
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.runtime import triton_heuristics
 from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
@@ -315,7 +316,36 @@ class SpyreTritonScheduling(TritonScheduling):
             entry_name, compile_wrapper.getvalue(), f"# bundle: {entry_name}"
         )
         entry.kernel_name = entry_name
+        pre_call_len = len(wrapper.lines)
         entry.call_kernel(entry_name)
+        self._defer_bundle_arg_frees(wrapper, entry, pre_call_len)
+
+    @staticmethod
+    def _defer_bundle_arg_frees(wrapper, entry, pre_call_len: int) -> None:
+        """Move buffer deletions of the entry's argument buffers after the launch.
+
+        The bundle consumes every member buffer in one ``.run()`` launch, but the
+        per-member buffer liveness that Inductor computed frees some of them
+        earlier via the reuse chain (``bufB = bufA; del bufA  # reuse``).  When
+        such a freed buffer is also an entry-launch argument, the generated
+        ``triton_bundle_N.run(..., bufA, ...)`` references a name already deleted
+        -> ``UnboundLocalError``.  Defer those deletions: drop the inline
+        ``del`` from the offending ``ReuseLine`` (its ``plan()`` preserves the
+        flag) and emit the ``del`` after the launch instead.  Mirrors
+        ``make_buffer_reuse``'s own guard by never deferring an output buffer.
+        """
+        _argdefs, call_args, _sig, _types = entry.args.python_argdefs()
+        arg_names = set(call_args)
+        out_names = set(V.graph.get_output_names())
+        deferred: list[str] = []
+        for line in wrapper.lines[:pre_call_len]:
+            if isinstance(line, ReuseLine) and line.delete_old:
+                old_name = line.node.get_name()
+                if old_name in arg_names and old_name not in out_names:
+                    line.delete_old = False
+                    deferred.append(old_name)
+        for name in deferred:
+            wrapper.writeline(f"del {name}")
 
     def _codegen_counted_loop_triton(self, node: CountedLoopSchedulerNode) -> None:
         """Generate a Triton kernel for a CountedLoopSchedulerNode.
