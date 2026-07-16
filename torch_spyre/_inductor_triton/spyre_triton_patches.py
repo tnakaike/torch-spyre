@@ -84,10 +84,66 @@ def _spyre_triton_decomp_layer_norm(
     return centered * rstd * weight + bias
 
 
+def _spyre_triton_decomp_rms_norm(
+    input: torch.Tensor,
+    normalized_shape: Sequence[int],
+    weight: Optional[torch.Tensor] = None,
+    eps: Optional[float] = 1e-5,
+) -> torch.Tensor:
+    """rms_norm decomposition for the Triton path.
+
+    Mirrors ``spyre_rms_norm`` but computes the mean-square as ``sum(...) / N``
+    instead of ``torch.mean``: the latter reaches codegen as ``tl.mean``, which
+    the Spyre Triton backend does not provide (bundle fails TTIR generation).
+    Same fix as :func:`_spyre_triton_decomp_layer_norm`.
+    """
+    if len(normalized_shape) != 1:
+        raise Unsupported(
+            f"_spyre_triton_decomp_rms_norm: only supports normalized_shape of length 1, "
+            f"got {normalized_shape}"
+        )
+    if eps is None:
+        eps = torch.finfo(input.dtype).eps
+    n = normalized_shape[0]
+    mean_sq = torch.sum(input * input, dim=-1, keepdim=True) / n
+    rstd = torch.rsqrt(mean_sq + eps)
+    output = input * rstd
+    if weight is not None:
+        output = output * weight
+    return output
+
+
+def _spyre_triton_decomp_var_mean(self, dim=None, *, correction=None, keepdim=False):
+    """var_mean.correction for the Triton path: two single-output reductions.
+
+    ``aten.var_mean`` is a multi-output reduction; the Spyre Triton reduction
+    codegen returns a single ``CSEVariable``, so the ``getitem`` on it fails with
+    ``'TritonCSEVariable' object is not subscriptable`` (batch_norm and PyTorch's
+    native layer_norm decomposition both emit it).  Split into explicit
+    ``mean = sum(x)/N`` and ``var = sum((x-mean)^2)/(N-correction)``, each a normal
+    single-output reduction.  Returns ``(var, mean)`` to match aten's order.
+    """
+    if correction is None:
+        correction = 1
+    dims = list(range(self.dim())) if dim is None else list(dim)
+    n = 1
+    for d in dims:
+        n *= self.size(d)
+    mean = torch.sum(self, dim=dims, keepdim=True) / n
+    centered = self - mean
+    var = torch.sum(centered * centered, dim=dims, keepdim=True) / (n - correction)
+    if not keepdim:
+        var = torch.squeeze(var, tuple(dims))
+        mean = torch.squeeze(mean, tuple(dims))
+    return var, mean
+
+
 # Op -> Triton-path decomposition.  Swapped into spyre_decompositions for the
 # duration of the Triton compile; the SDSC entries are restored on exit.
 _SPYRE_TRITON_DECOMPOSITIONS = {
     torch.ops.aten.layer_norm.default: _spyre_triton_decomp_layer_norm,
+    torch.ops.aten.rms_norm.default: _spyre_triton_decomp_rms_norm,
+    torch.ops.aten.var_mean.correction: _spyre_triton_decomp_var_mean,
 }
 
 

@@ -233,9 +233,27 @@ class SpyreTritonScheduling(TritonScheduling):
                 if isinstance(inplaced, RemovedArg):
                     continue
                 names = list(inplaced.other_names)
-                if any(n in inplace_names for n in names):
-                    continue  # same alias group already recorded
-                inplace_groups.append(names)
+                # In-place reuse chains span kernels: op9 may reuse buf2 as buf9
+                # and op10 then reuse buf9 as buf10, so successive kernels report
+                # partially-overlapping alias sets ([buf2,buf9] then [buf9,buf10])
+                # that are all ONE storage.  Merge every existing group sharing a
+                # name with this one (and merge groups this bridges together) so
+                # all aliases -> one in_out_ptr.  Skipping an overlapping group
+                # (old behavior) orphaned its new alias (buf10) -> the alias was
+                # absent from outer_to_inner and the entry call KeyError'd.
+                overlapping = [g for g in inplace_groups if any(n in g for n in names)]
+                if overlapping:
+                    merged = overlapping[0]
+                    for g in overlapping[1:]:
+                        for n in g:
+                            if n not in merged:
+                                merged.append(n)
+                        inplace_groups.remove(g)
+                    for n in names:
+                        if n not in merged:
+                            merged.append(n)
+                else:
+                    inplace_groups.append(list(names))
                 inplace_names.update(names)
             spyre_grids[bundled_kernel_name] = kernel._compute_spyre_grid()
 
