@@ -138,12 +138,26 @@ def _spyre_triton_decomp_var_mean(self, dim=None, *, correction=None, keepdim=Fa
     return var, mean
 
 
+def _spyre_triton_decomp_silu(input: torch.Tensor) -> torch.Tensor:
+    """silu for the Triton path: x * sigmoid(x), written via exp.
+
+    The SDSC decomposition (``decompositions.py``) lowers ``aten.silu`` to the
+    fused HW op ``spyre.silu``, whose ``lower_silu`` emits ``ops.silu`` -- a
+    method ``SpyreTritonOverrides`` does not implement (``AttributeError: silu``).
+    Decompose to ``x / (1 + exp(-x))`` instead: ``exp`` is mapped to ``tl.exp``
+    (with fp32 upcast) by SpyreTritonOverrides, whereas ``sigmoid`` has no Spyre
+    override.  (Same fix shape as the norm decompositions above.)
+    """
+    return input / (1.0 + torch.exp(-input))
+
+
 # Op -> Triton-path decomposition.  Swapped into spyre_decompositions for the
 # duration of the Triton compile; the SDSC entries are restored on exit.
 _SPYRE_TRITON_DECOMPOSITIONS = {
     torch.ops.aten.layer_norm.default: _spyre_triton_decomp_layer_norm,
     torch.ops.aten.rms_norm.default: _spyre_triton_decomp_rms_norm,
     torch.ops.aten.var_mean.correction: _spyre_triton_decomp_var_mean,
+    torch.ops.aten.silu.default: _spyre_triton_decomp_silu,
 }
 
 
