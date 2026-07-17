@@ -113,9 +113,18 @@ class SpyreTritonAsyncCompile:
         # carries the per-axis program count for SpyreOptions.grid.  The
         # DistributeWork MLIR pass requires grid.size() == kernel pid rank.
         spyre_grid = compile_meta.get("spyre_grid", (32,))
+        # Per-member grids for a kernel bundle (function name -> grid tuple).
+        # Forwarded as a hashable tuple-of-pairs (sorted for deterministic
+        # order) so SpyreOptions.hash() stays clean; DistributeWork then
+        # distributes each bundle member on its OWN grid instead of applying
+        # the single (first member's) spyre_grid module-wide, which fails when
+        # a bundle mixes a 2D native-matmul member with 1D pointwise members.
+        # Empty for standalone kernels -> single-grid fallback (no change).
+        spyre_grids = compile_meta.get("spyre_grids", {}) or {}
+        grids_opt = tuple((name, tuple(g)) for name, g in sorted(spyre_grids.items()))
         compile_kwargs = {
             "target": target,
-            "options": {"grid": spyre_grid},
+            "options": {"grid": spyre_grid, "grids": grids_opt},
         }
         compiled = triton.compile(*compile_args, **compile_kwargs)
 
