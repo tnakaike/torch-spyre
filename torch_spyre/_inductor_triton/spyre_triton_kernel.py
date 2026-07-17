@@ -560,7 +560,8 @@ class SpyreTritonKernel(TritonKernel):
             self.post_loop_store.clear()
 
     def codegen_range_tree(self):
-        """Emit only the reduction range-tree indexing; skip the spatial header.
+        """Emit the reduction offset; skip the spatial header and the dead
+        reduction index/mask boilerplate.
 
         The base ``TritonKernel`` writes a per-(x/y/z)-tree header
 
@@ -568,24 +569,41 @@ class SpyreTritonKernel(TritonKernel):
             xindex  = xoffset + tl.arange(0, XBLOCK)[:]
             xmask   = tl.full([XBLOCK], True, tl.int1)[:]
 
-        but Spyre never consumes any of it: logical offsets are derived straight
-        from ``tl.program_id`` in the ``# Triton -> Logical layouts`` prologue
-        (see :meth:`_emit_scalar_offsets` / :meth:`_emit_split_logical_offsets`),
-        and loads/stores go through tensor descriptors rather than
-        ``xindex``/``xmask``.  So the spatial header is dead code — we drop it.
+        and, for a reduction, the analogous
 
-        The reduction path is preserved verbatim: the reduction lowering still
-        relies on ``roffset``/``rbase``/``rindex`` from the base header and the
-        reduction-index helpers.
+            r0_index = tl.arange(0, R0_BLOCK)[None, :]
+            r0_offset = 0
+            r0_mask  = tl.full([R0_BLOCK], True, tl.int1)[None, :]
+            roffset  = r0_offset
+            rindex   = r0_index
+
+        but Spyre consumes almost none of it.  Logical offsets are derived
+        straight from ``tl.program_id`` in the ``# Triton -> Logical layouts``
+        prologue (see :meth:`_emit_scalar_offsets` /
+        :meth:`_emit_split_logical_offsets`), loads/stores go through tensor
+        descriptors rather than ``xindex``/``rindex``/masks, and the reduction
+        itself lowers to ``tl.sum(tile, axis)`` on the descriptor-loaded tile.
+        The *only* piece consumed is the reduction ``r<N>_offset`` (the
+        coordinate prologue reads it, e.g. ``c1 = r0_offset``).
+
+        So we emit the reduction header/indices into a scratch buffer and drop
+        every dead line (``r<N>_index = tl.arange`` and ``r<N>_mask = tl.full``,
+        plus the flattened ``rindex``/``rmask``/``roffset``), keeping only
+        ``r<N>_offset``.  This removes the last ``tl.arange`` / ``tl.full`` from
+        the kernel, so the Triton frontend's power-of-2 gates (arange range,
+        block shape) never see a non-pow2 reduced dim -- the reduced size flows
+        to KTIR through the descriptor unchanged.  The spatial (x/y/z) header is
+        dead on Spyre and omitted entirely.
         """
+        tmp = IndentedBuffer()
         for tree in self.range_trees:
             if not tree.is_loop:
-                # Keep the header for reduction (r-prefix) trees; the spatial
+                # Keep only the reduction (r-prefix) header; the spatial
                 # (x/y/z) header is dead on Spyre and intentionally omitted.
                 if tree.prefix.startswith("r"):
-                    self.iteration_ranges_codegen_header(tree, self.body)
+                    self.iteration_ranges_codegen_header(tree, tmp)
             elif self.inside_reduction:
-                self.body.writeline(
+                tmp.writeline(
                     f"{tree.prefix}base = {self.iteration_ranges_ranges_code(tree)}"
                 )
 
@@ -595,9 +613,35 @@ class SpyreTritonKernel(TritonKernel):
                     "base", integer=True, nonnegative=True
                 )
                 rbase = self._flatten_reduction_indices(rn_bases)
-                self.body.splice(f"rbase = {self.index_to_str(rbase)}")
+                tmp.splice(f"rbase = {self.index_to_str(rbase)}")
             else:
-                self.codegen_reduction_indices(self.body)
+                self.codegen_reduction_indices(tmp)
+
+        # Emit only the live lines (see docstring): drop the dead reduction
+        # index/mask boilerplate, keep r<N>_offset and everything else.
+        for line in tmp.getvalue().splitlines():
+            lhs = line.split("=", 1)[0].strip() if "=" in line else ""
+            if self._is_dead_reduction_var(lhs):
+                continue
+            self.body.writeline(line)
+
+    @staticmethod
+    def _is_dead_reduction_var(lhs: str) -> bool:
+        """Whether a reduction-preamble assignment target is unused on Spyre.
+
+        Dead: the flattened ``rindex`` / ``rmask`` / ``roffset`` and the
+        per-tree ``r<N>_index`` / ``r<N>_mask`` (the ``tl.arange`` index vector
+        and its ``tl.full`` mask).  Live (kept): ``r<N>_offset`` (the coordinate
+        prologue reads it) and ``r<N>base`` / ``rbase`` (loop-reduction bases).
+        """
+        if lhs in ("rindex", "rmask", "roffset"):
+            return True
+        for suffix in ("_index", "_mask"):
+            if lhs.startswith("r") and lhs.endswith(suffix):
+                mid = lhs[1 : -len(suffix)]
+                if mid.isdigit():
+                    return True
+        return False
 
     def codegen_static_numels(self, code):
         """Drop the static ``xnumel``/``ynumel`` spatial constants.
