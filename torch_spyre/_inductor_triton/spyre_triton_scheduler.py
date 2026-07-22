@@ -28,7 +28,7 @@ from torch._inductor.tiling_utils import analyze_memory_coalescing
 from torch._inductor.utils import IndentedBuffer, Placeholder, unique
 from torch._inductor.virtualized import V
 
-from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.logging_utils import _get_env_bool, get_inductor_logger
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
     iteration_space,
@@ -42,6 +42,16 @@ from torch_spyre._inductor.scheduler import (
 from .spyre_triton_kernel import SpyreTritonKernel
 
 logger = get_inductor_logger("spyre_triton_scheduler")
+
+# When False (default), a multi-member FusedSchedulerNode is codegen'd as one
+# standalone SpyreTritonKernel per member (separate ``.run()`` launches sharing
+# intermediates through HBM), each with its own flat 1D grid.  This is the
+# preferred path: it needs no func.call bundle (ConvertTTCall / per-member
+# grids / pid-less entry) and rebases cleanly against upstream triton +
+# ktir-cpu, which do not support that machinery yet.  Set SPYRE_TRITON_BUNDLE=1
+# to re-enable the func.call bundle (retained for the eventual upstream path and
+# for keeping an LX intermediate live across members in a single launch).
+_BUNDLE_ENABLED = _get_env_bool("SPYRE_TRITON_BUNDLE", False)
 
 
 class SpyreTritonScheduling(TritonScheduling):
@@ -65,6 +75,19 @@ class SpyreTritonScheduling(TritonScheduling):
         # True while _codegen_bundle builds member kernels, so create_kernel_choices
         # leaves their _opspec_name for the bundle to assign.
         self._building_bundle: bool = False
+        # True while the split path codegens the members of one FusedSchedulerNode,
+        # so the per-member free_buffers_in_scheduler() (emitted from the end of
+        # codegen_node_schedule) is deferred until every member is codegen'd --
+        # otherwise a fused-internal intermediate (e.g. buf0) is freed after its
+        # producer member's launch, before the consumer member reads it.
+        self._defer_frees: bool = False
+
+    def free_buffers_in_scheduler(self) -> None:
+        # While splitting a FusedSchedulerNode into standalone kernels, hold all
+        # frees until the whole group is codegen'd (see _defer_frees).
+        if self._defer_frees:
+            return
+        super().free_buffers_in_scheduler()
 
     def codegen_node(self, node) -> None:
         if isinstance(node, CountedLoopSchedulerNode):
@@ -94,13 +117,37 @@ class SpyreTritonScheduling(TritonScheduling):
                 and n.get_name() not in self.scheduler.removed_ops
             ]
             if len(members) > 1:
+                if _BUNDLE_ENABLED:
+                    logger.debug(
+                        "SpyreTritonScheduling: bundling %s into %d per-node "
+                        "SpyreTritonKernels",
+                        node.get_name(),
+                        len(members),
+                    )
+                    self._codegen_bundle(members)
+                    return
+                # Default (SPYRE_TRITON_BUNDLE unset): emit each member as its
+                # own standalone kernel.  Passing a single SchedulerNode to the
+                # normal path gives one iteration space (no "unexpected group"),
+                # one define_kernel + one .run() per member, each with its own
+                # flat 1D grid; the fused intermediate is a normal Inductor
+                # cross-kernel buffer materialized to HBM, and the launch
+                # boundary provides the cross-core barrier.
                 logger.debug(
-                    "SpyreTritonScheduling: bundling %s into %d per-node "
-                    "SpyreTritonKernels",
+                    "SpyreTritonScheduling: splitting %s into %d standalone "
+                    "SpyreTritonKernels (bundle disabled)",
                     node.get_name(),
                     len(members),
                 )
-                self._codegen_bundle(members)
+                self._defer_frees = True
+                try:
+                    for member in members:
+                        super().codegen_node(member)
+                finally:
+                    self._defer_frees = False
+                # Free intermediates only after every member is codegen'd, so a
+                # producer's output (e.g. buf0) stays live for its consumer.
+                self.free_buffers_in_scheduler()
                 return
 
         return super().codegen_node(node)
