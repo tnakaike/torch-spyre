@@ -2426,16 +2426,28 @@ class SpyreTritonKernel(TritonKernel):
             },
             args=args,
             op_info={},
-            tiled_symbols=list(self._tiling_loop_tiled_syms),
+            # OpSpec.tiled_symbols is list[list[Symbol]] (per loop level,
+            # innermost first).  The Triton tiling path has exactly one level
+            # (single _tiling_loop_count), so nest the flat per-level list as a
+            # single level.  Empty -> [] so the codegen/unroller guard skips it
+            # (a flat list here crashes _codegen_op_spec_list, which iterates
+            # each level as a list of symbols -- issue seen on add_mul_coarse).
+            tiled_symbols=(
+                [list(self._tiling_loop_tiled_syms)]
+                if self._tiling_loop_tiled_syms
+                else []
+            ),
         )
 
         # Under a tiling loop (CountedLoopSchedulerNode path) the op is wrapped in
         # a LoopSpec; mirror that so the dump matches the runtime structure.
         if self._tiling_loop_count is not None:
+            # tiled_symbols moved from LoopSpec to per-op on OpSpec upstream
+            # (#2944); the OpSpec in body already carries it (set above), and the
+            # unroller reads the per-op list rather than a shared loop-level one.
             opspec = LoopSpec(
                 count=sympy.Integer(int(self._tiling_loop_count)),
                 body=[opspec],
-                tiled_symbols=list(self._tiling_loop_tiled_syms),
             )
 
         # Serialize exactly like the SDSC path (sympify('...')-wrapped exprs).
