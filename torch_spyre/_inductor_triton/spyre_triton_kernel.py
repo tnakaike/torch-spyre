@@ -269,7 +269,13 @@ class _SpyreGatherCSEProxy(CSEProxy):
     ) -> sympy.Symbol:
         if isinstance(size, int):
             size = sympy.Integer(size)
-        return self.parent_handler.indirect_indexing(var, size, check)
+        sym = self.parent_handler.indirect_indexing(var, size, check)
+        # Record the indirect symbol's size so compute_coordinates can include
+        # its term when building device coordinates for the gather value load
+        # (otherwise the gathered dim collapses to 0 and the gather is
+        # misdetected as a plain load).  Mirrors SpyreKernel's indirect_sizes.
+        self.kernel.indirect_sizes[sym] = size
+        return sym
 
 
 class SpyreTritonKernel(TritonKernel):
@@ -331,6 +337,13 @@ class SpyreTritonKernel(TritonKernel):
         # output-row device dim to dim 0 so the row-first gather result stores
         # directly (matching shape with the gather result).
         self._gather_row_sym: Optional[sympy.Symbol] = None
+        # Sizes (ranges) of indirect SymT.TMP symbols, captured from
+        # ops.indirect_indexing (see _SpyreGatherCSEProxy).  Passed to
+        # compute_coordinates so the indirect symbol's term is included in the
+        # device coordinates (compute_coordinates skips indirect symbols whose
+        # size is unknown, collapsing the gathered dim to 0).  Mirrors
+        # SpyreKernel.indirect_sizes on the SDSC path.
+        self.indirect_sizes: dict[sympy.Symbol, sympy.Expr] = {}
         # When this kernel is a SpyreTritonKernelBundle entry, extra triton_meta
         # fields (spyre_grids, spyre_entry, spyre_grid) to merge in codegen_body
         # so they land in the emitted @fixed_config decorator.  None otherwise.
@@ -770,7 +783,12 @@ class SpyreTritonKernel(TritonKernel):
         # Pointwise path: align the loaded tile to the output tensor's device-block
         # order/shape when the operand's device layout differs (broadcast /
         # heterogeneous stick dim).  See PLAN-BroadcastAlignment.md.
-        if not self.inside_reduction:
+        #
+        # Exception: a gather's index buffer must NOT be aligned -- its raw
+        # multi-D load is reused directly as x_offsets (see
+        # _emit_index_xoffsets), and its stick axis may differ from the output's
+        # (a cross-stick restickify that is neither needed nor expressible).
+        if not self.inside_reduction and not self._is_gather_index_load(name):
             aligned = self._maybe_emit_aligned_pointwise_load(name, var, dep, layout)
             if aligned is not None:
                 return aligned
@@ -1296,6 +1314,32 @@ class SpyreTritonKernel(TritonKernel):
         )
         return desc_name, offset_var_names, perm_block_shape
 
+    def _is_gather_index_load(self, name: str) -> bool:
+        """True if ``name`` is the int32 index buffer feeding a gather here.
+
+        The index load must stay a plain multi-D descriptor load in its native
+        device layout: its CSE var is used *directly* as ``x_offsets`` by the
+        gather value-load (see ``_emit_index_xoffsets``).  Routing it through
+        the broadcast-alignment path would both corrupt ``x_offsets`` (it would
+        be reshaped/broadcast into the output block instead of staying the raw
+        index) and, when the index and output are sticked along different
+        iteration symbols, raise a restickify atom mismatch.  Skip alignment for
+        it and fall through to the plain descriptor load.
+
+        Detection mirrors ``_emit_index_xoffsets``'s single-index assumption:
+        the node performs a gather (some read index references a ``SymT.TMP``
+        symbol) and ``name`` is the int32 index buffer.
+        """
+        if V.graph.get_dtype(name) != torch.int32:
+            return False
+        it_syms = set(iteration_space(self.current_node).keys())
+        for d in self.current_node.read_writes.reads:
+            idx = sympy_subs(d.index, V.graph.sizevars.precomputed_replacements)
+            idx = concretize_index(idx, it_syms)
+            if any(symbol_is_type(s, SymT.TMP) for s in idx.free_symbols):
+                return True
+        return False
+
     def _gather_indirect_dim(
         self, dep, layout: "FixedTiledLayout"
     ) -> tuple[Optional[int], list]:
@@ -1309,11 +1353,23 @@ class SpyreTritonKernel(TritonKernel):
         device_size = [int(s) for s in layout.device_layout.device_size]
         dep_index = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
         dep_index = concretize_index(dep_index, set(it_space.keys()))
+        # Map captured indirect sizes onto the exact SymT.TMP symbols in this
+        # dep's index.  The symbol minted by ops.indirect_indexing and the one
+        # the scheduler records in dep.index share a name but may differ in
+        # sympy assumptions, so match by name (compute_coordinates keys on exact
+        # symbol identity).
+        size_by_name = {str(s): sz for s, sz in self.indirect_sizes.items()}
+        ind_sizes = {
+            s: size_by_name[str(s)]
+            for s in dep_index.free_symbols
+            if symbol_is_type(s, SymT.TMP) and str(s) in size_by_name
+        }
         device_coords = compute_coordinates(
             device_size,
             layout.device_layout.stride_map,
             it_space,
             dep_index,
+            indirect_sizes=ind_sizes or None,
         )
         for k, coord in enumerate(device_coords):
             if any(symbol_is_type(s, SymT.TMP) for s in coord.free_symbols):
@@ -2371,13 +2427,40 @@ class SpyreTritonKernel(TritonKernel):
                 return None
             idx = sympy_subs(dep.index, V.graph.sizevars.precomputed_replacements)
             idx = concretize_index(idx, set(it_space.keys()))
+            # Decompose indirect (SymT.TMP) symbols using their real ranges --
+            # compute_coordinates needs the *size* to split the coordinate, not
+            # the IndirectAccess substitution.  Match by name: the minted symbol
+            # and the scheduler's dep.index symbol share a name but may differ in
+            # sympy assumptions (compute_coordinates keys on exact identity).
+            size_by_name = {str(s): sz for s, sz in self.indirect_sizes.items()}
+            ind_sizes = {
+                s: size_by_name[str(s)]
+                for s in idx.free_symbols
+                if symbol_is_type(s, SymT.TMP) and str(s) in size_by_name
+            }
             coords = compute_coordinates(
                 list(layout.device_layout.device_size),
                 layout.device_layout.stride_map,
                 it_space,
                 idx,
-                indirect_subs or None,
+                indirect_sizes=ind_sizes or None,
             )
+            # Now substitute the decomposed indirect symbols with
+            # IndirectAccess(index_buffer) so the dumped coordinates match the
+            # SDSC op-spec.  Key the substitution on the coords' own symbols
+            # (name-matched) to avoid a sympy-assumptions identity mismatch.
+            if indirect_subs:
+                sub_by_name = {str(k): v for k, v in indirect_subs.items()}
+                free = (
+                    set().union(*(c.free_symbols for c in coords)) if coords else set()
+                )
+                ind_subs_here = {
+                    s: sub_by_name[str(s)]
+                    for s in free
+                    if symbol_is_type(s, SymT.TMP) and str(s) in sub_by_name
+                }
+                if ind_subs_here:
+                    coords = [c.xreplace(ind_subs_here) for c in coords]
             # Strip the redundant floor the Triton-path coordinate decomposition
             # adds around the (integer-valued) IndirectAccess on the indirect dim
             # (FloorDiv-by-1).  Genuine floors (e.g. floor(c1/64)) are untouched.
