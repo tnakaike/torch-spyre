@@ -13,12 +13,16 @@
 # limitations under the License.
 
 from .async_compile import SpyreTritonAsyncCompile
+from .opspec_triton_kernel import SpyreOpSpecTritonKernel
+from .opspec_triton_scheduling import SpyreOpSpecTritonScheduling
 from .spyre_triton_patches import SpyreTritonPatches, spyre_triton_patches
 from .spyre_triton_kernel import SpyreTritonKernel
 from .spyre_triton_scheduler import SpyreTritonScheduling
 from .spyre_triton_wrapper import SpyreTritonPythonWrapperCodegen
 
 __all__ = [
+    "SpyreOpSpecTritonKernel",
+    "SpyreOpSpecTritonScheduling",
     "SpyreTritonAsyncCompile",
     "SpyreTritonPatches",
     "SpyreTritonKernel",
