@@ -32,9 +32,13 @@ OpSpec symbols by construction:
                                                      strides=row_major(device_size),
                                                      block_shape=per_core_shape)
 
-This cut covers pointwise ops (``add.py``) and counted loops over a pointwise
-body (``add_mul_coarse.py``).  Reductions and ``tl.dot`` raise
-``NotImplementedError`` — they are the next bring-up steps.
+This cut covers pointwise ops (``add.py``), counted loops over a pointwise body
+(``add_mul_coarse.py``), and non-stick ``sum`` reductions (``sum.py`` with
+``dim=0``).  A reduction whose reduced dim is the within-stick axis (``dim=1``),
+spans multiple device axes, or is work-divided across cores raises
+``NotImplementedError`` (needs a ``sum_stick`` primitive or the inter-core reduce
+ring, respectively).  ``tl.dot`` (matmul) still raises ``NotImplementedError`` —
+it is the next bring-up step.
 
 Counted loops
 -------------
@@ -290,11 +294,84 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                 f"OpSpec->Triton: unexpected spec {type(spec).__name__}"
             )
         if spec.is_reduction:
-            raise NotImplementedError("OpSpec->Triton: reduction ops not supported yet")
+            SpyreOpSpecTritonKernel._validate_reduction(spec)
+            return
         if spec.op not in _BINARY_OPS:
             raise NotImplementedError(
                 f"OpSpec->Triton: op '{spec.op}' not supported yet"
             )
+
+    @staticmethod
+    def _reduction_axes(in_arg: TensorArg, out_arg: TensorArg) -> tuple[set, list[int]]:
+        """Reduced symbols and the input device axes that carry them.
+
+        A reduction collapses one iteration-space symbol (e.g. ``torch.sum``'s
+        reduced dim): it appears in the input's ``device_coordinates`` but not in
+        the output's (the user-confirmed rule — see ``sum`` SDSC artifacts).  The
+        reduced symbols are therefore ``input_free_syms - output_free_syms``; the
+        axes are the input device dimensions whose coordinate references one.
+
+        A non-stick reduction (``dim=0`` on ``(128, 256)``) puts the reduced
+        symbol on exactly one input axis -> a single ``tl.sum``.  A stick-dim
+        reduction (``dim=1``) spreads it across the outer-stick and within-stick
+        axes (two axes) -> not yet supported (needs a ``sum_stick`` primitive).
+        """
+        out_syms: set = set()
+        for coord in out_arg.device_coordinates:
+            out_syms |= coord.free_symbols
+        reduced: set = set()
+        for coord in in_arg.device_coordinates:
+            reduced |= coord.free_symbols - out_syms
+        axes = [
+            k
+            for k, coord in enumerate(in_arg.device_coordinates)
+            if coord.free_symbols & reduced
+        ]
+        return reduced, axes
+
+    @staticmethod
+    def _validate_reduction(spec: OpSpec) -> None:
+        """Guard the reduction cases this cut supports; raise loudly otherwise.
+
+        Supported: a single-input ``sum`` whose reduced symbol lands on exactly
+        one non-within-stick input axis and is not work-divided across cores.
+        The unsupported cases each need machinery that does not exist yet:
+
+        - stick-dim / multi-axis reduce -> a within-stick ``sum_stick`` primitive;
+        - reduction dim split across cores -> the HW inter-core reduce ring
+          (``tl.inter_tile``; see ``2607-InterCoreReduction.md``).
+        """
+        if spec.op != "sum":
+            raise NotImplementedError(
+                f"OpSpec->Triton: reduction '{spec.op}' not supported yet (only sum)"
+            )
+        inputs = [a for a in spec.args if a.is_input]
+        outputs = [a for a in spec.args if not a.is_input]
+        if len(inputs) != 1 or len(outputs) != 1:
+            raise NotImplementedError(
+                "OpSpec->Triton: reduction must have exactly one input and output"
+            )
+        in_arg = inputs[0]
+        reduced, axes = SpyreOpSpecTritonKernel._reduction_axes(in_arg, outputs[0])
+        if len(axes) != 1:
+            raise NotImplementedError(
+                "OpSpec->Triton: within-stick / multi-axis reduction not supported "
+                f"yet (reduced symbol spans input device axes {axes}); needs a "
+                "sum_stick primitive"
+            )
+        if axes[0] == len(in_arg.device_coordinates) - 1:
+            raise NotImplementedError(
+                "OpSpec->Triton: within-stick reduction (reduced symbol on the "
+                "innermost stick axis) not supported yet; needs a sum_stick "
+                "primitive"
+            )
+        for sym in reduced:
+            if int(spec.iteration_space.get(sym, (0, 1))[1]) != 1:
+                raise NotImplementedError(
+                    "OpSpec->Triton: reduction dim is work-divided across cores "
+                    "(inter-core reduce ring not implemented; see "
+                    "2607-InterCoreReduction.md). Retry with fewer SENCORES."
+                )
 
     @staticmethod
     def _iteration_space_key(spec: OpSpec) -> tuple:
@@ -350,6 +427,16 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         for _rng, div in it_space.values():
             grid *= int(div)
 
+        # Per-core block_shape per tensor arg, computed once and shared by the
+        # descriptor emission and the reduction reshape (which must target the
+        # output's block_shape).  Depends only on arg + work division + loop_ctx,
+        # not on the loop variable, so it is loop-invariant.
+        divisor_of = {sym: int(div) for sym, (_rng, div) in it_space.items()}
+        block_of = {
+            i: self._device_block_shape(tensor_args[i], divisor_of, loop_ctx)
+            for i in used
+        }
+
         # Build the body at column 0; buf.indent() re-indents it under `def`.
         # Program-id bases and descriptors are loop-invariant (they address the
         # full HBM buffer), so they stay above the loop; only the device-dim
@@ -358,18 +445,14 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         self._emit_logical_offsets(body, it_space)
         if loop_ctx is None:
             dims_of = self._emit_dim_vars(body, tensor_args, None)
-            desc_of = self._emit_descriptors(
-                body, tensor_args, param_names, it_space, None
-            )
-            self._emit_ops(body, group, desc_of, dims_of)
+            desc_of = self._emit_descriptors(body, tensor_args, param_names, block_of)
+            self._emit_ops(body, group, desc_of, dims_of, block_of)
         else:
-            desc_of = self._emit_descriptors(
-                body, tensor_args, param_names, it_space, loop_ctx
-            )
+            desc_of = self._emit_descriptors(body, tensor_args, param_names, block_of)
             body.writeline(f"for {loop_ctx.var} in range({loop_ctx.count}):")
             with body.indent():
                 dims_of = self._emit_dim_vars(body, tensor_args, loop_ctx)
-                self._emit_ops(body, group, desc_of, dims_of)
+                self._emit_ops(body, group, desc_of, dims_of, block_of)
 
         signature = ", ".join(param_names[i] for i in used)
         header = self._emit_header(grid, used)
@@ -486,23 +569,21 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         body: IndentedBuffer,
         tensor_args: dict[int, TensorArg],
         param_names: list[str],
-        it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
-        loop_ctx: "_LoopCtx | None",
+        block_of: dict[int, list[int]],
     ) -> dict[int, str]:
         """Emit one ``tl.make_tensor_descriptor`` per tensor arg.
 
         Returns ``desc_of`` keyed by ``arg_index``.  Descriptors address the full
         HBM buffer (``shape=device_size``) so they are loop-invariant; only the
-        per-core ``block_shape`` reflects the work division (and, in a loop, one
-        tile's worth of the tiled dim).
+        per-core ``block_shape`` (from the shared ``block_of``) reflects the work
+        division (and, in a loop, one tile's worth of the tiled dim).
         """
-        divisor_of = {sym: int(div) for sym, (_rng, div) in it_space.items()}
         desc_of: dict[int, str] = {}
         for arg_index in sorted(tensor_args):
             arg = tensor_args[arg_index]
             device_size = [int(s) for s in arg.device_size]
             strides = _row_major_strides(device_size)
-            block_shape = self._device_block_shape(arg, divisor_of, loop_ctx)
+            block_shape = block_of[arg_index]
             desc = f"desc_{arg_index}"
             body.writeline(
                 f"{desc} = tl.make_tensor_descriptor("
@@ -563,8 +644,9 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         specs: list[OpSpec],
         desc_of: dict[int, str],
         dims_of: dict[int, list[str]],
+        block_of: dict[int, list[int]],
     ) -> None:
-        """Emit load / compute / store for each pointwise op.
+        """Emit load / compute / store for each op (pointwise or reduction).
 
         Values produced by an earlier op (its output buffer) are reused by a
         later op that reads the same buffer, so a fused chain threads tiles
@@ -576,41 +658,132 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         tmp_counter = 0
         produced: dict[object, str] = {}  # buffer id -> tmp var holding its value
 
-        def _load(arg: TensorArg) -> str:
+        def _fresh() -> str:
             nonlocal tmp_counter
+            var = f"tmp{tmp_counter}"
+            tmp_counter += 1
+            return var
+
+        def _load(arg: TensorArg) -> str:
             key = _buf_id(arg)
             if key in produced:
                 return produced[key]
             # A register-threaded intermediate must have been produced earlier in
             # this kernel; only materialized args (arg_index >= 0) load from HBM.
             offsets = ", ".join(dims_of[arg.arg_index])
-            var = f"tmp{tmp_counter}"
-            tmp_counter += 1
+            var = _fresh()
             body.writeline(f"{var} = {desc_of[arg.arg_index]}.load([{offsets}])")
             produced[key] = var
             return var
 
-        for spec in specs:
-            inputs = [a for a in spec.args if a.is_input]
-            outputs = [a for a in spec.args if not a.is_input]
-            assert len(outputs) == 1, "pointwise op must have exactly one output"
-            assert len(inputs) == 2, f"binary op '{spec.op}' needs two inputs"
-
-            lhs = _load(inputs[0])
-            rhs = _load(inputs[1])
-            out_var = f"tmp{tmp_counter}"
-            tmp_counter += 1
-            body.writeline(f"{out_var} = {lhs} {_BINARY_OPS[spec.op]} {rhs}")
-
-            out = outputs[0]
+        def _store(out: TensorArg, var: str) -> None:
             # Only write HBM for a materialized output; a fused-away intermediate
             # (arg_index < 0) is consumed from the register in a later op.
             if out.arg_index >= 0:
                 offsets = ", ".join(dims_of[out.arg_index])
-                body.writeline(
-                    f"{desc_of[out.arg_index]}.store([{offsets}], {out_var})"
+                body.writeline(f"{desc_of[out.arg_index]}.store([{offsets}], {var})")
+            produced[_buf_id(out)] = var
+
+        for spec in specs:
+            inputs = [a for a in spec.args if a.is_input]
+            outputs = [a for a in spec.args if not a.is_input]
+            assert len(outputs) == 1, "op must have exactly one output"
+
+            if spec.is_reduction:
+                self._emit_reduction(
+                    body, spec, inputs, outputs[0], _load, _fresh, _store, block_of
                 )
-            produced[_buf_id(out)] = out_var
+                continue
+
+            assert len(inputs) == 2, f"binary op '{spec.op}' needs two inputs"
+            lhs = _load(inputs[0])
+            rhs = _load(inputs[1])
+            out_var = _fresh()
+            body.writeline(f"{out_var} = {lhs} {_BINARY_OPS[spec.op]} {rhs}")
+            _store(outputs[0], out_var)
+
+    def _emit_reduction(
+        self,
+        body: IndentedBuffer,
+        spec: OpSpec,
+        inputs: list[TensorArg],
+        out: TensorArg,
+        _load,
+        _fresh,
+        _store,
+        block_of: dict[int, list[int]],
+    ) -> None:
+        """Emit ``tl.sum`` over the reduced axis, reshaped to the output block.
+
+        The reduced axis is the single input device axis carrying the reduced
+        symbol (``_validate_reduction`` has guaranteed exactly one, non-within-
+        stick, work-division 1).  ``tl.sum`` drops that axis; the surviving tile
+        is then reshaped to the output's ``block_shape`` (the output layout may
+        add/remove unit axes relative to the reduced input — e.g. ``dim=0`` on
+        ``(128, 256)`` reduces input ``[4, 128, 64]`` on axis 1 to ``[4, 64]``,
+        which reshapes to output ``[1, 4, 64]``).
+        """
+        in_arg = inputs[0]
+        # A fused-away reduction input has no descriptor/block; not supported yet
+        # (sum.py reads an HBM buffer).  Raise loudly rather than emit wrong code.
+        if in_arg.arg_index < 0:
+            raise NotImplementedError(
+                "OpSpec->Triton: reduction with a register-threaded (fused) input "
+                "not supported yet"
+            )
+        _reduced, axes = self._reduction_axes(in_arg, out)
+        axis = axes[0]
+
+        in_var = _load(in_arg)
+        red_var = _fresh()
+        body.writeline(f"{red_var} = tl.sum({in_var}, {axis})")
+        out_var = red_var
+
+        # Shape of the tile after tl.sum drops `axis`, vs. the output block shape.
+        in_block = block_of[in_arg.arg_index]
+        reduced_shape = [s for k, s in enumerate(in_block) if k != axis]
+        out_block = block_of.get(out.arg_index) if out.arg_index >= 0 else None
+        if out_block is not None and out_block != reduced_shape:
+            self._check_reshape_is_order_preserving(
+                in_arg, out, axis, in_block, out_block
+            )
+            out_var = _fresh()
+            body.writeline(f"{out_var} = tl.reshape({red_var}, {out_block})")
+        _store(out, out_var)
+
+    @staticmethod
+    def _check_reshape_is_order_preserving(
+        in_arg: TensorArg,
+        out: TensorArg,
+        axis: int,
+        in_block: list[int],
+        out_block: list[int],
+    ) -> None:
+        """Raise unless reshaping the reduced tile to the output block is a no-op
+        on element order (i.e. only unit axes are added/removed, no permute).
+
+        A bare ``tl.reshape`` is correct only when the row-major enumeration of
+        the surviving input coordinates equals that of the output coordinates.
+        We approximate that by requiring the non-unit-*block* coordinates (in
+        axis order) to match on both sides — a block-size-1 axis holds a single
+        element and so does not affect ordering.  A genuine permute would need
+        ``tl.permute`` and is not supported yet.
+        """
+        surviving = [
+            str(coord)
+            for k, (coord, size) in enumerate(zip(in_arg.device_coordinates, in_block))
+            if k != axis and size != 1
+        ]
+        produced_out = [
+            str(coord)
+            for coord, size in zip(out.device_coordinates, out_block)
+            if size != 1
+        ]
+        if surviving != produced_out:
+            raise NotImplementedError(
+                "OpSpec->Triton: reduction output layout requires a permute "
+                f"({surviving} -> {produced_out}); tl.permute not supported yet"
+            )
 
     # -- preamble -----------------------------------------------------------
 
