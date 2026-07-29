@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+import os
+import tempfile
+from typing import Any, Optional
 
 from torch._inductor.codecache import PyCodeCache
+from torch._inductor.runtime.runtime_utils import cache_dir
 from torch._inductor.runtime.triton_compat import (
     ASTSource,
     GPUTarget,
@@ -22,11 +25,71 @@ from torch._inductor.runtime.triton_compat import (
     triton,
 )
 
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+
+logger = get_inductor_logger("async_compile")
+
+
+def _ktir_cpu_enabled() -> bool:
+    """Whether to run emitted KTIR on ktir-cpu instead of a Spyre device."""
+    return os.getenv("TORCH_SPYRE_KTIR_CPU", "0") != "0"
+
+
+def _asm_text(compiled: Any, ext: str) -> Optional[str]:
+    """Return ``compiled.asm[ext]`` as text, or None if the stage is absent."""
+    asm = getattr(compiled, "asm", None)
+    if asm is None:
+        return None
+    try:
+        blob = asm[ext]
+    except (KeyError, TypeError):
+        return None
+    if isinstance(blob, (bytes, bytearray)):
+        return blob.decode()
+    return blob
+
+
+def _extract_ktir(compiled: Any) -> Optional[str]:
+    """Return the textual KTIR from a compiled kernel, or None if unavailable.
+
+    The Spyre backend sets ``binary_ext = "ktir"``, so the KTDP-dialect module
+    is stored (as printed MLIR text) under ``compiled.asm["ktir"]``.
+    """
+    return _asm_text(compiled, "ktir")
+
+
+def _dump_ttir_ktir(kernel_name: str, compiled: Any) -> None:
+    """Write the emitted TTIR and KTIR to disk, mirroring the SDSC path.
+
+    Artifacts land under ``<cache_dir>/inductor-spyre/<kernel_name>_XXXX/`` (the
+    same ``inductor-spyre`` root the SDSC bundle path uses), so the Triton path's
+    intermediates can be inspected alongside SDSC's.
+    """
+    ttir = _asm_text(compiled, "ttir")
+    ktir = _asm_text(compiled, "ktir")
+    if ttir is None and ktir is None:
+        return
+    try:
+        spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
+        os.makedirs(spyre_dir, exist_ok=True)
+        out_dir = tempfile.mkdtemp(dir=spyre_dir, prefix=f"{kernel_name}_")
+        for ext, text in (("ttir", ttir), ("ktir", ktir)):
+            if text is None:
+                continue
+            path = os.path.join(out_dir, f"{kernel_name}.{ext}")
+            with open(path, "w") as f:
+                f.write(text)
+        logger.debug("SpyreTriton: wrote TTIR/KTIR for %s to %s", kernel_name, out_dir)
+    except OSError as exc:  # best-effort: never fail compilation over a dump
+        logger.warning(
+            "SpyreTriton: could not dump TTIR/KTIR for %s: %s", kernel_name, exc
+        )
+
 
 class SpyreTritonAsyncCompile:
     """Async compilation interface for Spyre Triton kernels."""
 
-    def triton(self, kernel_name: str, source_code: str, device_str: str) -> None:
+    def triton(self, kernel_name: str, source_code: str, device_str: str):
         cat = getattr(PyCodeCache.load(source_code), kernel_name)
         cfg = cat.configs[0]
         compile_meta = cat.triton_meta
@@ -46,10 +109,34 @@ class SpyreTritonAsyncCompile:
             compile_meta["cc"],
             cc_warp_size(compile_meta["cc"]),
         )
+        # spyre_grid is injected by the OpSpec->Triton generator and carries the
+        # per-axis program count for SpyreOptions.grid.  The DistributeWork MLIR
+        # pass requires grid.size() == kernel pid rank.
+        spyre_grid = compile_meta.get("spyre_grid", (32,))
         compile_kwargs = {
             "target": target,
+            "options": {"grid": spyre_grid},
         }
-        _ = triton.compile(*compile_args, **compile_kwargs)
+        compiled = triton.compile(*compile_args, **compile_kwargs)
+
+        # Persist TTIR/KTIR under <cache_dir>/inductor-spyre/, like the SDSC path.
+        _dump_ttir_ktir(kernel_name, compiled)
+
+        # Device-free path: run the emitted KTIR on ktir-cpu instead of a Spyre
+        # device. Gated so the default (device) path is unchanged.
+        if _ktir_cpu_enabled():
+            ktir_text = _extract_ktir(compiled)
+            if ktir_text is None:
+                logger.warning(
+                    "TORCH_SPYRE_KTIR_CPU set but no KTIR found on the compiled "
+                    "kernel %s; not returning a ktir-cpu runner.",
+                    kernel_name,
+                )
+                return None
+            from torch_spyre.execution.ktir_cpu_runner import KtirCpuRunner
+
+            return KtirCpuRunner(kernel_name, ktir_text)
+
         return None
 
     def wait(self, scope: dict[str, Any]) -> None:
