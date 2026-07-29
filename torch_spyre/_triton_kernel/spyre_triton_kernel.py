@@ -79,6 +79,17 @@ from torch._inductor.utils import IndentedBuffer
 from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import FloorDiv
 
+from torch_spyre._inductor.codegen.opspec_utils import (
+    _buf_id,
+    _check_reshape_is_order_preserving,
+    _device_block_shape,
+    _group_call_args,
+    _iteration_space_key,
+    _LoopCtx,
+    _reduction_axes,
+    _row_major_strides,
+    _size_hint,
+)
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg
 from torch_spyre._inductor.spyre_kernel import SpyreKernel
@@ -111,22 +122,6 @@ class _KernelPlan:
     call_args: list[str]
 
 
-@dataclasses.dataclass
-class _LoopCtx:
-    """Loop-emission context for a ``LoopSpec`` body group.
-
-    ``var`` is the Triton loop-variable name; ``count`` the trip count; ``tiled``
-    the set of iteration-space symbols advanced by this loop (from the body ops'
-    ``tiled_symbols[0]``); ``subs`` maps each tiled symbol ``s`` to
-    ``s + var * per_tile_range`` for offsetting full-size operands' coordinates.
-    """
-
-    var: str
-    count: int
-    tiled: set
-    subs: dict
-
-
 def _normalize_floor_div(expr: sympy.Expr) -> sympy.Expr:
     """Replace ``sympy.floor(a / n)`` with ``FloorDiv(a, n)`` for integer floordiv.
 
@@ -153,30 +148,9 @@ def _normalize_floor_div(expr: sympy.Expr) -> sympy.Expr:
     return _rewrite(expr)
 
 
-def _buf_id(arg: TensorArg) -> object:
-    """Stable identity of the buffer an op arg refers to, for register threading.
-
-    A fused-away intermediate carries ``arg_index == -1`` (the unassigned
-    sentinel), so distinct intermediates collide on ``arg_index``.  The op-spec
-    ``name`` is the buffer name, unique per buffer and identical whether the
-    buffer appears as an input or an output, so it is the reliable key; fall back
-    to ``arg_index`` only when a name is absent.
-    """
-    return arg.name if arg.name is not None else ("idx", arg.arg_index)
-
-
 def _coord_str(coord: sympy.Expr) -> str:
     """Render a device coordinate expression as Triton scalar-index source."""
     return texpr(_normalize_floor_div(coord))
-
-
-def _row_major_strides(device_size: list[int]) -> list[int]:
-    """Row-major (C-contiguous) strides for a device-size list."""
-    n = len(device_size)
-    strides = [1] * n
-    for i in range(n - 2, -1, -1):
-        strides[i] = strides[i + 1] * int(device_size[i + 1])
-    return strides
 
 
 class SpyreOpSpecTritonKernel(SpyreKernel):
@@ -246,7 +220,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         for spec in specs:
             self._validate_spec(spec)
             assert isinstance(spec, OpSpec)  # narrowed by _validate_spec
-            key = self._iteration_space_key(spec)
+            key = _iteration_space_key(spec)
             if not groups or key != prev_key:
                 groups.append([spec])
             else:
@@ -272,7 +246,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         subs = {sym: sym + loop_sym * it_space[sym][0] for sym in tiled}
         return _LoopCtx(
             var=self.LOOP_VAR,
-            count=int(self._size_hint(loop.count)),
+            count=int(_size_hint(loop.count)),
             tiled=tiled,
             subs=subs,
         )
@@ -302,34 +276,6 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             )
 
     @staticmethod
-    def _reduction_axes(in_arg: TensorArg, out_arg: TensorArg) -> tuple[set, list[int]]:
-        """Reduced symbols and the input device axes that carry them.
-
-        A reduction collapses one iteration-space symbol (e.g. ``torch.sum``'s
-        reduced dim): it appears in the input's ``device_coordinates`` but not in
-        the output's (the user-confirmed rule — see ``sum`` SDSC artifacts).  The
-        reduced symbols are therefore ``input_free_syms - output_free_syms``; the
-        axes are the input device dimensions whose coordinate references one.
-
-        A non-stick reduction (``dim=0`` on ``(128, 256)``) puts the reduced
-        symbol on exactly one input axis -> a single ``tl.sum``.  A stick-dim
-        reduction (``dim=1``) spreads it across the outer-stick and within-stick
-        axes (two axes) -> not yet supported (needs a ``sum_stick`` primitive).
-        """
-        out_syms: set = set()
-        for coord in out_arg.device_coordinates:
-            out_syms |= coord.free_symbols
-        reduced: set = set()
-        for coord in in_arg.device_coordinates:
-            reduced |= coord.free_symbols - out_syms
-        axes = [
-            k
-            for k, coord in enumerate(in_arg.device_coordinates)
-            if coord.free_symbols & reduced
-        ]
-        return reduced, axes
-
-    @staticmethod
     def _validate_reduction(spec: OpSpec) -> None:
         """Guard the reduction cases this cut supports; raise loudly otherwise.
 
@@ -352,7 +298,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                 "OpSpec->Triton: reduction must have exactly one input and output"
             )
         in_arg = inputs[0]
-        reduced, axes = SpyreOpSpecTritonKernel._reduction_axes(in_arg, outputs[0])
+        reduced, axes = _reduction_axes(in_arg, outputs[0])
         if len(axes) != 1:
             raise NotImplementedError(
                 "OpSpec->Triton: within-stick / multi-axis reduction not supported "
@@ -372,21 +318,6 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                     "(inter-core reduce ring not implemented; see "
                     "2607-InterCoreReduction.md). Retry with fewer SENCORES."
                 )
-
-    @staticmethod
-    def _iteration_space_key(spec: OpSpec) -> tuple:
-        """Hashable canonical form of ``spec.iteration_space`` for grouping.
-
-        Two ops fuse iff this key matches: same symbols, same ranges, and same
-        work divisions.  Symbols/ranges are compared by their string form so the
-        key is order-independent and hashable.
-        """
-        return tuple(
-            sorted(
-                (str(sym), str(rng), int(div))
-                for sym, (rng, div) in spec.iteration_space.items()
-            )
-        )
 
     # -- generator core -----------------------------------------------------
 
@@ -433,8 +364,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         # not on the loop variable, so it is loop-invariant.
         divisor_of = {sym: int(div) for sym, (_rng, div) in it_space.items()}
         block_of = {
-            i: self._device_block_shape(tensor_args[i], divisor_of, loop_ctx)
-            for i in used
+            i: _device_block_shape(tensor_args[i], divisor_of, loop_ctx) for i in used
         }
 
         # Build the body at column 0; buf.indent() re-indents it under `def`.
@@ -464,31 +394,8 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
 
         return _KernelPlan(
             source=buf.getvalue(),
-            call_args=self._group_call_args(tensor_args, used, actuals),
+            call_args=_group_call_args(tensor_args, used, actuals),
         )
-
-    @staticmethod
-    def _group_call_args(
-        tensor_args: dict[int, TensorArg],
-        used: list[int],
-        actuals: list[str],
-    ) -> list[str]:
-        """Caller-side buffer names for this group's ``.run`` call.
-
-        Mirrors ``SpyreKernel.call_kernel``: a leading ``_pool`` when the group
-        touches pool memory, then the used arg buffers in arg_index order,
-        deduplicated (an in-place op lists the same buffer as input and output).
-        """
-        call_args: list[str] = []
-        if any("pool" in a.allocation for a in tensor_args.values()):
-            call_args.append("_pool")
-        seen: set[str] = set()
-        for i in used:
-            name = actuals[i]
-            if name not in seen:
-                seen.add(name)
-                call_args.append(name)
-        return call_args
 
     def _emit_logical_offsets(
         self,
@@ -513,7 +420,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         bases: dict[sympy.Symbol, str] = {}
         inner_cores = 1
         for sym, rng, div in reversed(split):  # innermost first
-            extent = max(1, int(self._size_hint(rng)) // div)
+            extent = max(1, int(_size_hint(rng)) // div)
             idx = "tl.program_id(0)"
             if inner_cores > 1:
                 idx = f"({idx} // {inner_cores})"
@@ -595,48 +502,6 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             desc_of[arg_index] = desc
 
         return desc_of
-
-    def _device_block_shape(
-        self,
-        arg: TensorArg,
-        divisor_of: dict[sympy.Symbol, int],
-        loop_ctx: "_LoopCtx | None",
-    ) -> list[int]:
-        """Per-core ``block_shape`` for ``tl.make_tensor_descriptor``.
-
-        Divides each non-stick device dim by the product of core divisors
-        (``divisor_of``, this group's iteration-space work divisions) of the
-        OpSpec symbols appearing in that dim's coordinate.  The last device dim
-        is the inner-stick dim: always the full ``device_size[-1]`` (64 fp16 /
-        32 fp32 / 128 int8), never divided across cores.
-
-        In a counted loop, a full-size operand's ``device_size`` on the tiled dim
-        spans the whole tensor (``count`` tiles), but each iteration loads only
-        one tile, so that dim is first divided by ``count``.  A ``per_tile_fixed``
-        operand already holds one tile, so it is left alone.
-        """
-        device_size = [int(s) for s in arg.device_size]
-        coords = arg.device_coordinates
-        last = len(device_size) - 1
-        tile_this_arg = loop_ctx is not None and not arg.per_tile_fixed
-
-        block = []
-        for k, coord in enumerate(coords):
-            if k == last:
-                block.append(device_size[k])
-                continue
-            size = device_size[k]
-            if (
-                tile_this_arg
-                and loop_ctx is not None
-                and (coord.free_symbols & loop_ctx.tiled)
-            ):
-                size //= loop_ctx.count
-            divisor = 1
-            for sym in coord.free_symbols:
-                divisor *= divisor_of.get(sym, 1)
-            block.append(max(1, size // max(1, divisor)))
-        return block
 
     def _emit_ops(
         self,
@@ -731,7 +596,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                 "OpSpec->Triton: reduction with a register-threaded (fused) input "
                 "not supported yet"
             )
-        _reduced, axes = self._reduction_axes(in_arg, out)
+        _reduced, axes = _reduction_axes(in_arg, out)
         axis = axes[0]
 
         in_var = _load(in_arg)
@@ -744,46 +609,10 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         reduced_shape = [s for k, s in enumerate(in_block) if k != axis]
         out_block = block_of.get(out.arg_index) if out.arg_index >= 0 else None
         if out_block is not None and out_block != reduced_shape:
-            self._check_reshape_is_order_preserving(
-                in_arg, out, axis, in_block, out_block
-            )
+            _check_reshape_is_order_preserving(in_arg, out, axis, in_block, out_block)
             out_var = _fresh()
             body.writeline(f"{out_var} = tl.reshape({red_var}, {out_block})")
         _store(out, out_var)
-
-    @staticmethod
-    def _check_reshape_is_order_preserving(
-        in_arg: TensorArg,
-        out: TensorArg,
-        axis: int,
-        in_block: list[int],
-        out_block: list[int],
-    ) -> None:
-        """Raise unless reshaping the reduced tile to the output block is a no-op
-        on element order (i.e. only unit axes are added/removed, no permute).
-
-        A bare ``tl.reshape`` is correct only when the row-major enumeration of
-        the surviving input coordinates equals that of the output coordinates.
-        We approximate that by requiring the non-unit-*block* coordinates (in
-        axis order) to match on both sides — a block-size-1 axis holds a single
-        element and so does not affect ordering.  A genuine permute would need
-        ``tl.permute`` and is not supported yet.
-        """
-        surviving = [
-            str(coord)
-            for k, (coord, size) in enumerate(zip(in_arg.device_coordinates, in_block))
-            if k != axis and size != 1
-        ]
-        produced_out = [
-            str(coord)
-            for coord, size in zip(out.device_coordinates, out_block)
-            if size != 1
-        ]
-        if surviving != produced_out:
-            raise NotImplementedError(
-                "OpSpec->Triton: reduction output layout requires a permute "
-                f"({surviving} -> {produced_out}); tl.permute not supported yet"
-            )
 
     # -- preamble -----------------------------------------------------------
 
@@ -851,13 +680,6 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             return None
 
     # -- helpers ------------------------------------------------------------
-
-    @staticmethod
-    def _size_hint(expr) -> int:
-        """Concrete size hint for an iteration-space range expression."""
-        if isinstance(expr, (int, sympy.Integer)):
-            return int(expr)
-        return int(V.graph.sizevars.size_hint(expr))
 
     def _dump_source(self, src: str) -> None:
         """Write the emitted source to ./opspec-triton-dump/ for inspection."""
