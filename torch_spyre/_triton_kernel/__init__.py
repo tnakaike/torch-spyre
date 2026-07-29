@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OpSpec -> Triton *source generator* backend (see DESIGN-OpSpecToTriton.md)."""
+"""OpSpec -> Triton *source generator* backend (see DESIGN-OpSpecToTriton.md).
+
+Projects a finalized ``OpSpec``/``LoopSpec`` list to Triton source. This is the
+only OpSpec backend that imports Triton (``triton.compile`` ingests its output),
+so it is **lazy-imported** inside its env-var branch in
+``torch_spyre/_inductor/__init__.py`` — importing ``torch_spyre`` never pulls in
+Triton, and the KTIR path (a ``generate_ktir`` function in
+``_inductor/codegen/``) stays Triton-free. See
+``.claude/skills/spyre-triton/OPSPEC_BACKEND_FUNCTIONS.md``.
+"""
 
 from .async_compile import SpyreTritonAsyncCompile
 from .spyre_triton_kernel import SpyreOpSpecTritonKernel
