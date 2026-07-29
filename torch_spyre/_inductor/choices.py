@@ -13,12 +13,9 @@
 # limitations under the License.
 
 
-import os
-
 import torch
 
 from torch._inductor.choices import InductorChoices
-from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.scheduler import BaseSchedulerNode, Scheduler
 
 
@@ -61,17 +58,3 @@ class SpyreHeuristics(InductorChoices):
         shared_data_score: int,
     ) -> bool:
         return False
-
-    @staticmethod
-    def should_use_persistent_reduction(
-        features: SIMDKernelFeatures, cooperative_reduction: bool
-    ) -> bool:
-        """Force persistent reduction to avoid R-block tiling loops in Triton kernels.
-
-        Persistent reduction sets R0_BLOCK = rnumel so no loop over R is generated.
-        """
-        if os.getenv("TORCH_SPYRE_TRITON") == "1":
-            return True
-        return InductorChoices.should_use_persistent_reduction(
-            features, cooperative_reduction
-        )

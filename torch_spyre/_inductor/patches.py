@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 
 import torch
@@ -123,14 +122,7 @@ def enable_spyre_context(
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
 
-    if os.getenv("TORCH_SPYRE_TRITON") == "1":
-        from torch_spyre._inductor_triton.spyre_triton_patches import (
-            spyre_triton_patches,
-        )
-
-        spyre_triton_patches_cm: AbstractContextManager = spyre_triton_patches()
-    else:
-        spyre_triton_patches_cm = nullcontext()
+    spyre_triton_patches_cm: AbstractContextManager = nullcontext()
 
     with (
         spyre_data_types(),

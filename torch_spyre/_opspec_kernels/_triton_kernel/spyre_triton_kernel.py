@@ -32,8 +32,24 @@ OpSpec symbols by construction:
                                                      strides=row_major(device_size),
                                                      block_shape=per_core_shape)
 
-This first cut covers pointwise ops (``add.py``).  Reductions, ``tl.dot`` and
-``LoopSpec`` raise ``NotImplementedError`` — they are the next bring-up steps.
+This cut covers pointwise ops (``add.py``) and counted loops over a pointwise
+body (``add_mul_coarse.py``).  Reductions and ``tl.dot`` raise
+``NotImplementedError`` — they are the next bring-up steps.
+
+Counted loops
+-------------
+A coarse-tiled node arrives as ``[LoopSpec(count, body)]``: the body's ops run
+``count`` times, each iteration processing one tile of the tiled dimension
+(``tiled_symbols[0]``).  We emit the body's fusion group inside a
+``for loop0 in range(count):`` wrapper.  The tiled-dimension offset is threaded
+by the loop variable: a full-size operand (``device_size`` on the tiled dim ==
+``count * per_tile_range``) advances by ``loop0 * per_tile_range`` each
+iteration, and its per-core block extent on that dim is
+``device_size // count // work_division`` (one tile's worth, not the whole
+tensor).  A ``per_tile_fixed`` operand (an LX scratch tile whose ``device_size``
+is already one tile) does not move.  In the common case the loop-carried
+intermediate is a register-threaded LX buffer (``arg_index == -1``) that never
+touches HBM, so only the full-size operands get descriptors.
 
 Fuse vs. split
 --------------
@@ -89,6 +105,22 @@ class _KernelPlan:
 
     source: str
     call_args: list[str]
+
+
+@dataclasses.dataclass
+class _LoopCtx:
+    """Loop-emission context for a ``LoopSpec`` body group.
+
+    ``var`` is the Triton loop-variable name; ``count`` the trip count; ``tiled``
+    the set of iteration-space symbols advanced by this loop (from the body ops'
+    ``tiled_symbols[0]``); ``subs`` maps each tiled symbol ``s`` to
+    ``s + var * per_tile_range`` for offsetting full-size operands' coordinates.
+    """
+
+    var: str
+    count: int
+    tiled: set
+    subs: dict
 
 
 def _normalize_floor_div(expr: sympy.Expr) -> sympy.Expr:
@@ -152,6 +184,10 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
     projection to source is replaced.
     """
 
+    # Triton loop-variable name for a counted-loop (LoopSpec) body.  Only one
+    # loop nesting level is supported, so a single fixed name suffices.
+    LOOP_VAR = "loop0"
+
     def codegen_kernels(self) -> list[_KernelPlan]:
         """Finalize the op_specs and emit one Triton kernel per fusion group.
 
@@ -163,15 +199,38 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         Triton kernel — see the module docstring's "Fuse vs. split".
         """
         super().codegen_kernel()
-        plans = [self._emit_group(group) for group in self._partition_specs()]
+        plans = [
+            self._emit_group(group, loop_ctx)
+            for group, loop_ctx in self._partition_specs()
+        ]
         for plan in plans:
             self._dump_source(plan.source)
         return plans
 
     # -- fusion grouping ----------------------------------------------------
 
-    def _partition_specs(self) -> list[list[OpSpec]]:
-        """Split the op_specs into maximal contiguous same-iteration-space runs.
+    def _partition_specs(self) -> list[tuple[list[OpSpec], "_LoopCtx | None"]]:
+        """Partition the op_specs into (fusion group, loop context) pairs.
+
+        A plain node's op_specs partition into contiguous same-iteration-space
+        groups, each with ``loop_ctx=None``.  A coarse-tiled node arrives as a
+        single ``LoopSpec``; its body partitions the same way, but every group
+        carries a ``_LoopCtx`` so ``_emit_group`` wraps it in a counted loop.
+        """
+        specs = self.op_specs
+        if len(specs) == 1 and isinstance(specs[0], LoopSpec):
+            loop = specs[0]
+            groups = self._group_body(loop.body)
+            if len(groups) != 1:
+                raise NotImplementedError(
+                    "OpSpec->Triton: counted loop whose body spans more than one "
+                    "iteration space is not supported yet"
+                )
+            return [(groups[0], self._make_loop_ctx(loop, groups[0]))]
+        return [(group, None) for group in self._group_body(specs)]
+
+    def _group_body(self, specs: list) -> list[list[OpSpec]]:
+        """Split a flat op list into maximal contiguous same-iteration-space runs.
 
         Ops that share an iteration space (symbols + ranges + work divisions)
         fuse into one kernel; a change of iteration space starts a new group.
@@ -180,7 +239,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         """
         groups: list[list[OpSpec]] = []
         prev_key: object = None
-        for spec in self.op_specs:
+        for spec in specs:
             self._validate_spec(spec)
             assert isinstance(spec, OpSpec)  # narrowed by _validate_spec
             key = self._iteration_space_key(spec)
@@ -193,12 +252,38 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             raise NotImplementedError("OpSpec->Triton: no ops to emit")
         return groups
 
+    def _make_loop_ctx(self, loop: LoopSpec, group: list[OpSpec]) -> "_LoopCtx":
+        """Build the loop-emission context for a ``LoopSpec`` body group.
+
+        The tiled symbols are the innermost-level ``tiled_symbols[0]`` of the
+        body ops (they agree within a fusion group); each advances by its
+        per-tile iteration-space range times the loop variable.
+        """
+        it_space = group[0].iteration_space
+        tiled: set = set()
+        for spec in group:
+            if spec.tiled_symbols:
+                tiled.update(spec.tiled_symbols[0])
+        loop_sym = sympy.Symbol(self.LOOP_VAR)
+        subs = {sym: sym + loop_sym * it_space[sym][0] for sym in tiled}
+        return _LoopCtx(
+            var=self.LOOP_VAR,
+            count=int(self._size_hint(loop.count)),
+            tiled=tiled,
+            subs=subs,
+        )
+
     @staticmethod
     def _validate_spec(spec) -> None:
-        """Assert ``spec`` is one of the ops this first cut supports."""
+        """Assert ``spec`` is one of the ops this cut supports.
+
+        A top-level ``LoopSpec`` is handled by ``_partition_specs`` before this
+        runs; a ``LoopSpec`` reaching here is a *nested* loop inside a body,
+        which is not supported yet.
+        """
         if isinstance(spec, LoopSpec):
             raise NotImplementedError(
-                "OpSpec->Triton: LoopSpec (counted loop) not supported yet"
+                "OpSpec->Triton: nested counted loops are not supported yet"
             )
         if not isinstance(spec, OpSpec):
             raise NotImplementedError(
@@ -228,8 +313,16 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
 
     # -- generator core -----------------------------------------------------
 
-    def _emit_group(self, group: list[OpSpec]) -> _KernelPlan:
-        """Emit one Triton kernel (source + ``.run`` args) for a fusion group."""
+    def _emit_group(
+        self, group: list[OpSpec], loop_ctx: "_LoopCtx | None"
+    ) -> _KernelPlan:
+        """Emit one Triton kernel (source + ``.run`` args) for a fusion group.
+
+        ``loop_ctx`` is ``None`` for a plain group; for a counted-loop body it
+        carries the trip count and per-tile offsets, so the device-dim offsets
+        and ops are emitted inside a ``for loop0 in range(count):`` block while
+        the program-id bases and descriptors (loop-invariant) stay above it.
+        """
         # Kernel parameter names / caller buffer names, in arg_index order
         # (in_ptr0, in_ptr1, ..., out_ptr0).  TensorArg.arg_index indexes into
         # these parallel lists (assigned by super().codegen_kernel()).
@@ -258,12 +351,25 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             grid *= int(div)
 
         # Build the body at column 0; buf.indent() re-indents it under `def`.
+        # Program-id bases and descriptors are loop-invariant (they address the
+        # full HBM buffer), so they stay above the loop; only the device-dim
+        # offsets (which carry loop0) and the ops go inside it.
         body = IndentedBuffer()
         self._emit_logical_offsets(body, it_space)
-        desc_of, dims_of = self._emit_descriptors(
-            body, tensor_args, param_names, it_space
-        )
-        self._emit_ops(body, group, desc_of, dims_of)
+        if loop_ctx is None:
+            dims_of = self._emit_dim_vars(body, tensor_args, None)
+            desc_of = self._emit_descriptors(
+                body, tensor_args, param_names, it_space, None
+            )
+            self._emit_ops(body, group, desc_of, dims_of)
+        else:
+            desc_of = self._emit_descriptors(
+                body, tensor_args, param_names, it_space, loop_ctx
+            )
+            body.writeline(f"for {loop_ctx.var} in range({loop_ctx.count}):")
+            with body.indent():
+                dims_of = self._emit_dim_vars(body, tensor_args, loop_ctx)
+                self._emit_ops(body, group, desc_of, dims_of)
 
         signature = ", ".join(param_names[i] for i in used)
         header = self._emit_header(grid, used)
@@ -336,20 +442,21 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         for sym in it_space:
             body.writeline(f"{sym} = {bases.get(sym, '0')}")
 
-    def _emit_descriptors(
+    def _emit_dim_vars(
         self,
         body: IndentedBuffer,
         tensor_args: dict[int, TensorArg],
-        param_names: list[str],
-        it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
-    ) -> tuple[dict[int, str], dict[int, list[str]]]:
-        """Emit device-layout dim vars + one descriptor per tensor arg.
+        loop_ctx: "_LoopCtx | None",
+    ) -> dict[int, list[str]]:
+        """Emit device-dim offset vars (``dim0``/``dim1``/...) per tensor arg.
 
-        Returns ``(desc_of, dims_of)`` keyed by ``arg_index``: the descriptor
-        variable name and the list of device-dim offset variable names.
+        Returns ``dims_of`` keyed by ``arg_index``: the list of device-dim
+        offset variable names.  For a counted-loop body, a full-size operand's
+        tiled-dim coordinate is advanced by ``loop0 * per_tile_range`` (via
+        ``loop_ctx.subs``); a ``per_tile_fixed`` operand is left untouched.
+        Because the offset changes the coordinate string, full-size and
+        per-tile operands that shared a layout naturally get distinct dim vars.
         """
-        divisor_of = {sym: int(div) for sym, (_rng, div) in it_space.items()}
-        desc_of: dict[int, str] = {}
         dims_of: dict[int, list[str]] = {}
         # Cache device-dim var names by coordinate signature so operands with an
         # identical device layout share dim0/dim1/... (as SDSC/dev-triton do).
@@ -358,6 +465,8 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         for arg_index in sorted(tensor_args):
             arg = tensor_args[arg_index]
             coords = list(arg.device_coordinates)
+            if loop_ctx is not None and not arg.per_tile_fixed:
+                coords = [c.subs(loop_ctx.subs) for c in coords]
             key = tuple(str(c) for c in coords)
             if key not in coords_seen:
                 group = len(coords_seen)
@@ -370,11 +479,30 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                 coords_seen[key] = dim_names
             dims_of[arg_index] = coords_seen[key]
 
+        return dims_of
+
+    def _emit_descriptors(
+        self,
+        body: IndentedBuffer,
+        tensor_args: dict[int, TensorArg],
+        param_names: list[str],
+        it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
+        loop_ctx: "_LoopCtx | None",
+    ) -> dict[int, str]:
+        """Emit one ``tl.make_tensor_descriptor`` per tensor arg.
+
+        Returns ``desc_of`` keyed by ``arg_index``.  Descriptors address the full
+        HBM buffer (``shape=device_size``) so they are loop-invariant; only the
+        per-core ``block_shape`` reflects the work division (and, in a loop, one
+        tile's worth of the tiled dim).
+        """
+        divisor_of = {sym: int(div) for sym, (_rng, div) in it_space.items()}
+        desc_of: dict[int, str] = {}
         for arg_index in sorted(tensor_args):
             arg = tensor_args[arg_index]
             device_size = [int(s) for s in arg.device_size]
             strides = _row_major_strides(device_size)
-            block_shape = self._device_block_shape(arg, divisor_of)
+            block_shape = self._device_block_shape(arg, divisor_of, loop_ctx)
             desc = f"desc_{arg_index}"
             body.writeline(
                 f"{desc} = tl.make_tensor_descriptor("
@@ -385,10 +513,13 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             )
             desc_of[arg_index] = desc
 
-        return desc_of, dims_of
+        return desc_of
 
     def _device_block_shape(
-        self, arg: TensorArg, divisor_of: dict[sympy.Symbol, int]
+        self,
+        arg: TensorArg,
+        divisor_of: dict[sympy.Symbol, int],
+        loop_ctx: "_LoopCtx | None",
     ) -> list[int]:
         """Per-core ``block_shape`` for ``tl.make_tensor_descriptor``.
 
@@ -397,20 +528,33 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         OpSpec symbols appearing in that dim's coordinate.  The last device dim
         is the inner-stick dim: always the full ``device_size[-1]`` (64 fp16 /
         32 fp32 / 128 int8), never divided across cores.
+
+        In a counted loop, a full-size operand's ``device_size`` on the tiled dim
+        spans the whole tensor (``count`` tiles), but each iteration loads only
+        one tile, so that dim is first divided by ``count``.  A ``per_tile_fixed``
+        operand already holds one tile, so it is left alone.
         """
         device_size = [int(s) for s in arg.device_size]
         coords = arg.device_coordinates
         last = len(device_size) - 1
+        tile_this_arg = loop_ctx is not None and not arg.per_tile_fixed
 
         block = []
         for k, coord in enumerate(coords):
             if k == last:
                 block.append(device_size[k])
                 continue
+            size = device_size[k]
+            if (
+                tile_this_arg
+                and loop_ctx is not None
+                and (coord.free_symbols & loop_ctx.tiled)
+            ):
+                size //= loop_ctx.count
             divisor = 1
             for sym in coord.free_symbols:
                 divisor *= divisor_of.get(sym, 1)
-            block.append(max(1, device_size[k] // max(1, divisor)))
+            block.append(max(1, size // max(1, divisor)))
         return block
 
     def _emit_ops(
