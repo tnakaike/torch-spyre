@@ -12,21 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""OpSpec -> Triton *source generator* backend (see DESIGN-OpSpecToTriton.md)."""
+
 from .async_compile import SpyreTritonAsyncCompile
-from .opspec_triton_kernel import SpyreOpSpecTritonKernel
-from .opspec_triton_scheduling import SpyreOpSpecTritonScheduling
-from .spyre_triton_patches import SpyreTritonPatches, spyre_triton_patches
-from .spyre_triton_kernel import SpyreTritonKernel
-from .spyre_triton_scheduler import SpyreTritonScheduling
+from .spyre_triton_kernel import SpyreOpSpecTritonKernel
+from .spyre_triton_scheduling import SpyreOpSpecTritonScheduling
 from .spyre_triton_wrapper import SpyreTritonPythonWrapperCodegen
 
 __all__ = [
     "SpyreOpSpecTritonKernel",
     "SpyreOpSpecTritonScheduling",
     "SpyreTritonAsyncCompile",
-    "SpyreTritonPatches",
-    "SpyreTritonKernel",
     "SpyreTritonPythonWrapperCodegen",
-    "SpyreTritonScheduling",
-    "spyre_triton_patches",
 ]

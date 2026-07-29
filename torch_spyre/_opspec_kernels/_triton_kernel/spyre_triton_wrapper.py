@@ -48,6 +48,7 @@ class SpyreTritonPythonWrapperCodegen(SpyrePythonWrapperCodegen):
     def write_header(self) -> None:
         super().write_header()
         self.header.writeline(
-            "from torch_spyre._inductor_triton.async_compile import SpyreTritonAsyncCompile"
+            "from torch_spyre._opspec_kernels._triton_kernel.async_compile"
+            " import SpyreTritonAsyncCompile"
         )
         self.header.writeline("async_compile = SpyreTritonAsyncCompile()")

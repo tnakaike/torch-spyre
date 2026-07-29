@@ -49,7 +49,7 @@ from torch_spyre._inductor.scheduler import (
     SuperDSCScheduling,
 )
 
-from .opspec_triton_kernel import KERNEL_NAME_PLACEHOLDER, SpyreOpSpecTritonKernel
+from .spyre_triton_kernel import KERNEL_NAME_PLACEHOLDER, SpyreOpSpecTritonKernel
 
 
 class SpyreOpSpecTritonScheduling(SuperDSCScheduling):
