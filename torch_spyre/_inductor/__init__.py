@@ -211,7 +211,7 @@ def _autoload():
             # OpSpec -> Triton *source generator* path (DESIGN-OpSpecToTriton.md).
             # Reuses the SDSC frontend and projects the finished op_specs to
             # Triton source.
-            from torch_spyre._opspec_kernels._triton_kernel import (
+            from torch_spyre._triton_kernel import (
                 SpyreOpSpecTritonScheduling,
                 SpyreTritonPythonWrapperCodegen,
             )
