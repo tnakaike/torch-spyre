@@ -87,7 +87,9 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _buf_id,
     _check_reshape_is_order_preserving,
     _device_block_shape,
+    _gather_operands,
     _group_call_args,
+    _is_gather_spec,
     _iteration_space_key,
     _LoopCtx,
     _matmul_operand_permutation,
@@ -290,6 +292,12 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             else:
                 SpyreOpSpecTritonKernel._validate_reduction(spec)
             return
+        if _is_gather_spec(spec):
+            # Structural validation; the layout guards (>= 8 rows, no
+            # work-divided trailing axis) run in _emit_group where the per-core
+            # block shapes and work divisions are known.
+            _gather_operands(spec)
+            return
         if spec.op not in _BINARY_OPS:
             raise NotImplementedError(
                 f"OpSpec->Triton: op '{spec.op}' not supported yet"
@@ -427,6 +435,56 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                 "(pointwise-mul lowering retired to patches)"
             )
 
+    def _prepare_gather(
+        self,
+        spec: OpSpec,
+        tensor_args: dict[int, TensorArg],
+        divisor_of: dict[sympy.Symbol, int],
+        block_of: dict[int, list[int]],
+        perm_of: dict[int, list[int]],
+    ) -> None:
+        """Set gather permutations / block shapes and guard unsupported layouts.
+
+        Mutates ``perm_of`` and ``block_of`` in place: permutes the value arg's
+        indirect axis and the output's row axis to descriptor dim 0, and forces
+        the value arg's dim-0 block to 1 (the gather "descriptor block must have
+        exactly 1 row" rule).  Raises for layouts outside this cut (< 8 gathered
+        rows, or a work-divided trailing axis the single ``y_offset`` cannot
+        address).
+        """
+        index_arg, value_arg, out_arg, k_star, row_axis = _gather_operands(spec)
+        vi, oi = value_arg.arg_index, out_arg.arg_index
+
+        vrank = len(value_arg.device_size)
+        perm_of[vi] = [k_star] + [d for d in range(vrank) if d != k_star]
+        orank = len(out_arg.device_size)
+        perm_of[oi] = [row_axis] + [d for d in range(orank) if d != row_axis]
+
+        # x_offsets rows == the index buffer's per-core element count (>= 8, C5).
+        num_rows = 1
+        for b in block_of[index_arg.arg_index]:
+            num_rows *= int(b)
+        if num_rows < 8:
+            raise NotImplementedError(
+                f"OpSpec->Triton: gather x_offsets must have >= 8 rows, got {num_rows}"
+            )
+
+        # dims >= 2 after the permute read their full block extent with no offset
+        # (C4); a work-divided trailing axis would need a per-core offset the
+        # gather cannot express (only dim 1 carries y_offset).
+        for k in range(2, vrank):
+            coord = value_arg.device_coordinates[perm_of[vi][k]]
+            if any(divisor_of.get(s, 1) != 1 for s in coord.free_symbols):
+                raise NotImplementedError(
+                    "OpSpec->Triton: gather with a work-divided trailing axis "
+                    "(dims >= 2 read the full block extent; no per-core offset) "
+                    "not supported yet. Retry with fewer SENCORES."
+                )
+
+        # Descriptor block on the indirect axis (permuted dim 0) must be 1 (C2).
+        block_of[vi] = list(block_of[vi])
+        block_of[vi][k_star] = 1
+
     # -- generator core -----------------------------------------------------
 
     def _emit_group(
@@ -479,27 +537,34 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         # the sticked matrix dim's [outer_stick, inner_stick] pair is innermost
         # and adjacent, ready to collapse into one matrix dim for tl.dot (the
         # "weight transpose", expressed as a permuted descriptor rather than a
-        # tl.trans).  Non-matmul groups use identity permutations, so their
-        # descriptor / offset source is byte-identical to before.
+        # tl.trans).  A gather likewise permutes the value arg's indirect axis to
+        # descriptor dim 0 and the output's row axis to dim 0.  Non-permuted
+        # groups use identity permutations, so their descriptor / offset source
+        # is byte-identical to before.  ``dim_skip`` holds arg_indices whose
+        # scalar offsets are *not* emitted -- the gather value arg, addressed by
+        # ``desc.gather(x_offsets, y_offset)`` and whose indirect coordinate is
+        # not renderable as a scalar offset.
         is_matmul = any(s.op in _MATMUL_OPS for s in group)
-        # A batched matmul carries its (single) noreuse batch symbol into the
-        # permutation so it leads each operand's descriptor axes, giving a
-        # batched matrix for tl.dot; None for a 2D matmul or a non-matmul group.
-        batch_sym = None
+        is_gather = not is_matmul and any(_is_gather_spec(s) for s in group)
+        perm_of = {i: list(range(len(tensor_args[i].device_size))) for i in used}
+        dim_skip: set[int] = set()
         if is_matmul:
+            # A batched matmul carries its (single) noreuse batch symbol into the
+            # permutation so it leads each operand's descriptor axes, giving a
+            # batched matrix for tl.dot; None for a 2D matmul.
             mm_spec = next(s for s in group if s.op in _MATMUL_OPS)
             _batch = self._matmul_operands(mm_spec)[6]
             batch_sym = next(iter(_batch)) if _batch else None
-        perm_of = {
-            i: (
-                _matmul_operand_permutation(
+            perm_of = {
+                i: _matmul_operand_permutation(
                     tensor_args[i].device_coordinates, batch_sym
                 )
-                if is_matmul
-                else list(range(len(tensor_args[i].device_size)))
-            )
-            for i in used
-        }
+                for i in used
+            }
+        elif is_gather:
+            self._prepare_gather(group[0], tensor_args, divisor_of, block_of, perm_of)
+            _idx, value_arg, _out, _k, _row = _gather_operands(group[0])
+            dim_skip = {value_arg.arg_index}
 
         # Build the body at column 0; buf.indent() re-indents it under `def`.
         # Program-id bases and descriptors are loop-invariant (they address the
@@ -508,7 +573,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         body = IndentedBuffer()
         self._emit_logical_offsets(body, it_space)
         if loop_ctx is None:
-            dims_of = self._emit_dim_vars(body, tensor_args, None, perm_of)
+            dims_of = self._emit_dim_vars(body, tensor_args, None, perm_of, dim_skip)
             desc_of = self._emit_descriptors(
                 body, tensor_args, param_names, block_of, perm_of
             )
@@ -519,7 +584,9 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             )
             body.writeline(f"for {loop_ctx.var} in range({loop_ctx.count}):")
             with body.indent():
-                dims_of = self._emit_dim_vars(body, tensor_args, loop_ctx, perm_of)
+                dims_of = self._emit_dim_vars(
+                    body, tensor_args, loop_ctx, perm_of, dim_skip
+                )
                 self._emit_ops(body, group, desc_of, dims_of, block_of, perm_of)
 
         signature = ", ".join(param_names[i] for i in used)
@@ -576,6 +643,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         tensor_args: dict[int, TensorArg],
         loop_ctx: "_LoopCtx | None",
         perm_of: dict[int, list[int]],
+        skip: "set[int] | None" = None,
     ) -> dict[int, list[str]]:
         """Emit device-dim offset vars (``dim0``/``dim1``/...) per tensor arg.
 
@@ -587,7 +655,9 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         Because the offset changes the coordinate string, full-size and
         per-tile operands that shared a layout naturally get distinct dim vars.
         ``perm_of`` reorders each arg's coordinates so they line up with its
-        permuted descriptor axes (identity for non-matmul args).
+        permuted descriptor axes (identity for non-matmul args).  ``skip`` names
+        arg_indices with no scalar offsets (the gather value arg, addressed by
+        ``desc.gather`` and whose indirect coordinate is not renderable).
         """
         dims_of: dict[int, list[str]] = {}
         # Cache device-dim var names by coordinate signature so operands with an
@@ -595,6 +665,8 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         coords_seen: dict[tuple[str, ...], list[str]] = {}
 
         for arg_index in sorted(tensor_args):
+            if skip and arg_index in skip:
+                continue
             arg = tensor_args[arg_index]
             coords = list(arg.device_coordinates)
             if loop_ctx is not None and not arg.per_tile_fixed:
@@ -707,6 +779,12 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             inputs = [a for a in spec.args if a.is_input]
             outputs = [a for a in spec.args if not a.is_input]
             assert len(outputs) == 1, "op must have exactly one output"
+
+            if _is_gather_spec(spec):
+                self._emit_gather(
+                    body, spec, _load, _fresh, _store, desc_of, block_of, perm_of
+                )
+                continue
 
             if spec.op in _MATMUL_OPS:
                 self._emit_matmul(body, spec, _load, _fresh, _store, block_of, perm_of)
@@ -826,6 +904,57 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         out_var = _fresh()
         body.writeline(f"{out_var} = tl.reshape({dot_var}, {out_block})")
         _store(out, out_var)
+
+    def _emit_gather(
+        self,
+        body: IndentedBuffer,
+        spec: OpSpec,
+        _load,
+        _fresh,
+        _store,
+        desc_of: dict[int, str],
+        block_of: dict[int, list[int]],
+        perm_of: dict[int, list[int]],
+    ) -> None:
+        """Emit ``desc.gather(x_offsets, y_offset)`` for an indirect (gather) load.
+
+        The index buffer's device tile is loaded normally and used directly as
+        the multi-D ``x_offsets`` (no flatten -- the Spyre verifier accepts a
+        >1D ``x_offsets``); the value arg is addressed through its permuted
+        descriptor (indirect axis at dim 0, block 1) with the single direct
+        ``y_offset`` on dim 1 and full block extent on dims >= 2.  The gather
+        result ``[*idx_block, *block[1:]]`` collapses to the output's single row
+        dim so the row-first result stores directly through the row-permuted
+        output descriptor (``_prepare_gather`` set both permutations).
+        """
+        index_arg, value_arg, out, _k, _row = _gather_operands(spec)
+        vi = value_arg.arg_index
+
+        # x_offsets: the index buffer's device tile (loaded via its descriptor).
+        x_offsets = _load(index_arg)
+
+        # y_offset: the single direct scalar offset (permuted dim 1 of the value
+        # arg).  dim 0 is indirect (x_offsets, no offset); dims >= 2 read full.
+        perm = perm_of[vi]
+        value_coords = [value_arg.device_coordinates[p] for p in perm]
+        y_offset = _coord_str(value_coords[1]) if len(value_coords) > 1 else "0"
+
+        result = _fresh()
+        body.writeline(f"{result} = {desc_of[vi]}.gather({x_offsets}, {y_offset})")
+
+        # Collapse the multi-D index dims to the output's single row dim.
+        perm_block = [block_of[vi][p] for p in perm]
+        idx_block = block_of[index_arg.arg_index]
+        num_rows = 1
+        for b in idx_block:
+            num_rows *= int(b)
+        if list(idx_block) != [num_rows]:
+            out_shape = [num_rows, *perm_block[1:]]
+            reshaped = _fresh()
+            body.writeline(f"{reshaped} = tl.reshape({result}, {out_shape})")
+            result = reshaped
+
+        _store(out, result)
 
     # -- preamble -----------------------------------------------------------
 
