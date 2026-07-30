@@ -33,12 +33,15 @@ OpSpec symbols by construction:
                                                      block_shape=per_core_shape)
 
 This cut covers pointwise ops (``add.py``), counted loops over a pointwise body
-(``add_mul_coarse.py``), and non-stick ``sum`` reductions (``sum.py`` with
-``dim=0``).  A reduction whose reduced dim is the within-stick axis (``dim=1``),
-spans multiple device axes, or is work-divided across cores raises
-``NotImplementedError`` (needs a ``sum_stick`` primitive or the inter-core reduce
-ring, respectively).  ``tl.dot`` (matmul) still raises ``NotImplementedError`` —
-it is the next bring-up step.
+(``add_mul_coarse.py``), non-stick ``sum`` reductions (``sum.py`` with
+``dim=0``), and 2D / batched matmul (``matmul.py`` / ``bmm.py``, via ``tl.dot``).
+A reduction whose reduced dim is the within-stick axis (``dim=1``), spans
+multiple device axes, or is work-divided across cores raises
+``NotImplementedError`` (needs a ``sum_stick`` primitive or the inter-core
+reduce ring, respectively).  Matmul supports a single (non-work-divided)
+contraction dim and at most one batch dim; more than one batch dim, a
+work-divided K, degenerate ``K == 1``, and fp8 matmul each raise
+``NotImplementedError`` (see ``_validate_matmul``).
 
 Counted loops
 -------------
@@ -79,6 +82,7 @@ from torch._inductor.utils import IndentedBuffer
 from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import FloorDiv
 
+from torch_spyre._inductor import constants
 from torch_spyre._inductor.codegen.opspec_utils import (
     _buf_id,
     _check_reshape_is_order_preserving,
@@ -86,6 +90,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _group_call_args,
     _iteration_space_key,
     _LoopCtx,
+    _matmul_operand_permutation,
     _reduction_axes,
     _row_major_strides,
     _size_hint,
@@ -107,6 +112,10 @@ _BINARY_OPS = {
     "mul": "*",
     "div": "/",
 }
+
+# Reduction op names lowered via ``tl.dot`` (matmul) rather than ``tl.sum``.
+# Only plain fp16 matmul is emitted so far; ``batchmatmulfp8`` is deferred.
+_MATMUL_OPS = {constants.BATCH_MATMUL_OP}
 
 
 @dataclasses.dataclass
@@ -146,6 +155,14 @@ def _normalize_floor_div(expr: sympy.Expr) -> sympy.Expr:
         return e
 
     return _rewrite(expr)
+
+
+def _arg_free_symbols(arg: TensorArg) -> set:
+    """Union of free symbols over a tensor arg's device coordinates."""
+    syms: set = set()
+    for coord in arg.device_coordinates:
+        syms |= coord.free_symbols
+    return syms
 
 
 def _coord_str(coord: sympy.Expr) -> str:
@@ -268,7 +285,10 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                 f"OpSpec->Triton: unexpected spec {type(spec).__name__}"
             )
         if spec.is_reduction:
-            SpyreOpSpecTritonKernel._validate_reduction(spec)
+            if spec.op in _MATMUL_OPS:
+                SpyreOpSpecTritonKernel._validate_matmul(spec)
+            else:
+                SpyreOpSpecTritonKernel._validate_reduction(spec)
             return
         if spec.op not in _BINARY_OPS:
             raise NotImplementedError(
@@ -319,6 +339,94 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                     "2607-InterCoreReduction.md). Retry with fewer SENCORES."
                 )
 
+    @staticmethod
+    def _matmul_operands(spec: OpSpec):
+        """Identify ``(x, y, out)`` and the K/N/M/batch symbol sets of a matmul.
+
+        Uses the BatchMatmul semantic-dimension definitions over the operands'
+        ``device_coordinates`` free symbols (the OpSpec analogue of
+        ``pass_utils.identify_matmul_inputs``):
+
+          reduction_dim K: in x and y, NOT out
+          generated_dim N: in y and out, NOT x
+          preserved_dim  M: in x and out, NOT y
+          noreuse_dim batch: in x, y, and out
+
+        ``y`` is identified by its generated dim (present in y & out, absent
+        from x) -- robust even when ``M == 1`` folds M out of both x and out.
+        Returns ``(x, y, out, k_syms, n_syms, m_syms, batch_syms)``; raises if
+        the operand arity is wrong or y cannot be identified.
+        """
+        inputs = [a for a in spec.args if a.is_input]
+        outputs = [a for a in spec.args if not a.is_input]
+        if len(inputs) != 2 or len(outputs) != 1:
+            raise NotImplementedError(
+                "OpSpec->Triton: matmul must have exactly two inputs and one output"
+            )
+        out = outputs[0]
+        out_syms = _arg_free_symbols(out)
+        a_syms = _arg_free_symbols(inputs[0])
+        b_syms = _arg_free_symbols(inputs[1])
+        # y carries the generated dim (in y & out, not x); a carries it otherwise.
+        if (b_syms & out_syms) - a_syms:
+            x, y, x_syms, y_syms = inputs[0], inputs[1], a_syms, b_syms
+        elif (a_syms & out_syms) - b_syms:
+            x, y, x_syms, y_syms = inputs[1], inputs[0], b_syms, a_syms
+        else:
+            raise NotImplementedError(
+                "OpSpec->Triton: could not identify matmul y (generated dim)"
+            )
+        k_syms = (x_syms & y_syms) - out_syms
+        n_syms = (y_syms & out_syms) - x_syms
+        m_syms = (x_syms & out_syms) - y_syms
+        batch_syms = x_syms & y_syms & out_syms
+        return x, y, out, k_syms, n_syms, m_syms, batch_syms
+
+    @staticmethod
+    def _validate_matmul(spec: OpSpec) -> None:
+        """Guard the matmul cases this cut supports; raise loudly otherwise.
+
+        Supported: a plain 2D ``batchmatmul`` (no batch dim) or a batched
+        ``batchmatmul`` with a single noreuse/batch dim -- both with a single
+        contraction dim K that is not work-divided across cores.  The batch dim
+        leads the operand permutation so each operand reshapes to a batched
+        matrix (``[B, M, K]`` / ``[B, K, N]``) for a batched ``tl.dot`` (the
+        backend lowers a rank-3 ``tt.dot`` to ``linalg.batch_matmul``).  Deferred
+        cases each need machinery that does not exist yet:
+
+        - more than one batch dim -> multi-dim batched ``tl.dot``;
+        - K work-divided across cores -> the HW inter-core reduce ring;
+        - degenerate ``K == 1`` -> pointwise-mul lowering (retired to patches);
+        - fp8 matmul (``batchmatmulfp8``).
+        """
+        _x, _y, _out, k_syms, _n, _m, batch_syms = (
+            SpyreOpSpecTritonKernel._matmul_operands(spec)
+        )
+        if len(k_syms) != 1:
+            raise NotImplementedError(
+                "OpSpec->Triton: matmul must have exactly one contraction dim "
+                f"(got K symbols {k_syms})"
+            )
+        if len(batch_syms) > 1:
+            raise NotImplementedError(
+                "OpSpec->Triton: matmul with more than one batch dim not "
+                f"supported yet (batch symbols {batch_syms}); needs a "
+                "multi-dim batched tl.dot"
+            )
+        k_sym = next(iter(k_syms))
+        k_range, k_div = spec.iteration_space.get(k_sym, (0, 1))
+        if int(k_div) != 1:
+            raise NotImplementedError(
+                "OpSpec->Triton: matmul contraction dim is work-divided across "
+                "cores (inter-core reduce ring not implemented; see "
+                "2607-InterCoreReduction.md). Retry with fewer SENCORES."
+            )
+        if _size_hint(k_range) <= 1:
+            raise NotImplementedError(
+                "OpSpec->Triton: degenerate K==1 matmul not supported yet "
+                "(pointwise-mul lowering retired to patches)"
+            )
+
     # -- generator core -----------------------------------------------------
 
     def _emit_group(
@@ -367,6 +475,32 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             i: _device_block_shape(tensor_args[i], divisor_of, loop_ctx) for i in used
         }
 
+        # Matmul operands are addressed through a *permuted* tensor descriptor so
+        # the sticked matrix dim's [outer_stick, inner_stick] pair is innermost
+        # and adjacent, ready to collapse into one matrix dim for tl.dot (the
+        # "weight transpose", expressed as a permuted descriptor rather than a
+        # tl.trans).  Non-matmul groups use identity permutations, so their
+        # descriptor / offset source is byte-identical to before.
+        is_matmul = any(s.op in _MATMUL_OPS for s in group)
+        # A batched matmul carries its (single) noreuse batch symbol into the
+        # permutation so it leads each operand's descriptor axes, giving a
+        # batched matrix for tl.dot; None for a 2D matmul or a non-matmul group.
+        batch_sym = None
+        if is_matmul:
+            mm_spec = next(s for s in group if s.op in _MATMUL_OPS)
+            _batch = self._matmul_operands(mm_spec)[6]
+            batch_sym = next(iter(_batch)) if _batch else None
+        perm_of = {
+            i: (
+                _matmul_operand_permutation(
+                    tensor_args[i].device_coordinates, batch_sym
+                )
+                if is_matmul
+                else list(range(len(tensor_args[i].device_size)))
+            )
+            for i in used
+        }
+
         # Build the body at column 0; buf.indent() re-indents it under `def`.
         # Program-id bases and descriptors are loop-invariant (they address the
         # full HBM buffer), so they stay above the loop; only the device-dim
@@ -374,15 +508,19 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         body = IndentedBuffer()
         self._emit_logical_offsets(body, it_space)
         if loop_ctx is None:
-            dims_of = self._emit_dim_vars(body, tensor_args, None)
-            desc_of = self._emit_descriptors(body, tensor_args, param_names, block_of)
-            self._emit_ops(body, group, desc_of, dims_of, block_of)
+            dims_of = self._emit_dim_vars(body, tensor_args, None, perm_of)
+            desc_of = self._emit_descriptors(
+                body, tensor_args, param_names, block_of, perm_of
+            )
+            self._emit_ops(body, group, desc_of, dims_of, block_of, perm_of)
         else:
-            desc_of = self._emit_descriptors(body, tensor_args, param_names, block_of)
+            desc_of = self._emit_descriptors(
+                body, tensor_args, param_names, block_of, perm_of
+            )
             body.writeline(f"for {loop_ctx.var} in range({loop_ctx.count}):")
             with body.indent():
-                dims_of = self._emit_dim_vars(body, tensor_args, loop_ctx)
-                self._emit_ops(body, group, desc_of, dims_of, block_of)
+                dims_of = self._emit_dim_vars(body, tensor_args, loop_ctx, perm_of)
+                self._emit_ops(body, group, desc_of, dims_of, block_of, perm_of)
 
         signature = ", ".join(param_names[i] for i in used)
         header = self._emit_header(grid, used)
@@ -437,15 +575,19 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         body: IndentedBuffer,
         tensor_args: dict[int, TensorArg],
         loop_ctx: "_LoopCtx | None",
+        perm_of: dict[int, list[int]],
     ) -> dict[int, list[str]]:
         """Emit device-dim offset vars (``dim0``/``dim1``/...) per tensor arg.
 
         Returns ``dims_of`` keyed by ``arg_index``: the list of device-dim
-        offset variable names.  For a counted-loop body, a full-size operand's
-        tiled-dim coordinate is advanced by ``loop0 * per_tile_range`` (via
+        offset variable names, in the arg's (possibly permuted) descriptor-axis
+        order.  For a counted-loop body, a full-size operand's tiled-dim
+        coordinate is advanced by ``loop0 * per_tile_range`` (via
         ``loop_ctx.subs``); a ``per_tile_fixed`` operand is left untouched.
         Because the offset changes the coordinate string, full-size and
         per-tile operands that shared a layout naturally get distinct dim vars.
+        ``perm_of`` reorders each arg's coordinates so they line up with its
+        permuted descriptor axes (identity for non-matmul args).
         """
         dims_of: dict[int, list[str]] = {}
         # Cache device-dim var names by coordinate signature so operands with an
@@ -457,6 +599,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             coords = list(arg.device_coordinates)
             if loop_ctx is not None and not arg.per_tile_fixed:
                 coords = [c.subs(loop_ctx.subs) for c in coords]
+            coords = [coords[p] for p in perm_of[arg_index]]
             key = tuple(str(c) for c in coords)
             if key not in coords_seen:
                 group = len(coords_seen)
@@ -477,6 +620,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         tensor_args: dict[int, TensorArg],
         param_names: list[str],
         block_of: dict[int, list[int]],
+        perm_of: dict[int, list[int]],
     ) -> dict[int, str]:
         """Emit one ``tl.make_tensor_descriptor`` per tensor arg.
 
@@ -484,13 +628,22 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         HBM buffer (``shape=device_size``) so they are loop-invariant; only the
         per-core ``block_shape`` (from the shared ``block_of``) reflects the work
         division (and, in a loop, one tile's worth of the tiled dim).
+
+        ``perm_of`` reorders each arg's descriptor axes (identity for non-matmul
+        args).  The strides are the *natural* row-major strides permuted the same
+        way -- i.e. the physical HBM tensor viewed under a reordered axis basis --
+        so a permuted descriptor is a genuine transpose of the same buffer, not a
+        re-layout.
         """
         desc_of: dict[int, str] = {}
         for arg_index in sorted(tensor_args):
             arg = tensor_args[arg_index]
-            device_size = [int(s) for s in arg.device_size]
-            strides = _row_major_strides(device_size)
-            block_shape = block_of[arg_index]
+            perm = perm_of[arg_index]
+            device_size_nat = [int(s) for s in arg.device_size]
+            strides_nat = _row_major_strides(device_size_nat)
+            device_size = [device_size_nat[p] for p in perm]
+            strides = [strides_nat[p] for p in perm]
+            block_shape = [block_of[arg_index][p] for p in perm]
             desc = f"desc_{arg_index}"
             body.writeline(
                 f"{desc} = tl.make_tensor_descriptor("
@@ -510,6 +663,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         desc_of: dict[int, str],
         dims_of: dict[int, list[str]],
         block_of: dict[int, list[int]],
+        perm_of: dict[int, list[int]],
     ) -> None:
         """Emit load / compute / store for each op (pointwise or reduction).
 
@@ -553,6 +707,10 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             inputs = [a for a in spec.args if a.is_input]
             outputs = [a for a in spec.args if not a.is_input]
             assert len(outputs) == 1, "op must have exactly one output"
+
+            if spec.op in _MATMUL_OPS:
+                self._emit_matmul(body, spec, _load, _fresh, _store, block_of, perm_of)
+                continue
 
             if spec.is_reduction:
                 self._emit_reduction(
@@ -612,6 +770,61 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             _check_reshape_is_order_preserving(in_arg, out, axis, in_block, out_block)
             out_var = _fresh()
             body.writeline(f"{out_var} = tl.reshape({red_var}, {out_block})")
+        _store(out, out_var)
+
+    def _emit_matmul(
+        self,
+        body: IndentedBuffer,
+        spec: OpSpec,
+        _load,
+        _fresh,
+        _store,
+        block_of: dict[int, list[int]],
+        perm_of: dict[int, list[int]],
+    ) -> None:
+        """Emit ``tl.dot`` for a 2D or batched matmul (``batchmatmul``).
+
+        ``_validate_matmul`` has guaranteed a single, non-work-divided
+        contraction dim K and at most one batch dim.  Each operand was loaded
+        through a permuted descriptor placing its (single) batch dim first and
+        its sticked matrix dim's ``[outer_stick, inner_stick]`` pair innermost,
+        so its per-core block is ``[batch?, row, ..., outer_stick, inner_stick]``.
+        Collapsing everything after the batch+row dims into one column yields the
+        canonical (batched) matrix the Spyre ``tt.dot`` -> ``linalg.matmul`` /
+        ``linalg.batch_matmul`` lowering expects::
+
+            A block [B?, M, K_out, K_in] -> [B?, M, K]   (K = K_out * K_in)
+            B block [B?, K, N_out, N_in] -> [B?, K, N]   (N = N_out * N_in)
+            tl.dot(A, B)                 -> [B?, M, N]
+            reshape                      -> out block [B?, M, N_out, N_in], store
+
+        The collapse is order-preserving: the within-stick index plus
+        ``outer * stick`` reproduces the matrix-dim iteration symbol exactly
+        (``c = FloorDiv(c, stick) * stick + Mod(c, stick)``).  For a plain 2D
+        matmul ``n_batch == 0`` and this reduces to ``[M, K]`` / ``[K, N]``.
+        """
+        x, y, out, _k, _n, _m, batch_syms = self._matmul_operands(spec)
+        n_batch = 1 if batch_syms else 0
+
+        def _collapse(arg: TensorArg, var: str) -> str:
+            perm_block = [block_of[arg.arg_index][p] for p in perm_of[arg.arg_index]]
+            batch = perm_block[:n_batch]
+            rows = perm_block[n_batch]
+            cols = 1
+            for s in perm_block[n_batch + 1 :]:
+                cols *= s
+            flat = _fresh()
+            body.writeline(f"{flat} = tl.reshape({var}, {batch + [rows, cols]})")
+            return flat
+
+        a2d = _collapse(x, _load(x))
+        b2d = _collapse(y, _load(y))
+        dot_var = _fresh()
+        body.writeline(f'{dot_var} = tl.dot({a2d}, {b2d}, input_precision="ieee")')
+
+        out_block = [block_of[out.arg_index][p] for p in perm_of[out.arg_index]]
+        out_var = _fresh()
+        body.writeline(f"{out_var} = tl.reshape({dot_var}, {out_block})")
         _store(out, out_var)
 
     # -- preamble -----------------------------------------------------------
