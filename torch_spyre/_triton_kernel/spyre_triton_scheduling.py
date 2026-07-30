@@ -126,6 +126,18 @@ class SpyreOpSpecTritonScheduling(SuperDSCScheduling):
             for snode in all_schedule_nodes:
                 snode.mark_run()
 
+        # A pool intermediate that crosses a fusion-group boundary (produced in
+        # one kernel, read in another) is kept as a pool buffer in the OpSpec but
+        # materialized as its own HBM tensor for the Triton path.  Emit its
+        # allocation before the first ``.run()`` so both kernels can address it;
+        # the generator owns it (added to removed_buffers), so Inductor neither
+        # allocates nor frees it.
+        for name in getattr(kernel, "materialized_pool_names", ()):
+            buffer = V.graph.get_buffer(name)
+            if buffer is not None:
+                line = V.graph.wrapper_code.make_buffer_allocation(buffer)
+                V.graph.wrapper_code.writeline(line)
+
         for plan in plans:
             kernel_name = self.define_kernel(plan.source, all_schedule_nodes, kernel)
             self.codegen_comment(all_schedule_nodes, kernel_name)

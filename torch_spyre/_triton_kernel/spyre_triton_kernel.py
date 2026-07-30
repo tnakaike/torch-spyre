@@ -77,6 +77,7 @@ import dataclasses
 import os
 
 import sympy
+import torch
 from torch._inductor.codegen.triton import TritonKernel, texpr
 from torch._inductor.utils import IndentedBuffer
 from torch._inductor.virtualized import V
@@ -88,7 +89,6 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _check_reshape_is_order_preserving,
     _device_block_shape,
     _gather_operands,
-    _group_call_args,
     _is_gather_spec,
     _is_restickify_spec,
     _iteration_space_key,
@@ -122,14 +122,29 @@ _BINARY_OPS = {
 # Only plain fp16 matmul is emitted so far; ``batchmatmulfp8`` is deferred.
 _MATMUL_OPS = {constants.BATCH_MATMUL_OP}
 
+# torch dtype -> Triton pointer-type string, for synthesizing the fixed_config
+# signature of a materialized cross-group pool buffer (which has no entry in
+# ``python_argdefs``; see ``_assign_pool_slots``).
+_TORCH_PTR_TYPE = {
+    torch.float16: "*fp16",
+    torch.float32: "*fp32",
+    torch.bfloat16: "*bf16",
+    torch.int64: "*i64",
+    torch.int32: "*i32",
+    torch.int8: "*i8",
+    torch.uint8: "*u8",
+    torch.bool: "*i1",
+}
+
 
 @dataclasses.dataclass
 class _KernelPlan:
     """One emitted Triton kernel: its source plus the ``.run`` call arguments.
 
-    ``call_args`` are the caller-side buffer names (in signature order, deduped,
-    with a leading ``_pool`` if the group touches pool memory) that the scheduler
-    passes to ``<name>.run(...)`` for this group's kernel.
+    ``call_args`` are the caller-side buffer names (in signature order, deduped)
+    that the scheduler passes to ``<name>.run(...)`` for this group's kernel.  A
+    cross-group pool intermediate appears here as its own materialized HBM tensor
+    (see ``_assign_pool_slots``); the shared ``_pool`` region is never passed.
     """
 
     source: str
@@ -188,6 +203,22 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
     # loop nesting level is supported, so a single fixed name suffices.
     LOOP_VAR = "loop0"
 
+    def create_tensor_arg(self, is_input, name, tensor, opspec_name=None):
+        """Populate ``TensorArg.name`` with the buffer name for every arg.
+
+        The base ``SpyreKernel`` leaves ``name`` unset outside the gather path,
+        so ``_buf_id`` falls back to the ``arg_index`` sentinel and distinct
+        fused-away intermediates (all ``arg_index == -1``) collide.  The Triton
+        projection needs a stable per-buffer identity -- to thread register
+        values without aliasing, and to identify a cross-group pool buffer by
+        name (see ``_assign_pool_slots``) -- so default ``opspec_name`` to the
+        buffer name.  This is a projection detail local to the Triton path; the
+        SDSC frontend is untouched.
+        """
+        return super().create_tensor_arg(
+            is_input, name, tensor, opspec_name=opspec_name or name
+        )
+
     def codegen_kernels(self) -> list[_KernelPlan]:
         """Finalize the op_specs and emit one Triton kernel per fusion group.
 
@@ -199,13 +230,75 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         Triton kernel — see the module docstring's "Fuse vs. split".
         """
         super().codegen_kernel()
-        plans = [
-            self._emit_group(group, loop_ctx)
-            for group, loop_ctx in self._partition_specs()
-        ]
+        partitions = self._partition_specs()
+        self._assign_pool_slots([group for group, _ in partitions])
+        plans = [self._emit_group(group, loop_ctx) for group, loop_ctx in partitions]
         for plan in plans:
             self._dump_source(plan.source)
         return plans
+
+    # -- cross-group pool buffers -------------------------------------------
+
+    def _assign_pool_slots(self, groups: list[list[OpSpec]]) -> None:
+        """Assign a kernel-parameter slot to each cross-group pool buffer.
+
+        A pool buffer (``arg_index < 0``, ``allocation={'pool': ...}``) that is
+        referenced in more than one fusion group is a fused-away intermediate
+        that must actually cross the kernel boundary through HBM (e.g.
+        ``sum_sum``'s ``buf0``, produced by group 0's reduction and consumed by
+        group 1's).  The OpSpec keeps it as a pool buffer -- identical to the
+        SDSC contract -- so the *generator* materializes it: it gets a synthetic
+        parameter slot appended after the real ``python_argdefs`` args (its
+        OpSpec ``arg_index`` stays ``< 0``), threaded through every group that
+        uses it, plus its own HBM allocation emitted into the wrapper by the
+        scheduler.  A pool buffer confined to a single group is register-threaded
+        as before (``add_mul_coarse``'s loop-carried intermediate), so it gets no
+        slot here.
+        """
+        self._pool_slot_of: dict[str, int] = {}
+        self._pool_param_of: dict[int, str] = {}
+        self.materialized_pool_names: list[str] = []
+
+        groups_of: dict[str, set[int]] = {}
+        for gi, group in enumerate(groups):
+            for spec in group:
+                for a in spec.args:
+                    if (
+                        isinstance(a, TensorArg)
+                        and a.arg_index < 0
+                        and "pool" in a.allocation
+                    ):
+                        groups_of.setdefault(str(_buf_id(a)), set()).add(gi)
+
+        base = len(self.args.python_argdefs()[0])
+        for bid, gids in groups_of.items():
+            if len(gids) <= 1:
+                continue  # register-threaded within a single group
+            slot = base + len(self._pool_slot_of)
+            self._pool_slot_of[bid] = slot
+            self._pool_param_of[slot] = bid
+            self.materialized_pool_names.append(bid)
+            # Own the buffer entirely: keep Inductor from allocating/freeing it
+            # (it is a pool buffer, so it is kernel-local to Inductor anyway); the
+            # scheduler emits its allocation and threads it through both kernels.
+            self.removed_buffers.add(bid)
+
+    def _slot(self, arg: TensorArg) -> int:
+        """Kernel-parameter slot for a tensor arg, or ``-1`` if register-threaded.
+
+        A real arg uses its assigned ``arg_index``; a materialized cross-group
+        pool buffer uses its synthetic slot (see ``_assign_pool_slots``);
+        anything else (a within-group fused-away intermediate) has no slot and is
+        threaded through registers.
+        """
+        if arg.arg_index >= 0:
+            return arg.arg_index
+        return self._pool_slot_of.get(str(_buf_id(arg)), -1)
+
+    def _pool_ptr_type(self, slot: int) -> str:
+        """Triton pointer-type string for a materialized pool buffer's slot."""
+        dtype = V.graph.get_buffer(self._pool_param_of[slot]).get_dtype()
+        return _TORCH_PTR_TYPE.get(dtype, "*fp16")
 
     # -- fusion grouping ----------------------------------------------------
 
@@ -510,20 +603,30 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         # these parallel lists (assigned by super().codegen_kernel()).
         argdefs, actuals, _sig, _types = self.args.python_argdefs()
         param_names = [a.name for a in argdefs]
+        actuals = list(actuals)
+        # Materialized cross-group pool buffers have no python_argdefs entry;
+        # append a synthetic parameter slot for each (its name is both the Triton
+        # parameter and the caller-side buffer name).  Slots are global (indexed
+        # after the real args, identically for every group), so ``used`` and the
+        # signature/descriptor lookups below stay a single flat int keyspace.
+        for slot in sorted(self._pool_param_of):
+            assert slot == len(param_names)
+            param_names.append(self._pool_param_of[slot])
+            actuals.append(self._pool_param_of[slot])
 
-        # Unique *materialized* tensor args of this group, first occurrence per
-        # arg_index.  A negative arg_index marks a buffer that was never made a
-        # kernel parameter (a fused-away intermediate): it is threaded through
-        # registers by _emit_ops, so it gets no descriptor and no signature slot.
+        # Unique tensor args of this group, keyed by their kernel-parameter slot
+        # (== arg_index for a real arg; the synthetic slot for a materialized
+        # pool buffer).  A slot of -1 marks a register-threaded intermediate: it
+        # is threaded through registers by _emit_ops, so it gets no descriptor
+        # and no signature slot.
         tensor_args: dict[int, TensorArg] = {}
         for spec in group:
             for a in spec.args:
-                if (
-                    isinstance(a, TensorArg)
-                    and a.arg_index >= 0
-                    and a.arg_index not in tensor_args
-                ):
-                    tensor_args[a.arg_index] = a
+                if not isinstance(a, TensorArg):
+                    continue
+                slot = self._slot(a)
+                if slot >= 0 and slot not in tensor_args:
+                    tensor_args[slot] = a
         used = sorted(tensor_args)
 
         # Every op in a group shares one iteration space (grouping invariant).
@@ -605,10 +708,19 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         with buf.indent():
             buf.splice(body.getvalue())
 
-        return _KernelPlan(
-            source=buf.getvalue(),
-            call_args=_group_call_args(tensor_args, used, actuals),
-        )
+        # Caller-side buffer names in signature order, deduped.  No leading
+        # ``_pool``: within-group intermediates are register-threaded and
+        # cross-group ones are materialized HBM tensors (real actuals here), so
+        # the Triton path never passes the shared pool region.
+        seen: set[str] = set()
+        call_args: list[str] = []
+        for i in used:
+            name = actuals[i]
+            if name not in seen:
+                seen.add(name)
+                call_args.append(name)
+
+        return _KernelPlan(source=buf.getvalue(), call_args=call_args)
 
     def _emit_logical_offsets(
         self,
@@ -768,19 +880,23 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             if key in produced:
                 return produced[key]
             # A register-threaded intermediate must have been produced earlier in
-            # this kernel; only materialized args (arg_index >= 0) load from HBM.
-            offsets = ", ".join(dims_of[arg.arg_index])
+            # this kernel; only args with a slot (real, or a materialized
+            # cross-group pool buffer) load from HBM.
+            slot = self._slot(arg)
+            offsets = ", ".join(dims_of[slot])
             var = _fresh()
-            body.writeline(f"{var} = {desc_of[arg.arg_index]}.load([{offsets}])")
+            body.writeline(f"{var} = {desc_of[slot]}.load([{offsets}])")
             produced[key] = var
             return var
 
         def _store(out: TensorArg, var: str) -> None:
-            # Only write HBM for a materialized output; a fused-away intermediate
-            # (arg_index < 0) is consumed from the register in a later op.
-            if out.arg_index >= 0:
-                offsets = ", ".join(dims_of[out.arg_index])
-                body.writeline(f"{desc_of[out.arg_index]}.store([{offsets}], {var})")
+            # Write HBM for any output with a slot (a real output or a
+            # materialized cross-group pool buffer); a register-threaded
+            # intermediate (no slot) is consumed from the register in a later op.
+            slot = self._slot(out)
+            if slot >= 0:
+                offsets = ", ".join(dims_of[slot])
+                body.writeline(f"{desc_of[slot]}.store([{offsets}], {var})")
             produced[_buf_id(out)] = var
 
         for spec in specs:
@@ -837,9 +953,11 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         which reshapes to output ``[1, 4, 64]``).
         """
         in_arg = inputs[0]
-        # A fused-away reduction input has no descriptor/block; not supported yet
-        # (sum.py reads an HBM buffer).  Raise loudly rather than emit wrong code.
-        if in_arg.arg_index < 0:
+        # A reduction input with no slot is register-threaded (fused away) and has
+        # no descriptor/block; not supported yet.  A materialized cross-group pool
+        # buffer (sum_sum's buf0) does have a slot and loads from HBM below.
+        in_slot = self._slot(in_arg)
+        if in_slot < 0:
             raise NotImplementedError(
                 "OpSpec->Triton: reduction with a register-threaded (fused) input "
                 "not supported yet"
@@ -853,9 +971,10 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         out_var = red_var
 
         # Shape of the tile after tl.sum drops `axis`, vs. the output block shape.
-        in_block = block_of[in_arg.arg_index]
+        in_block = block_of[in_slot]
         reduced_shape = [s for k, s in enumerate(in_block) if k != axis]
-        out_block = block_of.get(out.arg_index) if out.arg_index >= 0 else None
+        out_slot = self._slot(out)
+        out_block = block_of.get(out_slot) if out_slot >= 0 else None
         if out_block is not None and out_block != reduced_shape:
             _check_reshape_is_order_preserving(in_arg, out, axis, in_block, out_block)
             out_var = _fresh()
@@ -1047,17 +1166,29 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             from torch._inductor.runtime.hints import DeviceProperties
 
             argdefs, _call, signature, _types = self.args.python_argdefs()
-            argdefs = [argdefs[i] for i in used]
-            signature = [signature[i] for i in used]
+            base = len(argdefs)
+            # Real args come first in ``used`` (slots < base), materialized pool
+            # buffers last (slots >= base, no python_argdefs entry).  Build the
+            # signature/divisibility from the real args, then append a pointer
+            # type for each pool buffer (its position in the emitted signature is
+            # after every real arg, so the divisibility config indices still line
+            # up); a missing divisibility hint is merely conservative.
+            real_used = [i for i in used if i < base]
+            pool_used = [i for i in used if i >= base]
+            argdefs_r = [argdefs[i] for i in real_used]
+            signature_r = [signature[i] for i in real_used]
+            sig_meta = signature_to_meta(
+                signature_r, size_dtype=None, argdefs=argdefs_r
+            )
+            for slot in pool_used:
+                sig_meta[self._pool_param_of[slot]] = self._pool_ptr_type(slot)
             triton_meta = {
-                "signature": signature_to_meta(
-                    signature, size_dtype=None, argdefs=argdefs
-                ),
+                "signature": sig_meta,
                 "device": DeviceProperties.create(
                     V.graph.get_current_device_or_throw()
                 ),
                 "constants": {},
-                "configs": [config_of(signature)],
+                "configs": [config_of(signature_r)],
                 "native_matmul": False,
                 "spyre_grid": [grid],
             }
