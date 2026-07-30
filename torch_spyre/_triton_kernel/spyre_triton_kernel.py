@@ -90,10 +90,13 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _gather_operands,
     _group_call_args,
     _is_gather_spec,
+    _is_restickify_spec,
     _iteration_space_key,
     _LoopCtx,
     _matmul_operand_permutation,
     _reduction_axes,
+    _restickify_operands,
+    _restickify_plan,
     _row_major_strides,
     _size_hint,
 )
@@ -297,6 +300,11 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             # work-divided trailing axis) run in _emit_group where the per-core
             # block shapes and work divisions are known.
             _gather_operands(spec)
+            return
+        if _is_restickify_spec(spec):
+            # Cross-stick transpose copy; the reshape/permute/reshape plan (which
+            # needs the per-core block shapes) is built in _emit_restickify.
+            _restickify_operands(spec)
             return
         if spec.op not in _BINARY_OPS:
             raise NotImplementedError(
@@ -786,6 +794,10 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                 )
                 continue
 
+            if _is_restickify_spec(spec):
+                self._emit_restickify(body, spec, _load, _fresh, _store, block_of)
+                continue
+
             if spec.op in _MATMUL_OPS:
                 self._emit_matmul(body, spec, _load, _fresh, _store, block_of, perm_of)
                 continue
@@ -904,6 +916,53 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         out_var = _fresh()
         body.writeline(f"{out_var} = tl.reshape({dot_var}, {out_block})")
         _store(out, out_var)
+
+    def _emit_restickify(
+        self,
+        body: IndentedBuffer,
+        spec: OpSpec,
+        _load,
+        _fresh,
+        _store,
+        block_of: dict[int, list[int]],
+    ) -> None:
+        """Emit reshape -> permute -> reshape for a cross-stick restickify.
+
+        A restickify moves which logical dim is the within-stick (last) axis, so
+        the 64 within-stick elements physically cross sticks -- not expressible
+        as a plain strided copy.  ``_restickify_plan`` splits the input tile at
+        the stick boundary of the axis that becomes stick-split on the output,
+        permutes the atoms into the output device-axis order, then merges the
+        output's now-full former-stick axis back from its pair -- reproducing the
+        reference ``clone/transpose`` kernel.  The descriptors are the natural
+        (unpermuted) ones, so the tile arrives in ``block_of`` device order.
+        """
+        in_arg = next(a for a in spec.args if a.is_input)
+        out = next(a for a in spec.args if not a.is_input)
+        in_block = [int(b) for b in block_of[in_arg.arg_index]]
+        out_block = (
+            [int(b) for b in block_of[out.arg_index]]
+            if out.arg_index >= 0
+            else [int(s) for s in out.device_size]
+        )
+        reshape1, permute, reshape2 = _restickify_plan(in_arg, out, in_block, out_block)
+
+        var = _load(in_arg)
+        cur_shape = in_block
+        if reshape1 != cur_shape:
+            nv = _fresh()
+            body.writeline(f"{nv} = tl.reshape({var}, {reshape1})")
+            var, cur_shape = nv, reshape1
+        if permute != list(range(len(permute))):
+            nv = _fresh()
+            body.writeline(f"{nv} = tl.permute({var}, {permute})")
+            var = nv
+            cur_shape = [cur_shape[p] for p in permute]
+        if reshape2 != cur_shape:
+            nv = _fresh()
+            body.writeline(f"{nv} = tl.reshape({var}, {reshape2})")
+            var = nv
+        _store(out, var)
 
     def _emit_gather(
         self,
