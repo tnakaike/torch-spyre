@@ -122,6 +122,19 @@ _BINARY_OPS = {
 # Only plain fp16 matmul is emitted so far; ``batchmatmulfp8`` is deferred.
 _MATMUL_OPS = {constants.BATCH_MATMUL_OP}
 
+
+def _consumes_registers(spec: OpSpec) -> bool:
+    """Whether ``spec`` can consume a register-threaded (fused-away) operand.
+
+    Only a pointwise binary op reads its inputs straight from the register a
+    prior op left them in.  Every other op (matmul, reduction, restickify,
+    gather) loads its operands through a ``tl.make_tensor_descriptor`` and needs
+    per-arg ``block_shape`` / permutation metadata, so its operands must be
+    HBM-resident -- see ``_group_body``, which splits the producer off.
+    """
+    return spec.op in _BINARY_OPS and not spec.is_reduction
+
+
 # torch dtype -> Triton pointer-type string, for synthesizing the fixed_config
 # signature of a materialized cross-group pool buffer (which has no entry in
 # ``python_argdefs``; see ``_assign_pool_slots``).
@@ -329,17 +342,36 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         fuse into one kernel; a change of iteration space starts a new group.
         Grouping is *contiguous* so the kernels run in op order — a later op that
         reads an earlier op's (now HBM) output is always sequenced after it.
+
+        A second boundary is forced independently of the iteration space: an op
+        that loads its operands through descriptors (matmul, reduction,
+        restickify, gather -- anything but a pointwise binary op) cannot consume
+        a register-threaded operand, so it must not fuse with an op *within the
+        same group* that produces one of its inputs.  Splitting there pushes the
+        producer's output across the kernel boundary (it becomes a materialized
+        HBM pool buffer, see ``_assign_pool_slots``) so the consumer reads it via
+        a descriptor.  ``linear.py`` is the canonical case: a restickify feeds
+        the matmul weight, and both share ``{c0:(512,1), c1:(512,1)}``.
         """
         groups: list[list[OpSpec]] = []
         prev_key: object = None
+        produced: set[object] = set()  # buffer ids produced in the current group
         for spec in specs:
             self._validate_spec(spec)
             assert isinstance(spec, OpSpec)  # narrowed by _validate_spec
             key = _iteration_space_key(spec)
-            if not groups or key != prev_key:
+            reads_produced = any(
+                a.is_input and _buf_id(a) in produced for a in spec.args
+            )
+            needs_split = reads_produced and not _consumes_registers(spec)
+            if not groups or key != prev_key or needs_split:
                 groups.append([spec])
+                produced = set()
             else:
                 groups[-1].append(spec)
+            for a in spec.args:
+                if not a.is_input:
+                    produced.add(_buf_id(a))
             prev_key = key
         if not groups:
             raise NotImplementedError("OpSpec->Triton: no ops to emit")
@@ -1016,7 +1048,12 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         n_batch = 1 if batch_syms else 0
 
         def _collapse(arg: TensorArg, var: str) -> str:
-            perm_block = [block_of[arg.arg_index][p] for p in perm_of[arg.arg_index]]
+            # Index block_of/perm_of by the kernel-parameter slot, not the raw
+            # arg_index: a matmul operand may be a materialized cross-group pool
+            # buffer (arg_index == -1, synthetic slot), e.g. linear.py's
+            # restickified weight buf1 produced by a prior kernel.
+            slot = self._slot(arg)
+            perm_block = [block_of[slot][p] for p in perm_of[slot]]
             batch = perm_block[:n_batch]
             rows = perm_block[n_batch]
             cols = 1
@@ -1031,7 +1068,8 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         dot_var = _fresh()
         body.writeline(f'{dot_var} = tl.dot({a2d}, {b2d}, input_precision="ieee")')
 
-        out_block = [block_of[out.arg_index][p] for p in perm_of[out.arg_index]]
+        out_slot = self._slot(out)
+        out_block = [block_of[out_slot][p] for p in perm_of[out_slot]]
         out_var = _fresh()
         body.writeline(f"{out_var} = tl.reshape({dot_var}, {out_block})")
         _store(out, out_var)
