@@ -146,11 +146,22 @@ _UNARY_EXPR_OPS = {
     IDENTITY_OP: "{x}",
     "neg": "-{x}",
     "reciprocal": "1.0 / {x}",
+    # relu(x) == max(x, 0); tl.maximum takes fp16 directly (no fp32 upcast).
+    "relufwd": "tl.maximum({x}, 0.0)",
 }
+
+# Unary ops the flex/KTIR backends lower natively as a single op, but which the
+# generator has no primitive for -- it expands them into supported ``tl.*`` ops
+# at emit time (see ``_emit_pointwise``).
+_UNARY_COMPOUND_OPS = {"silu"}  # silu(x) == x * sigmoid(x)
 
 # All pointwise (non-reduction) op names the generator can emit.
 _POINTWISE_OPS = (
-    set(_BINARY_OPS) | set(_BINARY_FN_OPS) | set(_UNARY_MATH_OPS) | set(_UNARY_EXPR_OPS)
+    set(_BINARY_OPS)
+    | set(_BINARY_FN_OPS)
+    | set(_UNARY_MATH_OPS)
+    | set(_UNARY_EXPR_OPS)
+    | _UNARY_COMPOUND_OPS
 )
 
 # Device float formats that ``tl.*`` math ops cannot consume directly; operands
@@ -1105,6 +1116,13 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             assert len(inputs) == 1, f"unary op '{op}' needs one input"
             x = _al(inputs[0])
             body.writeline(f"{out_var} = {_UNARY_EXPR_OPS[op].format(x=x)}")
+        elif op == "silu":
+            # silu(x) == x * sigmoid(x); sigmoid needs fp32 (see _tl_unary), then
+            # the original (unupcast) x multiplies the downcast result.
+            assert len(inputs) == 1, "silu needs one input"
+            x = _al(inputs[0])
+            sig = _tl_unary("tl.sigmoid", x, inputs[0].device_dtype)
+            body.writeline(f"{out_var} = {x} * ({sig})")
         else:
             raise NotImplementedError(
                 f"OpSpec->Triton: pointwise op '{op}' not supported yet"
