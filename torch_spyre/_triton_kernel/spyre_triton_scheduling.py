@@ -14,11 +14,11 @@
 
 """Scheduling for the OpSpec -> Triton source generator path.
 
-``SpyreOpSpecTritonScheduling`` reuses the whole SDSC frontend
+``SpyreTritonScheduling`` reuses the whole SDSC frontend
 (``SuperDSCScheduling``) and only swaps two things:
 
 1. the kernel class instantiated in ``codegen_node`` /
-   ``_codegen_counted_loop`` — ``SpyreOpSpecTritonKernel`` instead of
+   ``_codegen_counted_loop`` — ``SpyreTritonKernel`` instead of
    ``SpyreKernel`` — so the finalized op_specs are projected to Triton source;
 2. ``define_kernel`` — emits ``name = async_compile.triton('name', '''src''',
    device_str='spyre')`` instead of ``async_compile.sdsc('name', <flex>)``.
@@ -49,11 +49,11 @@ from torch_spyre._inductor.scheduler import (
     SuperDSCScheduling,
 )
 
-from .spyre_triton_kernel import KERNEL_NAME_PLACEHOLDER, SpyreOpSpecTritonKernel
+from .spyre_triton_kernel import KERNEL_NAME_PLACEHOLDER, SpyreTritonKernel
 
 
-class SpyreOpSpecTritonScheduling(SuperDSCScheduling):
-    """SDSC scheduling that emits Triton source via SpyreOpSpecTritonKernel."""
+class SpyreTritonScheduling(SuperDSCScheduling):
+    """SDSC scheduling that emits Triton source via SpyreTritonKernel."""
 
     def codegen_node(
         self, node: Union[FusedSchedulerNode, SchedulerNode, CountedLoopSchedulerNode]
@@ -61,7 +61,7 @@ class SpyreOpSpecTritonScheduling(SuperDSCScheduling):
         """Generate a kernel given a list of pre-fused nodes.
 
         Copy of ``SuperDSCScheduling.codegen_node`` with the kernel class swapped
-        to ``SpyreOpSpecTritonKernel``.
+        to ``SpyreTritonKernel``.
         """
         if isinstance(node, CountedLoopSchedulerNode):
             self._codegen_counted_loop(node)
@@ -76,7 +76,7 @@ class SpyreOpSpecTritonScheduling(SuperDSCScheduling):
         if len(nodes) == 0:
             return
 
-        kernel = SpyreOpSpecTritonKernel()
+        kernel = SpyreTritonKernel()
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
             self._codegen_into_kernel(nodes, kernel, all_schedule_nodes)
@@ -87,7 +87,7 @@ class SpyreOpSpecTritonScheduling(SuperDSCScheduling):
         """Generate a kernel for a counted loop group.
 
         Copy of ``SuperDSCScheduling._codegen_counted_loop`` with the kernel
-        class swapped to ``SpyreOpSpecTritonKernel``.
+        class swapped to ``SpyreTritonKernel``.
         """
         assert self.scheduler
         inner_nodes = [
@@ -98,7 +98,7 @@ class SpyreOpSpecTritonScheduling(SuperDSCScheduling):
         if len(inner_nodes) == 0:
             return
 
-        kernel = SpyreOpSpecTritonKernel()
+        kernel = SpyreTritonKernel()
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
             self._codegen_into_kernel(inner_nodes, kernel, all_schedule_nodes)
@@ -109,7 +109,7 @@ class SpyreOpSpecTritonScheduling(SuperDSCScheduling):
 
     def _emit_kernels(
         self,
-        kernel: SpyreOpSpecTritonKernel,
+        kernel: SpyreTritonKernel,
         all_schedule_nodes: list[SchedulerNode],
     ) -> None:
         """Project the finalized op_specs to one or more Triton kernels.

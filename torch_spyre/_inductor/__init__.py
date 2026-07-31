@@ -207,18 +207,18 @@ def _autoload():
 
         import os
 
-        if os.getenv("TORCH_SPYRE_OPSPEC_TRITON") == "1":
+        if os.getenv("TORCH_SPYRE_TRITON") == "1":
             # OpSpec -> Triton *source generator* path (DESIGN-OpSpecToTriton.md).
             # Reuses the SDSC frontend and projects the finished op_specs to
             # Triton source.
             from torch_spyre._triton_kernel import (
-                SpyreOpSpecTritonScheduling,
+                SpyreTritonScheduling,
                 SpyreTritonPythonWrapperCodegen,
             )
 
             register_backend_for_device(
                 DEVICE_NAME,
-                SpyreOpSpecTritonScheduling,
+                SpyreTritonScheduling,
                 SpyreTritonPythonWrapperCodegen,
                 device_custom_config=config,
             )

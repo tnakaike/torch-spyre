@@ -24,13 +24,13 @@ Triton, and the KTIR path (a ``generate_ktir`` function in
 """
 
 from .async_compile import SpyreTritonAsyncCompile
-from .spyre_triton_kernel import SpyreOpSpecTritonKernel
-from .spyre_triton_scheduling import SpyreOpSpecTritonScheduling
+from .spyre_triton_kernel import SpyreTritonKernel
+from .spyre_triton_scheduling import SpyreTritonScheduling
 from .spyre_triton_wrapper import SpyreTritonPythonWrapperCodegen
 
 __all__ = [
-    "SpyreOpSpecTritonKernel",
-    "SpyreOpSpecTritonScheduling",
+    "SpyreTritonKernel",
+    "SpyreTritonScheduling",
     "SpyreTritonAsyncCompile",
     "SpyreTritonPythonWrapperCodegen",
 ]

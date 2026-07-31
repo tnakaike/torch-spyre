@@ -15,7 +15,7 @@
 """Backend-agnostic spec-reading helpers shared by the OpSpec backends.
 
 Both OpSpec backends -- the Triton source generator
-(``SpyreOpSpecTritonKernel``, on the fork) and the planned KTIR emitter
+(``SpyreTritonKernel``, on the fork) and the planned KTIR emitter
 (``generate_ktir``) -- consume the same *finished* ``OpSpec``/``LoopSpec`` list
 and must agree on the "decision / arithmetic" it implies: grouping, per-core
 tile/block shape, reduction-axis selection, loop offsets, call arguments, and
@@ -690,7 +690,7 @@ def _check_reshape_is_order_preserving(
 
     The innermost (within-stick) axis is *excluded* from the comparison: under
     the temporary outer-stick-only reduction (see
-    ``SpyreOpSpecTritonKernel._emit_reduction``) the reduced input tile still
+    ``SpyreTritonKernel._emit_reduction``) the reduced input tile still
     carries the real within-stick coordinate (``Mod(c1, 64)``) while the
     reduction output broadcasts a single value across that axis (coordinate
     ``0``, ``stride -1``).  Those coordinates differ by construction; the axis

@@ -53,8 +53,7 @@ def _opspec_backend_active() -> bool:
     generators can emit.  Otherwise the original SDSC forms are kept.
     """
     return (
-        os.getenv("TORCH_SPYRE_OPSPEC_TRITON") == "1"
-        or os.getenv("TORCH_SPYRE_KTIR") == "1"
+        os.getenv("TORCH_SPYRE_TRITON") == "1" or os.getenv("TORCH_SPYRE_KTIR") == "1"
     )
 
 

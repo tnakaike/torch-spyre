@@ -14,7 +14,7 @@
 
 """OpSpec -> Triton source generator (see DESIGN-OpSpecToTriton.md).
 
-``SpyreOpSpecTritonKernel`` is **not** a ``TritonKernel`` subclass.  It is a
+``SpyreTritonKernel`` is **not** a ``TritonKernel`` subclass.  It is a
 ``SpyreKernel`` (the SDSC frontend) that, after the op_specs are finalized,
 *generates* Triton ``tl.*`` source by walking the finished ``OpSpec`` list.
 
@@ -271,7 +271,7 @@ def _coord_str(coord: sympy.Expr) -> str:
     return texpr(_normalize_floor_div(coord))
 
 
-class SpyreOpSpecTritonKernel(SpyreKernel):
+class SpyreTritonKernel(SpyreKernel):
     """SpyreKernel that emits Triton source instead of the flex OpSpec literal.
 
     All op_spec building (``load``/``store``/``store_reduction``/
@@ -484,9 +484,9 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             )
         if spec.is_reduction:
             if spec.op in _MATMUL_OPS:
-                SpyreOpSpecTritonKernel._validate_matmul(spec)
+                SpyreTritonKernel._validate_matmul(spec)
             else:
-                SpyreOpSpecTritonKernel._validate_reduction(spec)
+                SpyreTritonKernel._validate_reduction(spec)
             return
         if _is_gather_spec(spec):
             # Structural validation; the layout guards (>= 8 rows, no
@@ -611,8 +611,8 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         - degenerate ``K == 1`` -> pointwise-mul lowering (retired to patches);
         - fp8 matmul (``batchmatmulfp8``).
         """
-        _x, _y, _out, k_syms, _n, _m, batch_syms = (
-            SpyreOpSpecTritonKernel._matmul_operands(spec)
+        _x, _y, _out, k_syms, _n, _m, batch_syms = SpyreTritonKernel._matmul_operands(
+            spec
         )
         if len(k_syms) != 1:
             raise NotImplementedError(
