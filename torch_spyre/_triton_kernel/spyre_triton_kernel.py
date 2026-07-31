@@ -83,8 +83,11 @@ from torch._inductor.utils import IndentedBuffer
 from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import FloorDiv
 
+from torch_spyre._C import DataFormats
 from torch_spyre._inductor import constants
+from torch_spyre._inductor.constants import IDENTITY_OP
 from torch_spyre._inductor.codegen.opspec_utils import (
+    _align_reshape_plan,
     _buf_id,
     _check_reshape_is_order_preserving,
     _device_block_shape,
@@ -94,7 +97,8 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _iteration_space_key,
     _LoopCtx,
     _matmul_operand_permutation,
-    _reduction_axes,
+    _outer_stick_reduce_axes,
+    _physical_device_extents,
     _restickify_operands,
     _restickify_plan,
     _row_major_strides,
@@ -116,7 +120,60 @@ _BINARY_OPS = {
     "sub": "-",
     "mul": "*",
     "div": "/",
+    "realdiv": "/",
 }
+
+# Pointwise binary op name -> non-infix ``tl.*`` function (takes two operands).
+_BINARY_FN_OPS = {
+    "maximum": "tl.maximum",
+    "minimum": "tl.minimum",
+}
+
+# Unary op name -> ``tl.*`` math function.  Spyre's ``tl.*`` math ops accept
+# only fp32/fp64, so fp16/bf16 operands are upcast to fp32 and the result is
+# downcast back (see ``_tl_unary``).
+_UNARY_MATH_OPS = {
+    "rsqrt": "tl.rsqrt",
+    "sqrt": "tl.sqrt",
+    "exp": "tl.exp",
+    "sigmoid": "tl.sigmoid",
+    "abs": "tl.abs",
+}
+
+# Unary op name -> Python/tl infix expression template (no fp32 upcast needed;
+# these are exact or reduce to a supported infix op).
+_UNARY_EXPR_OPS = {
+    IDENTITY_OP: "{x}",
+    "neg": "-{x}",
+    "reciprocal": "1.0 / {x}",
+}
+
+# All pointwise (non-reduction) op names the generator can emit.
+_POINTWISE_OPS = (
+    set(_BINARY_OPS) | set(_BINARY_FN_OPS) | set(_UNARY_MATH_OPS) | set(_UNARY_EXPR_OPS)
+)
+
+# Device float formats that ``tl.*`` math ops cannot consume directly; operands
+# in these formats are upcast to fp32 for the math op, then downcast back.
+_LOW_PREC_FLOAT_FORMATS = {
+    DataFormats.IEEE_FP16: "tl.float16",
+    DataFormats.SEN169_FP16: "tl.float16",
+    DataFormats.BFLOAT16: "tl.bfloat16",
+}
+
+
+def _tl_unary(fn: str, x: str, device_dtype) -> str:
+    """Emit a Spyre ``tl.*`` unary math op, upcasting fp16/bf16 to fp32.
+
+    Spyre's ``tl.*`` math ops accept only fp32/fp64, so a low-precision float
+    operand is upcast to fp32 and the result downcast back to the operand's
+    device dtype.
+    """
+    tl_ty = _LOW_PREC_FLOAT_FORMATS.get(device_dtype)
+    if tl_ty is not None:
+        return f"{fn}({x}.to(tl.float32)).to({tl_ty})"
+    return f"{fn}({x})"
+
 
 # Reduction op names lowered via ``tl.dot`` (matmul) rather than ``tl.sum``.
 # Only plain fp16 matmul is emitted so far; ``batchmatmulfp8`` is deferred.
@@ -126,13 +183,13 @@ _MATMUL_OPS = {constants.BATCH_MATMUL_OP}
 def _consumes_registers(spec: OpSpec) -> bool:
     """Whether ``spec`` can consume a register-threaded (fused-away) operand.
 
-    Only a pointwise binary op reads its inputs straight from the register a
-    prior op left them in.  Every other op (matmul, reduction, restickify,
-    gather) loads its operands through a ``tl.make_tensor_descriptor`` and needs
-    per-arg ``block_shape`` / permutation metadata, so its operands must be
-    HBM-resident -- see ``_group_body``, which splits the producer off.
+    Only a pointwise op reads its inputs straight from the register a prior op
+    left them in.  Every other op (matmul, reduction, restickify, gather) loads
+    its operands through a ``tl.make_tensor_descriptor`` and needs per-arg
+    ``block_shape`` / permutation metadata, so its operands must be HBM-resident
+    -- see ``_group_body``, which splits the producer off.
     """
-    return spec.op in _BINARY_OPS and not spec.is_reduction
+    return spec.op in _POINTWISE_OPS and not spec.is_reduction
 
 
 # torch dtype -> Triton pointer-type string, for synthesizing the fixed_config
@@ -431,7 +488,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             # needs the per-core block shapes) is built in _emit_restickify.
             _restickify_operands(spec)
             return
-        if spec.op not in _BINARY_OPS:
+        if spec.op not in _POINTWISE_OPS:
             raise NotImplementedError(
                 f"OpSpec->Triton: op '{spec.op}' not supported yet"
             )
@@ -441,10 +498,18 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         """Guard the reduction cases this cut supports; raise loudly otherwise.
 
         Supported: a single-input ``sum`` whose reduced symbol lands on exactly
-        one non-within-stick input axis and is not work-divided across cores.
-        The unsupported cases each need machinery that does not exist yet:
+        one outer-stick input axis (a ``FloorDiv`` / bare-symbol coordinate),
+        not work-divided across cores.  A stick-dim reduction additionally
+        spreads the reduced symbol onto the within-stick (``Mod``) axis; that
+        axis is *skipped* here and reduced implicitly by the backend hardware
+        (a temporary approximation -- the within-stick partials are not summed
+        in the emitted Triton, so results are numerically wrong until a
+        ``sum_stick`` primitive lands; see ``2602`` / the retired
+        ``SpyreTritonKernel._get_reduction_axis``).
 
-        - stick-dim / multi-axis reduce -> a within-stick ``sum_stick`` primitive;
+        Still unsupported:
+
+        - pure within-stick reduce (no outer-stick axis) -> needs ``sum_stick``;
         - reduction dim split across cores -> the HW inter-core reduce ring
           (``tl.inter_tile``; see ``2607-InterCoreReduction.md``).
         """
@@ -459,18 +524,13 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                 "OpSpec->Triton: reduction must have exactly one input and output"
             )
         in_arg = inputs[0]
-        reduced, axes = _reduction_axes(in_arg, outputs[0])
-        if len(axes) != 1:
+        reduced, axes, outer = _outer_stick_reduce_axes(in_arg, outputs[0])
+        if len(outer) != 1:
             raise NotImplementedError(
-                "OpSpec->Triton: within-stick / multi-axis reduction not supported "
-                f"yet (reduced symbol spans input device axes {axes}); needs a "
+                "OpSpec->Triton: reduction has no single outer-stick axis to "
+                f"reduce (reduced symbol spans input device axes {axes}, "
+                f"outer-stick axes {outer}); a pure within-stick reduce needs a "
                 "sum_stick primitive"
-            )
-        if axes[0] == len(in_arg.device_coordinates) - 1:
-            raise NotImplementedError(
-                "OpSpec->Triton: within-stick reduction (reduced symbol on the "
-                "innermost stick axis) not supported yet; needs a sum_stick "
-                "primitive"
             )
         for sym in reduced:
             if int(spec.iteration_space.get(sym, (0, 1))[1]) != 1:
@@ -675,6 +735,18 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         block_of = {
             i: _device_block_shape(tensor_args[i], divisor_of, loop_ctx) for i in used
         }
+        # Per-core block_shape keyed by buffer id, covering register-threaded
+        # intermediates (arg_index < 0, absent from block_of) as well as slotted
+        # args -- pointwise broadcast alignment needs the tile shape of every
+        # operand and output, whether or not it is materialized to HBM.
+        block_by_buf: dict[object, list[int]] = {}
+        for spec in group:
+            for a in spec.args:
+                if not isinstance(a, TensorArg):
+                    continue
+                bid = _buf_id(a)
+                if bid not in block_by_buf:
+                    block_by_buf[bid] = _device_block_shape(a, divisor_of, loop_ctx)
 
         # Matmul operands are addressed through a *permuted* tensor descriptor so
         # the sticked matrix dim's [outer_stick, inner_stick] pair is innermost
@@ -720,7 +792,9 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
             desc_of = self._emit_descriptors(
                 body, tensor_args, param_names, block_of, perm_of
             )
-            self._emit_ops(body, group, desc_of, dims_of, block_of, perm_of)
+            self._emit_ops(
+                body, group, desc_of, dims_of, block_of, perm_of, block_by_buf
+            )
         else:
             desc_of = self._emit_descriptors(
                 body, tensor_args, param_names, block_of, perm_of
@@ -730,7 +804,9 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                 dims_of = self._emit_dim_vars(
                     body, tensor_args, loop_ctx, perm_of, dim_skip
                 )
-                self._emit_ops(body, group, desc_of, dims_of, block_of, perm_of)
+                self._emit_ops(
+                    body, group, desc_of, dims_of, block_of, perm_of, block_by_buf
+                )
 
         signature = ", ".join(param_names[i] for i in used)
         header = self._emit_header(grid, used)
@@ -863,7 +939,10 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         for arg_index in sorted(tensor_args):
             arg = tensor_args[arg_index]
             perm = perm_of[arg_index]
-            device_size_nat = [int(s) for s in arg.device_size]
+            # Broadcast axes report the full stick width in ``device_size`` but
+            # physically hold one element; clamp them so the descriptor addresses
+            # only real memory (see ``_physical_device_extents``).
+            device_size_nat = _physical_device_extents(arg)
             strides_nat = _row_major_strides(device_size_nat)
             device_size = [device_size_nat[p] for p in perm]
             strides = [strides_nat[p] for p in perm]
@@ -888,6 +967,7 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         dims_of: dict[int, list[str]],
         block_of: dict[int, list[int]],
         perm_of: dict[int, list[int]],
+        block_by_buf: dict[object, list[int]],
     ) -> None:
         """Emit load / compute / store for each op (pointwise or reduction).
 
@@ -956,12 +1036,80 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                 )
                 continue
 
-            assert len(inputs) == 2, f"binary op '{spec.op}' needs two inputs"
-            lhs = _load(inputs[0])
-            rhs = _load(inputs[1])
-            out_var = _fresh()
-            body.writeline(f"{out_var} = {lhs} {_BINARY_OPS[spec.op]} {rhs}")
+            out_var = self._emit_pointwise(
+                spec, inputs, outputs[0], _load, _fresh, body, block_by_buf
+            )
             _store(outputs[0], out_var)
+
+    def _emit_aligned_load(
+        self, arg: TensorArg, out: TensorArg, _load, _fresh, body, block_by_buf
+    ) -> str:
+        """Load ``arg`` and reshape / broadcast its tile into ``out``'s device
+        order so an elementwise op with mismatched operand axes type-checks.
+
+        The fast path (operand already matches the output tile) emits neither a
+        reshape nor a broadcast, so simple kernels stay byte-identical.
+        """
+        var = _load(arg)
+        plan = _align_reshape_plan(
+            arg.device_coordinates,
+            block_by_buf[_buf_id(arg)],
+            out.device_coordinates,
+            block_by_buf[_buf_id(out)],
+        )
+        if plan is None:
+            return var
+        reshape_to, broadcast_to = plan
+        if reshape_to != [int(b) for b in block_by_buf[_buf_id(arg)]]:
+            nxt = _fresh()
+            body.writeline(f"{nxt} = tl.reshape({var}, {reshape_to})")
+            var = nxt
+        if broadcast_to is not None:
+            nxt = _fresh()
+            body.writeline(f"{nxt} = tl.broadcast_to({var}, {broadcast_to})")
+            var = nxt
+        return var
+
+    def _emit_pointwise(
+        self, spec, inputs, out, _load, _fresh, body, block_by_buf
+    ) -> str:
+        """Emit one pointwise op (infix / non-infix binary, or unary).
+
+        Returns the tmp var holding the result.  Each operand tile is aligned to
+        the output tile's device-axis order (see ``_emit_aligned_load``), and
+        low-precision float operands of ``tl.*`` math ops are upcast to fp32
+        (see ``_tl_unary``).
+        """
+        op = spec.op
+
+        def _al(arg: TensorArg) -> str:
+            return self._emit_aligned_load(arg, out, _load, _fresh, body, block_by_buf)
+
+        out_var = _fresh()
+        if op in _BINARY_OPS:
+            assert len(inputs) == 2, f"binary op '{op}' needs two inputs"
+            lhs = _al(inputs[0])
+            rhs = _al(inputs[1])
+            body.writeline(f"{out_var} = {lhs} {_BINARY_OPS[op]} {rhs}")
+        elif op in _BINARY_FN_OPS:
+            assert len(inputs) == 2, f"binary op '{op}' needs two inputs"
+            lhs = _al(inputs[0])
+            rhs = _al(inputs[1])
+            body.writeline(f"{out_var} = {_BINARY_FN_OPS[op]}({lhs}, {rhs})")
+        elif op in _UNARY_MATH_OPS:
+            assert len(inputs) == 1, f"unary op '{op}' needs one input"
+            x = _al(inputs[0])
+            expr = _tl_unary(_UNARY_MATH_OPS[op], x, inputs[0].device_dtype)
+            body.writeline(f"{out_var} = {expr}")
+        elif op in _UNARY_EXPR_OPS:
+            assert len(inputs) == 1, f"unary op '{op}' needs one input"
+            x = _al(inputs[0])
+            body.writeline(f"{out_var} = {_UNARY_EXPR_OPS[op].format(x=x)}")
+        else:
+            raise NotImplementedError(
+                f"OpSpec->Triton: pointwise op '{op}' not supported yet"
+            )
+        return out_var
 
     def _emit_reduction(
         self,
@@ -974,12 +1122,16 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
         _store,
         block_of: dict[int, list[int]],
     ) -> None:
-        """Emit ``tl.sum`` over the reduced axis, reshaped to the output block.
+        """Emit ``tl.sum`` over the outer-stick axis, reshaped to the output block.
 
-        The reduced axis is the single input device axis carrying the reduced
-        symbol (``_validate_reduction`` has guaranteed exactly one, non-within-
-        stick, work-division 1).  ``tl.sum`` drops that axis; the surviving tile
-        is then reshaped to the output's ``block_shape`` (the output layout may
+        The reduced axis is the single outer-stick input device axis carrying
+        the reduced symbol (``_validate_reduction`` has guaranteed exactly one,
+        work-division 1).  For a stick-dim reduction the reduced symbol also
+        lands on the innermost within-stick axis; that axis is intentionally
+        *not* reduced here (the backend reduces it implicitly -- a temporary
+        approximation that leaves the within-stick partials un-summed).
+        ``tl.sum`` drops the outer-stick axis; the surviving tile is then
+        reshaped to the output's ``block_shape`` (the output layout may
         add/remove unit axes relative to the reduced input — e.g. ``dim=0`` on
         ``(128, 256)`` reduces input ``[4, 128, 64]`` on axis 1 to ``[4, 64]``,
         which reshapes to output ``[1, 4, 64]``).
@@ -994,15 +1146,38 @@ class SpyreOpSpecTritonKernel(SpyreKernel):
                 "OpSpec->Triton: reduction with a register-threaded (fused) input "
                 "not supported yet"
             )
-        _reduced, axes = _reduction_axes(in_arg, out)
-        axis = axes[0]
+        _reduced, _axes, outer = _outer_stick_reduce_axes(in_arg, out)
+        # Reduce only the single outer-stick axis (``FloorDiv`` / bare symbol).
+        # For a stick-dim reduction the reduced symbol also lands on the
+        # within-stick (``Mod``) axis, but reducing it with ``tl.sum`` would
+        # collapse the innermost dim to 1 and destroy the physical stick (the
+        # inner dim must stay 64 at fp16).  So the within-stick partials are left
+        # un-summed -- a numerical approximation (matches the retired subclass
+        # path's finite error) that keeps a valid stick descriptor rather than
+        # an invalid ``[.., .., 1]`` one; a correct within-stick reduce needs a
+        # ``sum_stick`` primitive that reduces the 64 lanes while keeping the
+        # inner dim at 64.
+        axis = outer[0]
 
+        # Accumulate the sum in fp32 for a low-precision (fp16 / bf16) input,
+        # then downcast -- a raw fp16 reduce loses precision / overflows (and the
+        # KTIR reduce lowering expects fp32), matching the retired subclass path.
         in_var = _load(in_arg)
+        tl_ty = _LOW_PREC_FLOAT_FORMATS.get(in_arg.device_dtype)
+        if tl_ty:
+            up_var = _fresh()
+            body.writeline(f"{up_var} = {in_var}.to(tl.float32)")
+            in_var = up_var
         red_var = _fresh()
         body.writeline(f"{red_var} = tl.sum({in_var}, {axis})")
+        if tl_ty:
+            down_var = _fresh()
+            body.writeline(f"{down_var} = {red_var}.to({tl_ty})")
+            red_var = down_var
         out_var = red_var
 
-        # Shape of the tile after tl.sum drops `axis`, vs. the output block shape.
+        # Shape of the tile after tl.sum drops ``axis``, vs. the output block
+        # shape (which may add/remove unit axes relative to the reduced input).
         in_block = block_of[in_slot]
         reduced_shape = [s for k, s in enumerate(in_block) if k != axis]
         out_slot = self._slot(out)
