@@ -387,6 +387,29 @@ def _distribute_work(graph: GraphLowering) -> None:
     work_distribution(graph, preassigned_ops)
 
 
+@_runs(enforce_indirect_access_layout)
+def _maybe_enforce_indirect_access_layout(graph: GraphLowering) -> None:
+    """Force the indexed dim outermost in an indirect-access value tensor.
+
+    The indexed-dim-outermost requirement is universal, but the two backend
+    families *materialize* it differently.  The SDSC descriptor gather needs
+    the indexed dim physically outermost, so this pass permutes the value
+    tensor -- rewriting the producer's layout in place or inserting a
+    ``spyre.restickify`` copy.  The OpSpec source-generating backends (Triton
+    generator / KTIR emitter) instead bring the indexed axis to descriptor dim
+    0 *logically*: ``_gather_operands`` locates the indirect axis wherever it
+    sits and ``_prepare_gather`` permutes it to the front of the operand's
+    ``make_tensor_descriptor``.  The physical permute is therefore redundant
+    for those paths (it only adds a full-tensor restickify copy), so it is
+    skipped when an OpSpec backend is active.
+    """
+    from .decompositions import _is_ktir_path
+
+    if _is_ktir_path():
+        return
+    enforce_indirect_access_layout(graph)
+
+
 @_runs(scratchpad_planning)
 def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     if not config.lx_planning:
@@ -436,7 +459,7 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
-            enforce_indirect_access_layout,
+            _maybe_enforce_indirect_access_layout,
             insert_post_mutation_restickify,
             insert_bmm_padding,
             #
