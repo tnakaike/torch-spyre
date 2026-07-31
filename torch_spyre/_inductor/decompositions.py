@@ -42,7 +42,7 @@ from torch_spyre._C import DataFormats, get_device_dtype
 import torch_spyre._inductor.customops  # noqa: F401
 
 
-def _opspec_backend_active() -> bool:
+def _is_ktir_path() -> bool:
     """True when an OpSpec-based backend (Triton source generator or KTIR
     emitter) is selected.
 
@@ -302,7 +302,7 @@ def spyre_rms_norm(
             f"got device={input.device.type}, normalized_shape={normalized_shape}"
         )
 
-    if _opspec_backend_active():
+    if _is_ktir_path():
         # OpSpec backends cannot emit the fused ``mean`` reduction kind, so
         # express the mean as an explicit ``sum`` reduction plus a pointwise
         # divide.
@@ -336,7 +336,7 @@ def spyre_layer_norm(
         weight = input.new_ones(normalized_shape)
     if bias is None:
         bias = input.new_zeros(normalized_shape)
-    if _opspec_backend_active():
+    if _is_ktir_path():
         # OpSpec backends cannot emit the fused SDSC ops
         # (exx2 / layernormscale / layernormnorm), so express layer norm with
         # explicit sum-based reductions plus pointwise ops.
@@ -375,7 +375,7 @@ def spyre_var_mean(input, dim=None, *, correction=None, keepdim=False):
 
 # ``var_mean`` is only intercepted for the OpSpec backends; the SDSC path keeps
 # PyTorch's default handling untouched.
-if _opspec_backend_active():
+if _is_ktir_path():
     spyre_var_mean = register_spyre_decompositions(
         [torch.ops.aten.var_mean.correction]
     )(spyre_var_mean)

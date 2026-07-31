@@ -95,6 +95,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _physical_device_extents,
     _row_major_strides,
     _size_hint,
+    coarse_loop_subs,
 )
 from torch_spyre._inductor.codegen.opspec_utils_gather import (
     _gather_operands,
@@ -108,13 +109,19 @@ from torch_spyre._inductor.codegen.opspec_utils_reduction import (
     _outer_stick_reduce_axes,
 )
 from torch_spyre._inductor.codegen.opspec_utils_restickify import (
+    _is_axis_permute_copy,
     _is_restickify_spec,
     _restickify_operands,
     _restickify_plan,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg
-from torch_spyre._inductor.spyre_kernel import SpyreKernel
+from torch_spyre._inductor.op_spec import (
+    IndirectAccess,
+    LoopSpec,
+    OpSpec,
+    TensorArg,
+)
+from torch_spyre._inductor.spyre_kernel import SpyreKernel, _codegen_op_spec_list
 
 logger = get_inductor_logger("opspec_triton_kernel")
 
@@ -207,8 +214,18 @@ def _consumes_registers(spec: OpSpec) -> bool:
     its operands through a ``tl.make_tensor_descriptor`` and needs per-arg
     ``block_shape`` / permutation metadata, so its operands must be HBM-resident
     -- see ``_group_body``, which splits the producer off.
+
+    A gather is emitted from an ``identity`` op (so ``spec.op`` is pointwise),
+    but it loads its value operand through an indirect descriptor, so it is
+    excluded here too: it must not fuse with the op that produces that value
+    (e.g. the restickify feeding ``gather_idx1d_src2d``'s value buffer), or
+    ``_emit_group`` would mistake the producer for the gather (``group[0]``).
     """
-    return spec.op in _POINTWISE_OPS and not spec.is_reduction
+    return (
+        spec.op in _POINTWISE_OPS
+        and not spec.is_reduction
+        and not _is_gather_spec(spec)
+    )
 
 
 # torch dtype -> Triton pointer-type string, for synthesizing the fixed_config
@@ -319,6 +336,7 @@ class SpyreTritonKernel(SpyreKernel):
         Triton kernel — see the module docstring's "Fuse vs. split".
         """
         super().codegen_kernel()
+        self._dump_op_specs()
         partitions = self._partition_specs()
         self._assign_pool_slots([group for group, _ in partitions])
         plans = [self._emit_group(group, loop_ctx) for group, loop_ctx in partitions]
@@ -331,7 +349,7 @@ class SpyreTritonKernel(SpyreKernel):
     def _assign_pool_slots(self, groups: list[list[OpSpec]]) -> None:
         """Assign a kernel-parameter slot to each cross-group pool buffer.
 
-        A pool buffer (``arg_index < 0``, ``allocation={'pool': ...}``) that is
+        A pool buffer (``arg_index < 0``, ``allocation={'hbm_pool': ...}``) that is
         referenced in more than one fusion group is a fused-away intermediate
         that must actually cross the kernel boundary through HBM (e.g.
         ``sum_sum``'s ``buf0``, produced by group 0's reduction and consumed by
@@ -355,7 +373,7 @@ class SpyreTritonKernel(SpyreKernel):
                     if (
                         isinstance(a, TensorArg)
                         and a.arg_index < 0
-                        and "pool" in a.allocation
+                        and "hbm_pool" in a.allocation
                     ):
                         groups_of.setdefault(str(_buf_id(a)), set()).add(gi)
 
@@ -456,17 +474,14 @@ class SpyreTritonKernel(SpyreKernel):
     def _make_loop_ctx(self, loop: LoopSpec, group: list[OpSpec]) -> "_LoopCtx":
         """Build the loop-emission context for a ``LoopSpec`` body group.
 
-        The tiled symbols are the innermost-level ``tiled_symbols[0]`` of the
-        body ops (they agree within a fusion group); each advances by its
-        per-tile iteration-space range times the loop variable.
+        ``tiled_symbols[0]`` holds *minted* per-(op, level) tile-advance symbols
+        (``_tile_adv_<op>_lvl0``), not the real ``c{i}`` iteration symbols, so
+        ``coarse_loop_subs`` recovers each real symbol and its per-tile stride
+        from the body's full-size operands' ``device_tile_advance_expr`` (see
+        that helper).  Register-threaded intermediates carry no advance expr and
+        are left untouched.
         """
-        it_space = group[0].iteration_space
-        tiled: set = set()
-        for spec in group:
-            if spec.tiled_symbols:
-                tiled.update(spec.tiled_symbols[0])
-        loop_sym = sympy.Symbol(self.LOOP_VAR)
-        subs = {sym: sym + loop_sym * it_space[sym][0] for sym in tiled}
+        tiled, subs = coarse_loop_subs(group, self.LOOP_VAR)
         return _LoopCtx(
             var=self.LOOP_VAR,
             count=int(_size_hint(loop.count)),
@@ -665,7 +680,13 @@ class SpyreTritonKernel(SpyreKernel):
         address).
         """
         index_arg, value_arg, out_arg, k_star, row_axis = _gather_operands(spec)
-        vi, oi = value_arg.arg_index, out_arg.arg_index
+        # Key by kernel-parameter slot, not raw ``arg_index``: the value operand
+        # may be a materialized cross-group pool buffer (``arg_index == -1``, a
+        # synthetic slot) when a relayout copy feeds the gather -- e.g. the
+        # transpose ``enforce_indirect_access_layout`` inserts ahead of a gather
+        # whose source is a graph input (see ``_is_axis_permute_copy``).
+        vi, oi = self._slot(value_arg), self._slot(out_arg)
+        ii = self._slot(index_arg)
 
         vrank = len(value_arg.device_size)
         perm_of[vi] = [k_star] + [d for d in range(vrank) if d != k_star]
@@ -674,7 +695,7 @@ class SpyreTritonKernel(SpyreKernel):
 
         # x_offsets rows == the index buffer's per-core element count (>= 8, C5).
         num_rows = 1
-        for b in block_of[index_arg.arg_index]:
+        for b in block_of[ii]:
             num_rows *= int(b)
         if num_rows < 8:
             raise NotImplementedError(
@@ -798,7 +819,7 @@ class SpyreTritonKernel(SpyreKernel):
         elif is_gather:
             self._prepare_gather(group[0], tensor_args, divisor_of, block_of, perm_of)
             _idx, value_arg, _out, _k, _row = _gather_operands(group[0])
-            dim_skip = {value_arg.arg_index}
+            dim_skip = {self._slot(value_arg)}
 
         # Build the body at column 0; buf.indent() re-indents it under `def`.
         # Program-id bases and descriptors are loop-invariant (they address the
@@ -1041,7 +1062,7 @@ class SpyreTritonKernel(SpyreKernel):
                 )
                 continue
 
-            if _is_restickify_spec(spec):
+            if _is_restickify_spec(spec) or _is_axis_permute_copy(spec):
                 self._emit_restickify(body, spec, _load, _fresh, _store, block_of)
                 continue
 
@@ -1345,7 +1366,10 @@ class SpyreTritonKernel(SpyreKernel):
         output descriptor (``_prepare_gather`` set both permutations).
         """
         index_arg, value_arg, out, _k, _row = _gather_operands(spec)
-        vi = value_arg.arg_index
+        # Slot, not raw ``arg_index``: the value operand may be a materialized
+        # pool buffer (synthetic slot) -- see ``_prepare_gather``.
+        vi = self._slot(value_arg)
+        ii = self._slot(index_arg)
 
         # x_offsets: the index buffer's device tile (loaded via its descriptor).
         x_offsets = _load(index_arg)
@@ -1361,7 +1385,7 @@ class SpyreTritonKernel(SpyreKernel):
 
         # Collapse the multi-D index dims to the output's single row dim.
         perm_block = [block_of[vi][p] for p in perm]
-        idx_block = block_of[index_arg.arg_index]
+        idx_block = block_of[ii]
         num_rows = 1
         for b in idx_block:
             num_rows *= int(b)
@@ -1451,6 +1475,40 @@ class SpyreTritonKernel(SpyreKernel):
             return None
 
     # -- helpers ------------------------------------------------------------
+
+    def _dump_op_specs(self) -> None:
+        """Dump the finalized op_specs to the Inductor debug trace dir.
+
+        Writes ``op_specs_triton.txt`` alongside Inductor's own
+        ``ir_post_fusion.txt`` in the ``torch_compile_debug`` trace directory
+        (only when ``TORCH_COMPILE_DEBUG=1`` populated ``V.debug``'s path), so
+        the exact ``OpSpec``/``LoopSpec`` list this backend consumes -- device
+        coordinates, tile-advance exprs, tiled symbols, allocations -- is
+        inspectable per compiled graph.  Uses the same pretty constructor-call
+        serializer (``_codegen_op_spec_list``) the SDSC path writes into
+        ``output_code.py``, so both backends' op-spec dumps read identically.
+        Best-effort: never fail a compile.
+        """
+
+        def sympy_str(x) -> str:
+            if isinstance(x, IndirectAccess):
+                return f"IndirectAccess('{x.args[0]}')"
+            return "sympify('" + str(x) + "')"
+
+        try:
+            path = getattr(V.debug, "_path", None)
+            if not path:
+                return
+            buf = IndentedBuffer()
+            buf.writeline("[")
+            with buf.indent():
+                _codegen_op_spec_list(self.op_specs, buf, sympy_str)
+            buf.writeline("]")
+            with V.debug.fopen("op_specs_triton.txt") as fh:
+                fh.write(buf.getvalue())
+                fh.write("\n")
+        except (OSError, AssertionError) as exc:  # pragma: no cover
+            logger.debug("OpSpec->Triton: op_specs dump failed (%s)", exc)
 
     def _dump_source(self, src: str) -> None:
         """Write the emitted source to ./opspec-triton-dump/ for inspection."""

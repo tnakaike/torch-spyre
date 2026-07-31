@@ -43,6 +43,46 @@ def _is_restickify_spec(spec: OpSpec) -> bool:
     return getattr(spec, "op", None) == RESTICKIFY_OP
 
 
+def _is_axis_permute_copy(spec: OpSpec) -> bool:
+    """True if ``spec`` is a single-input copy whose device axes are a pure
+    *permutation* of the input's (same within-stick axis, same atom set, a
+    different order) -- e.g. the outer-axis transpose
+    ``enforce_indirect_access_layout`` inserts to put a gather's indexed dim
+    outermost in the value tensor's device layout.
+
+    ``SpyreKernel.store`` labels such a copy ``IDENTITY_OP`` (its within-stick
+    axis symbol is unchanged, so ``_is_restickify_spec`` does not match it), yet
+    it physically moves data across device axes and must be emitted as a
+    reshape/permute (``_restickify_plan``), not a plain strided pointwise copy.
+    A true no-op copy (identical device-axis order), a broadcast, and a
+    reduction all return False and stay on the pointwise path.
+    """
+    if getattr(spec, "is_reduction", False):
+        return False
+    inputs = [a for a in spec.args if a.is_input]
+    outputs = [a for a in spec.args if not a.is_input]
+    if len(inputs) != 1 or len(outputs) != 1:
+        return False
+    in_coords = list(inputs[0].device_coordinates)
+    out_coords = list(outputs[0].device_coordinates)
+    if len(in_coords) != len(out_coords):
+        return False
+    try:
+        in_roles = [_restickify_axis_role(c) for c in in_coords]
+        out_roles = [_restickify_axis_role(c) for c in out_coords]
+    except NotImplementedError:
+        # A broadcast / multi-symbol axis is not a bijective permute copy.
+        return False
+    # A changed within-stick (last) axis is a genuine cross-stick move that is
+    # already ``RESTICKIFY_OP`` (handled by ``_is_restickify_spec``); here we
+    # only claim the same-stick outer-axis permutation.
+    if in_roles[-1] != out_roles[-1]:
+        return False
+    return in_roles != out_roles and sorted(map(str, in_roles)) == sorted(
+        map(str, out_roles)
+    )
+
+
 def _restickify_stick_symbol(arg: TensorArg) -> sympy.Symbol:
     """The single iteration symbol on ``arg``'s within-stick (last) device axis."""
     syms = arg.device_coordinates[-1].free_symbols
