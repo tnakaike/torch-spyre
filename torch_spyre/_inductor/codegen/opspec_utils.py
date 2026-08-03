@@ -30,6 +30,8 @@ This module holds the **pointwise core** -- the helpers every OpSpec backend
 needs regardless of op family.  The op-specific arithmetic lives in sibling
 modules that import from here as needed:
 
+- ``opspec_utils_loop.py`` -- counted-loop (``LoopSpec``) emission context and
+  tiled-symbol recovery.
 - ``opspec_utils_reduction.py`` -- reduction-axis selection, outer-stick reduce,
   reshape order-preservation.
 - ``opspec_utils_matmul.py`` -- matmul / bmm operand permutation.
@@ -48,35 +50,16 @@ backends.
 
 from __future__ import annotations
 
-import dataclasses
+from typing import TYPE_CHECKING
 
 import sympy
 from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import ModularIndexing
 
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
-from torch_spyre._inductor.pass_utils import coeff_through_floor
 
-
-@dataclasses.dataclass
-class _LoopCtx:
-    """Loop-emission context for a ``LoopSpec`` body group.
-
-    ``var`` is the loop-variable name; ``count`` the trip count; ``tiled`` the
-    set of *real* iteration-space symbols advanced by this loop; ``subs`` maps
-    each such symbol ``s`` to ``s + var * per_tile_range`` for offsetting
-    full-size operands' coordinates.
-
-    The body ops' ``tiled_symbols[0]`` hold *minted* per-(op, level) symbols
-    (``_tile_adv_<op>_lvl<n>``), not the real ``c{i}`` iteration symbols, so
-    the real symbol and its per-tile stride are recovered from each full-size
-    operand's ``device_tile_advance_expr`` -- see ``coarse_loop_subs``.
-    """
-
-    var: str
-    count: int
-    tiled: set
-    subs: dict
+if TYPE_CHECKING:
+    from torch_spyre._inductor.codegen.opspec_utils_loop import _LoopCtx
 
 
 def _size_hint(expr) -> int:
@@ -93,76 +76,6 @@ def _row_major_strides(device_size: list[int]) -> list[int]:
     for i in range(n - 2, -1, -1):
         strides[i] = strides[i + 1] * int(device_size[i + 1])
     return strides
-
-
-def _tile_axis_offset(
-    coords: list[sympy.Expr], strides: list[int], coeff: int
-) -> tuple[sympy.Symbol, int]:
-    """Recover the (real symbol, per-tile offset) a device-element advance encodes.
-
-    ``coeff`` is one loop level's per-iteration advance in device *elements*
-    (row-major over ``device_size``, as ``device_tile_advance_expr`` stores it).
-    Decompose it against the row-major ``strides`` into mixed-radix per-axis
-    offsets: exactly one device axis must carry it (a single logical dim is
-    tiled), and that axis's coordinate must be a bare iteration symbol ``s`` so
-    the offset can be applied as ``s -> s + loop * offset``.  A leftover, a
-    multi-axis split, or a non-bare (sticked / folded) axis is a tiling pattern
-    this cut does not support yet.
-    """
-    remaining = int(coeff)
-    hits: list[tuple[int, int]] = []
-    for axis, stride in enumerate(strides):
-        off, remaining = divmod(remaining, int(stride))
-        if off:
-            hits.append((axis, off))
-    if remaining != 0 or len(hits) != 1:
-        raise NotImplementedError(
-            "OpSpec->Triton: coarse-tile advance spans more than one device "
-            f"axis (coeff={coeff}, strides={strides}); not supported yet"
-        )
-    axis, offset = hits[0]
-    coord = coords[axis]
-    if not isinstance(coord, sympy.Symbol):
-        raise NotImplementedError(
-            "OpSpec->Triton: coarse-tile advance lands on a non-bare device "
-            f"axis (coord={coord}); tiling a sticked/folded dim is not "
-            "supported yet"
-        )
-    return coord, offset
-
-
-def coarse_loop_subs(group: list[OpSpec], loop_var: str) -> tuple[set, dict]:
-    """Build the ``(tiled, subs)`` for a coarse-tiled ``LoopSpec`` body group.
-
-    Each body op's ``tiled_symbols[0]`` names the *minted* per-(op, level)
-    symbols the innermost loop advances; the real iteration symbol and its
-    per-tile stride live in each full-size operand's
-    ``device_tile_advance_expr`` (``coeff_through_floor`` extracts one level's
-    device-element advance, ``_tile_axis_offset`` maps it back to a real
-    symbol).  Register-threaded intermediates carry no advance expr and are
-    left untouched.  Returns the set of real tiled symbols and a substitution
-    mapping each to ``s + loop_var * per_tile_range``.
-    """
-    loop_sym = sympy.Symbol(loop_var)
-    tiled: set = set()
-    subs: dict = {}
-    for spec in group:
-        if not spec.tiled_symbols:
-            continue
-        for arg in spec.args:
-            if arg.device_tile_advance_expr is None:
-                continue
-            strides = _row_major_strides(list(arg.device_size))
-            for minted in spec.tiled_symbols[0]:
-                coeff = int(coeff_through_floor(arg.device_tile_advance_expr, minted))
-                if coeff == 0:
-                    continue
-                real_sym, per_tile = _tile_axis_offset(
-                    list(arg.device_coordinates), strides, coeff
-                )
-                tiled.add(real_sym)
-                subs[real_sym] = real_sym + loop_sym * per_tile
-    return tiled, subs
 
 
 def _is_broadcast_axis(coord: sympy.Expr) -> bool:

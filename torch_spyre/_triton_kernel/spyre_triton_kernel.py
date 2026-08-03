@@ -91,10 +91,12 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _buf_id,
     _device_block_shape,
     _iteration_space_key,
-    _LoopCtx,
     _physical_device_extents,
     _row_major_strides,
     _size_hint,
+)
+from torch_spyre._inductor.codegen.opspec_utils_loop import (
+    _LoopCtx,
     coarse_loop_subs,
 )
 from torch_spyre._inductor.codegen.opspec_utils_gather import (
