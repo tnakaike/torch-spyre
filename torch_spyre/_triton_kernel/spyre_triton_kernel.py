@@ -89,31 +89,21 @@ from torch_spyre._inductor.constants import IDENTITY_OP
 from torch_spyre._inductor.codegen.opspec_utils import (
     _align_reshape_plan,
     _buf_id,
-    _device_block_shape,
-    _iteration_space_key,
-    _row_major_strides,
-    _size_hint,
-)
-from torch_spyre._inductor.codegen.opspec_utils_loop import (
-    _LoopCtx,
-    coarse_loop_subs,
-)
-from torch_spyre._inductor.codegen.opspec_utils_gather import (
-    _gather_operands,
-    _is_gather_spec,
-)
-from torch_spyre._inductor.codegen.opspec_utils_matmul import (
-    _matmul_operand_permutation,
-)
-from torch_spyre._inductor.codegen.opspec_utils_reduction import (
     _check_reshape_is_order_preserving,
-    _outer_stick_reduce_axes,
-)
-from torch_spyre._inductor.codegen.opspec_utils_restickify import (
+    _device_block_shape,
+    _gather_operands,
     _is_axis_permute_copy,
+    _is_gather_spec,
     _is_restickify_spec,
+    _iteration_space_key,
+    _LoopCtx,
+    _matmul_operand_permutation,
+    _outer_stick_reduce_axes,
     _restickify_operands,
     _restickify_plan,
+    _row_major_strides,
+    _size_hint,
+    coarse_loop_subs,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
