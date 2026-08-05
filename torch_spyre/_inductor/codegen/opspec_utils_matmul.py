@@ -17,12 +17,12 @@
 Op-specific counterpart to ``opspec_utils.py`` (the pointwise core): the pure
 "decision / arithmetic" a *matmul* / *bmm* OpSpec implies -- specifically the
 device-axis permutation that places a sticked matrix dim's stick pair innermost
-so the two backends can collapse it back into a matrix for ``tl.dot`` (Triton)
-or the KTIR matmul primitive.
+so a backend can collapse it back into a matrix for its dot / matmul primitive
+(the KTIR matmul op, etc.).
 
-Like ``opspec_utils.py`` this module must stay **Triton-free** (no ``tl.*``,
-no MLIR builder, no live Inductor kernel state) so both OpSpec backends -- the
-Triton source generator and the planned KTIR emitter -- can import it.
+Like ``opspec_utils.py`` this module must stay free of any backend emission
+toolchain (no MLIR builder, no live Inductor kernel state) so any OpSpec
+backend can import it.
 """
 
 from __future__ import annotations
@@ -37,15 +37,15 @@ def _matmul_operand_permutation(
 
     A Spyre matmul operand's non-leading matrix dim (K for A, N for B) is
     stored as a stick split: an outer-stick dim (``FloorDiv(sym, stick)``) and
-    the inner-stick dim (``Mod(sym, stick)``), the latter always the last
+    the within-stick dim (``Mod(sym, stick)``), the latter always the last
     device dim.  ``_emit_matmul`` collapses the two innermost dims back into
-    that matrix dim, so the outer-stick and inner-stick dims must be adjacent
+    that matrix dim, so the outer-stick and within-stick dims must be adjacent
     and innermost, with the remaining dims (the leading matrix dim(s) --
     batch/M for A, batch/K for B) kept ahead of them.  When a batch dim is
     present (bmm) it must lead so the block reshapes to a batched matrix
-    ``[B, M, K]`` / ``[B, K, N]`` for a batched ``tl.dot``.
+    ``[B, M, K]`` / ``[B, K, N]`` for a batched matmul.
 
-    Anchoring on the stick pair -- the two dims that share the inner-stick
+    Anchoring on the stick pair -- the two dims that share the within-stick
     dim's iteration symbol -- keeps this correct even when the row dim M is
     size 1 and its coordinate degenerates to a constant ``0`` (the decode-phase
     / GEMV case).  For a non-degenerate operand it yields the natural order, so
@@ -54,24 +54,24 @@ def _matmul_operand_permutation(
     rank = len(device_coords)
     if rank < 3:
         return list(range(rank))  # already a (batched) matrix; nothing to move
-    inner_stick = rank - 1  # inner-stick dim is always the last device dim
-    inner_stick_syms = device_coords[inner_stick].free_symbols
+    within_stick = rank - 1  # within-stick dim is always the last device dim
+    within_stick_syms = device_coords[within_stick].free_symbols
     outer_stick = None
-    if inner_stick_syms:
+    if within_stick_syms:
         outer_stick = next(
             (
                 k
                 for k in range(rank - 1)
-                if device_coords[k].free_symbols & inner_stick_syms
+                if device_coords[k].free_symbols & within_stick_syms
             ),
             None,
         )
     if outer_stick is None:
         return list(range(rank))  # not stick-split; leave as-is
-    leading = [k for k in range(rank) if k not in (outer_stick, inner_stick)]
+    leading = [k for k in range(rank) if k not in (outer_stick, within_stick)]
     # A batched-matmul operand must lead with its batch dim.
     if batch_sym is not None:
         b = next((k for k in leading if device_coords[k] == batch_sym), None)
         if b is not None:
             leading = [b] + [k for k in leading if k != b]
-    return leading + [outer_stick, inner_stick]
+    return leading + [outer_stick, within_stick]

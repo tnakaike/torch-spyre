@@ -12,40 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Backend-agnostic *pointwise-core* spec-reading helpers shared by the OpSpec
-backends.
+"""OpSpec-reading helpers
 
-Both OpSpec backends -- the Triton source generator
-(``SpyreTritonKernel``, on the fork) and the planned KTIR emitter
-(``generate_ktir``) -- consume the same *finished* ``OpSpec``/``LoopSpec`` list
+The KTIR emitter consume the *finished* ``OpSpec``/``LoopSpec`` list
 and must agree on the "decision / arithmetic" it implies: grouping, per-core
 tile/block shape, loop offsets, call arguments, and reshape / broadcast
 alignment.  Those computations are **pure** (sympy / int over the ``op_specs``)
--- no ``tl.*``, no MLIR builder, no live Inductor kernel state -- so they live
-here as plain functions rather than as base-class methods (the two backends
-deliberately share *functions*, not a base class; see
-``OPSPEC_BACKEND_FUNCTIONS.md`` -- there is no ``SpyreOpSpecKernel``).
-
-This module holds the **pointwise core** -- the helpers every OpSpec backend
-needs regardless of op family.  The op-specific arithmetic lives in sibling
-modules that import from here as needed:
-
-- ``opspec_utils_loop.py`` -- counted-loop (``LoopSpec``) emission context and
-  tiled-symbol recovery.
-- ``opspec_utils_reduction.py`` -- reduction-axis selection, outer-stick reduce,
-  reshape order-preservation.
-- ``opspec_utils_matmul.py`` -- matmul / bmm operand permutation.
-- ``opspec_utils_gather.py`` -- gather (``aten.index``) operand identification.
-- ``opspec_utils_restickify.py`` -- cross-stick restickify reshape/permute plan.
-
-Keeping the pointwise core separate lets it be extracted for a first upstream
-PR without dragging the op-specific modules along.
-
-**This module (and every sibling) must stay Triton-free** (guard:
-``grep -n "triton" opspec_utils*.py`` is empty) so the KTIR path can import it
-without pulling Triton in.  Emission primitives (``texpr``/``tl.*`` on the
-Triton side, ``ktdp.*``/``linalg.*`` on the KTIR side) stay in the respective
-backends.
+-- no backend emission primitives, no MLIR builder, no live Inductor kernel
+state -- so they live here as plain functions rather than as base-class methods.
 """
 
 from __future__ import annotations
@@ -78,69 +52,27 @@ def _row_major_strides(device_size: list[int]) -> list[int]:
     return strides
 
 
-def _is_broadcast_axis(coord: sympy.Expr) -> bool:
-    """True if a device axis is a broadcast (fixed at element 0).
-
-    A broadcast operand (e.g. a scalar ``spyre_constant_tensor`` reciprocal, or
-    a per-row reduction result replicated over the outer-stick dim) is read at
-    element ``0`` along the broadcast axis and replicated by the consuming op.
-    Its coordinate is the pure constant ``0``.
-
-    Such an axis has physical extent ``1`` even though ``device_size`` may report
-    the full stick width: the inner-stick ``device_size`` is force-set to
-    ``elems_per_stick`` (see ``ir.py`` layout rules) regardless of broadcasting,
-    so a descriptor built straight from ``device_size`` would address 64 elements
-    of a 1-element buffer and read past its end.
-    """
-    e = sympy.sympify(coord)
-    return not e.free_symbols and e == 0
-
-
-def _physical_device_extents(arg: TensorArg) -> list[int]:
-    """``device_size`` with broadcast axes clamped to their true extent (1).
-
-    Use this -- not ``arg.device_size`` -- to build a tensor descriptor's
-    ``shape`` / ``strides`` and per-core ``block_shape`` so a broadcast operand
-    addresses only its real elements.  Non-broadcast axes are unchanged, so
-    ordinary operands are unaffected (fast path stays byte-identical).
-
-    Clamping applies only to a *genuine scalar / all-broadcast* operand (e.g. a
-    ``spyre_constant_tensor`` reciprocal), which is physically a single element
-    -- so a descriptor built straight from ``device_size`` (whose inner-stick
-    dim is force-set to the stick width) would address 64 elements of a
-    1-element buffer and read past its end.
-
-    A buffer that has a *real data axis* (a coordinate referencing an iteration
-    symbol) is allocated at its full ``device_size`` by
-    ``ktir_empty_with_layout``, so its broadcast axes ARE physically backed;
-    clamping them would instead under-address a real stick.  A per-row reduction
-    result is the canonical case: its within-stick coordinate is the broadcast
-    constant ``0`` (one value per row, replicated over the stick), yet the buffer
-    is a full 64-wide stick.  Its descriptor must keep extent 64 -- matching the
-    retired subclass path -- so an outer-stick-only reduce (``[128, 64]``)
-    reshapes cleanly to ``[1, 128, 64]`` rather than to an impossible
-    ``[1, 128, 1]``.
-    """
-    coords = arg.device_coordinates
-    if any(sympy.sympify(c).free_symbols for c in coords):
-        # A real data axis is present -> the buffer is physically full-size, so
-        # every axis is backed; leave all extents unclamped.
-        return [int(s) for s in arg.device_size]
-    return [
-        1 if _is_broadcast_axis(c) else int(s) for s, c in zip(arg.device_size, coords)
-    ]
-
-
-def _buf_id(arg: TensorArg) -> object:
+def _buf_id(arg: TensorArg) -> str:
     """Stable identity of the buffer an op arg refers to, for register threading.
 
-    A fused-away intermediate carries ``arg_index == -1`` (the unassigned
-    sentinel), so distinct intermediates collide on ``arg_index``.  The op-spec
-    ``name`` is the buffer name, unique per buffer and identical whether the
-    buffer appears as an input or an output, so it is the reliable key; fall back
-    to ``arg_index`` only when a name is absent.
+    Keys on the op-spec ``name`` (the buffer name): unique per buffer and
+    identical whether the buffer appears as an input or an output, so a
+    fused-away intermediate threads its register value without aliasing.
+    ``arg_index`` cannot serve as the identity -- distinct fused-away
+    intermediates all carry the unassigned sentinel ``-1``.
+
+    ``name`` must therefore be populated on every projected op arg (see
+    ``create_tensor_arg``).  A ``None`` name means an unnamed arg reached
+    projection, which would silently alias on ``-1``; raise loudly instead of
+    falling back.
     """
-    return arg.name if arg.name is not None else ("idx", arg.arg_index)
+    if arg.name is None:
+        raise ValueError(
+            "_buf_id: TensorArg.name is None -- every projected op arg must "
+            "carry a buffer name for register-threading identity (arg_index is "
+            "-1 for fused intermediates and cannot disambiguate them)"
+        )
+    return arg.name
 
 
 def _iteration_space_key(spec: OpSpec) -> tuple:
@@ -161,9 +93,8 @@ def _iteration_space_key(spec: OpSpec) -> tuple:
 # Device-dim coordinate kinds, used to align pointwise operands whose device
 # axes are ordered differently from the op's output tile (broadcast alignment).
 _DIM_CONST = "const"  # no iteration-space symbol (an inserted / broadcast dim)
-_DIM_MULTI = "multi"  # more than one symbol (not a simple device axis)
-_DIM_BARE = "bare"  # coord == sym            (an un-sticked dim)
-_DIM_INNER_STICK = "inner_stick"  # coord == sym % stick  (within-stick lanes)
+_DIM_BARE = "bare"  # coord == sym (a non-stick dim)
+_DIM_WITHIN_STICK = "within_stick"  # coord == sym % stick  (within-stick lanes)
 _DIM_OUTER_STICK = "outer_stick"  # coord == sym // stick (outer-stick chunks)
 
 
@@ -174,17 +105,30 @@ def _dim_info(coord: sympy.Expr) -> tuple[str, sympy.Symbol | None]:
     -- e.g. a weight's ``sym // stick`` outer-stick axis matches an output's
     ``sym // stick`` axis even when they sit at different positions.  A ``const``
     dim (extent 1, no symbol) carries no data and is dropped / broadcast.
+
+    A coordinate carrying more than one iteration symbol (a single physical axis
+    that folds two logical dims, e.g. ``a*8 + b``) is not a simple device axis.
+    No legal reshape produces one today -- a plain reshape is a pure view whose
+    strides stay stick-aligned (single symbol per axis), and a within-stick fold
+    is rejected earlier at layout selection (the within-stick dim must be a full
+    64-element stick).  Raise loudly rather than carrying a dead classification:
+    if this fires, a new frontend construct reached alignment and both this
+    helper and ``_align_reshape_plan`` need real multi-symbol support.
     """
     syms = coord.free_symbols
     if not syms:
         return (_DIM_CONST, None)
     if len(syms) > 1:
-        return (_DIM_MULTI, None)
+        raise NotImplementedError(
+            f"OpSpec alignment: device coordinate {coord!r} folds multiple "
+            f"iteration symbols {syms} into one physical axis; no supported "
+            "reshape produces this, so multi-symbol alignment is not implemented"
+        )
     sym = next(iter(syms))
     if isinstance(coord, sympy.Symbol):
         return (_DIM_BARE, sym)
     if isinstance(coord, (sympy.Mod, ModularIndexing)):
-        return (_DIM_INNER_STICK, sym)
+        return (_DIM_WITHIN_STICK, sym)
     return (_DIM_OUTER_STICK, sym)
 
 
@@ -200,15 +144,15 @@ def _align_reshape_plan(
     A pointwise op's operands may carry their device axes in a different order
     (and rank) from the output tile: a per-row reduction result broadcasts over
     the outer-stick dim, a channel weight broadcasts over the row dim, etc.
-    ``tl.*`` elementwise only auto-broadcasts *leading* unit dims, so a
+    Elementwise broadcast typically only auto-aligns *leading* unit dims, so a
     misaligned operand (outer-stick where the output has rows) must be reshaped
     to the output order first.
 
     Each output device axis is matched to an input axis by ``(kind, sym)`` (see
-    ``_dim_info``); the inner-stick axis maps last -> last.  Unmatched output
+    ``_dim_info``); the within-stick axis maps last -> last.  Unmatched output
     axes get extent 1 (to be broadcast).  Returns ``(reshape_to, broadcast_to)``
-    -- ``tl.reshape`` the operand to ``reshape_to`` (skip if it already equals
-    ``in_block``) then ``tl.broadcast_to`` ``broadcast_to`` (``None`` to skip).
+    -- reshape the operand to ``reshape_to`` (skip if it already equals
+    ``in_block``) then broadcast to ``broadcast_to`` (``None`` to skip).
     Returns ``None`` when the operand already matches the output (fast path:
     no reshape / broadcast emitted, keeping simple kernels byte-identical).
 
@@ -227,13 +171,13 @@ def _align_reshape_plan(
 
     reshape_to = [1] * out_rank
     used: set[int] = set()
-    # Inner-stick lanes: the last input axis always maps to the last output axis.
+    # Within-stick lanes: the last input axis always maps to the last output axis.
     reshape_to[out_rank - 1] = in_block[in_rank - 1]
     used.add(in_rank - 1)
     matched_seq: list[int] = []  # input axes matched to output axes, in out order
     for o in range(out_rank - 1):
         okind, osym = _dim_info(out_coords[o])
-        if okind in (_DIM_CONST, _DIM_MULTI):
+        if okind == _DIM_CONST:
             continue
         for a in range(in_rank - 1):
             if a in used:
@@ -249,7 +193,7 @@ def _align_reshape_plan(
     # transpose (restickify) to align -- not supported on this path.
     if any(matched_seq[i] >= matched_seq[i + 1] for i in range(len(matched_seq) - 1)):
         raise NotImplementedError(
-            "OpSpec->Triton: pointwise operand needs a transpose (restickify) "
+            "OpSpec alignment: pointwise operand needs a transpose (restickify) "
             "to align device axes; not supported yet"
         )
     prod_in = 1
@@ -262,7 +206,7 @@ def _align_reshape_plan(
         # An input axis with extent > 1 was dropped -> real data would be lost;
         # aligning it needs a cross-stick transpose (restickify).
         raise NotImplementedError(
-            "OpSpec->Triton: pointwise operand needs a cross-stick transpose "
+            "OpSpec alignment: pointwise operand needs a cross-stick transpose "
             "(restickify) to align device axes; not supported yet"
         )
     broadcast_to = out_block if reshape_to != out_block else None
@@ -276,11 +220,14 @@ def _device_block_shape(
 ) -> list[int]:
     """Per-core ``block_shape`` for the access tile.
 
-    Divides each non-stick device dim by the product of core divisors
-    (``divisor_of``, this group's iteration-space work divisions) of the
-    OpSpec symbols appearing in that dim's coordinate.  The last device dim
-    is the inner-stick dim: always the full ``device_size[-1]`` (64 fp16 /
-    32 fp32 / 128 int8), never divided across cores.
+    Divides each non-stick device dim by the core divisor (``divisor_of``,
+    this group's iteration-space work divisions) of the single OpSpec symbol
+    on that dim's coordinate.  Each non-stick device dim carries exactly one
+    iteration symbol -- a bare ``c_i`` or an outer-stick ``c_i // stick`` --
+    so exactly one divisor applies per dim; a constant (broadcast) axis
+    carries none and is left at full size.  The last device dim is the
+    within-stick dim: always the full ``device_size[-1]`` (64 fp16 / 32 fp32 /
+    128 int8), never divided across cores.
 
     In a counted loop, a full-size operand's ``device_size`` on the tiled dim
     spans the whole tensor (``count`` tiles), but each iteration loads only
@@ -292,7 +239,7 @@ def _device_block_shape(
     (post-WSR ``tiled_symbols`` name minted symbols, so ``per_tile_fixed`` alone
     no longer distinguishes a full-size operand from a per-tile pool).
     """
-    device_size = _physical_device_extents(arg)
+    device_size = [int(s) for s in arg.device_size]
     coords = arg.device_coordinates
     last = len(device_size) - 1
     tile_this_arg = loop_ctx is not None and arg.device_tile_advance_expr is not None
@@ -309,31 +256,13 @@ def _device_block_shape(
             and (coord.free_symbols & loop_ctx.tiled)
         ):
             size //= loop_ctx.count
-        divisor = 1
-        for sym in coord.free_symbols:
-            divisor *= divisor_of.get(sym, 1)
+        syms = coord.free_symbols
+        if len(syms) > 1:
+            raise NotImplementedError(
+                f"OpSpec: device dim {k} coordinate {coord!r} folds multiple "
+                f"iteration symbols {syms}; work-division of a multi-symbol "
+                "axis is not supported"
+            )
+        divisor = divisor_of.get(next(iter(syms)), 1) if syms else 1
         block.append(max(1, size // max(1, divisor)))
     return block
-
-
-def _group_call_args(
-    tensor_args: dict[int, TensorArg],
-    used: list[int],
-    actuals: list[str],
-) -> list[str]:
-    """Caller-side buffer names for this group's ``.run`` call.
-
-    Mirrors ``SpyreKernel.call_kernel``: a leading ``_pool`` when the group
-    touches pool memory, then the used arg buffers in arg_index order,
-    deduplicated (an in-place op lists the same buffer as input and output).
-    """
-    call_args: list[str] = []
-    if any("hbm_pool" in a.allocation for a in tensor_args.values()):
-        call_args.append("_pool")
-    seen: set[str] = set()
-    for i in used:
-        name = actuals[i]
-        if name not in seen:
-            seen.add(name)
-            call_args.append(name)
-    return call_args

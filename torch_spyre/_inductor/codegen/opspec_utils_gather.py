@@ -19,9 +19,9 @@ Op-specific counterpart to ``opspec_utils.py`` (the pointwise core): the pure
 recognizing an indirect device coordinate and identifying the index / value /
 output operands and the gathered / row axes.
 
-Like ``opspec_utils.py`` this module must stay **Triton-free** (no ``tl.*``,
-no MLIR builder, no live Inductor kernel state) so both OpSpec backends -- the
-Triton source generator and the planned KTIR emitter -- can import it.
+Like ``opspec_utils.py`` this module must stay free of any backend emission
+toolchain (no MLIR builder, no live Inductor kernel state) so any OpSpec
+backend can import it.
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ def _gather_operands(
     outputs = [a for a in spec.args if not a.is_input]
     if len(inputs) != 2 or len(outputs) != 1:
         raise NotImplementedError(
-            "OpSpec->Triton: gather must have exactly two inputs (index + value) "
+            "OpSpec: gather must have exactly two inputs (index + value) "
             f"and one output (got {len(inputs)} inputs, {len(outputs)} outputs)"
         )
     out = outputs[0]
@@ -86,12 +86,12 @@ def _gather_operands(
             continue
         if value_arg is not None or len(indirect_dims) != 1:
             raise NotImplementedError(
-                "OpSpec->Triton: gather supports exactly one indirect axis on one "
+                "OpSpec: gather supports exactly one indirect axis on one "
                 "input (found more than one)"
             )
         value_arg, k_star = a, indirect_dims[0]
     if value_arg is None:
-        raise NotImplementedError("OpSpec->Triton: gather has no indirect input")
+        raise NotImplementedError("OpSpec: gather has no indirect input")
     index_arg = next(a for a in inputs if a is not value_arg)
 
     # The gathered output-row axis is the index buffer's single iteration symbol.
@@ -100,7 +100,7 @@ def _gather_operands(
         row_syms |= c.free_symbols
     if len(row_syms) != 1:
         raise NotImplementedError(
-            "OpSpec->Triton: gather index buffer must have exactly one iteration "
+            "OpSpec: gather index buffer must have exactly one iteration "
             f"symbol (got {sorted(map(str, row_syms))})"
         )
     row_sym = next(iter(row_syms))
@@ -109,7 +109,7 @@ def _gather_operands(
     ]
     if len(row_dims) != 1:
         raise NotImplementedError(
-            "OpSpec->Triton: gather output must carry the row symbol "
+            "OpSpec: gather output must carry the row symbol "
             f"{row_sym} on exactly one device dim (got dims {row_dims})"
         )
     return index_arg, value_arg, out, k_star, row_dims[0]

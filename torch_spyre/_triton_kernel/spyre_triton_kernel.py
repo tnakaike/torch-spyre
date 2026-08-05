@@ -91,7 +91,6 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _buf_id,
     _device_block_shape,
     _iteration_space_key,
-    _physical_device_extents,
     _row_major_strides,
     _size_hint,
 )
@@ -791,7 +790,7 @@ class SpyreTritonKernel(SpyreKernel):
                     block_by_buf[bid] = _device_block_shape(a, divisor_of, loop_ctx)
 
         # Matmul operands are addressed through a *permuted* tensor descriptor so
-        # the sticked matrix dim's [outer_stick, inner_stick] pair is innermost
+        # the sticked matrix dim's [outer_stick, within_stick] pair is innermost
         # and adjacent, ready to collapse into one matrix dim for tl.dot (the
         # "weight transpose", expressed as a permuted descriptor rather than a
         # tl.trans).  A gather likewise permutes the value arg's indirect axis to
@@ -981,10 +980,11 @@ class SpyreTritonKernel(SpyreKernel):
         for arg_index in sorted(tensor_args):
             arg = tensor_args[arg_index]
             perm = perm_of[arg_index]
-            # Broadcast axes report the full stick width in ``device_size`` but
-            # physically hold one element; clamp them so the descriptor addresses
-            # only real memory (see ``_physical_device_extents``).
-            device_size_nat = _physical_device_extents(arg)
+            # Physical extents come straight from ``device_size``: a genuine
+            # scalar's degenerate outer axes are already reported as 1, and the
+            # within-stick axis stays at full stick width (physically a
+            # replicated stick), so the descriptor addresses real memory.
+            device_size_nat = [int(s) for s in arg.device_size]
             strides_nat = _row_major_strides(device_size_nat)
             device_size = [device_size_nat[p] for p in perm]
             strides = [strides_nat[p] for p in perm]
@@ -1252,8 +1252,8 @@ class SpyreTritonKernel(SpyreKernel):
         ``_validate_matmul`` has guaranteed a single, non-work-divided
         contraction dim K and at most one batch dim.  Each operand was loaded
         through a permuted descriptor placing its (single) batch dim first and
-        its sticked matrix dim's ``[outer_stick, inner_stick]`` pair innermost,
-        so its per-core block is ``[batch?, row, ..., outer_stick, inner_stick]``.
+        its sticked matrix dim's ``[outer_stick, within_stick]`` pair innermost,
+        so its per-core block is ``[batch?, row, ..., outer_stick, within_stick]``.
         Collapsing everything after the batch+row dims into one column yields the
         canonical (batched) matrix the Spyre ``tt.dot`` -> ``linalg.matmul`` /
         ``linalg.batch_matmul`` lowering expects::

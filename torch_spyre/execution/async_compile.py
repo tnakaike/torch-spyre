@@ -96,3 +96,37 @@ class SpyreAsyncCompile(AsyncCompile):
                 raise
 
         return SpyreSDSCKernelRunner(kernel_name, output_dir)
+
+    def ktir(
+        self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
+    ):
+        """Emit KTDP-dialect MLIR for ``specs`` (OpSpec->KTIR path).
+
+        Mirrors ``sdsc`` but emits KTIR directly instead of an SDSC bundle.
+        """
+        unimp = find_unimplemented(list(specs))
+        if unimp is not None:
+            logger.warning(
+                f"WARNING: Compiling unimplemented {unimp.op} to runtime exception"
+            )
+            return SpyreUnimplementedRunner(kernel_name, unimp.op)
+
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        # Persist the emitted KTIR as a text file in the same per-kernel output
+        # dir as sdsc's bundle.
+        output_dir = get_output_dir(kernel_name)
+        ktir_path = os.path.join(output_dir, f"{kernel_name}.ktir")
+        with open(ktir_path, "w") as fh:
+            fh.write(generate_ktir(kernel_name, specs))
+        logger.debug("OpSpec->KTIR: wrote %s", ktir_path)
+
+        if os.getenv("TORCH_SPYRE_KTIR_CPU", "0") == "0":
+            raise NotImplementedError(
+                "OpSpec->KTIR: device execution is not wired yet; "
+                "set TORCH_SPYRE_KTIR_CPU=1 to run the emitted KTIR on ktir-cpu."
+            )
+
+        from .ktir_cpu_runner import KtirCpuRunner
+
+        return KtirCpuRunner(kernel_name, ktir_path)

@@ -20,9 +20,9 @@ implies -- recognizing the op, classifying its device axes, identifying the
 in/out within-stick symbols, and computing the reshape/permute/reshape plan that
 turns the input tile into the output tile.
 
-Like ``opspec_utils.py`` this module must stay **Triton-free** (no ``tl.*``,
-no MLIR builder, no live Inductor kernel state) so both OpSpec backends -- the
-Triton source generator and the planned KTIR emitter -- can import it.
+Like ``opspec_utils.py`` this module must stay free of any backend emission
+toolchain (no MLIR builder, no live Inductor kernel state) so any OpSpec
+backend can import it.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def _restickify_stick_symbol(arg: TensorArg) -> sympy.Symbol:
     syms = arg.device_coordinates[-1].free_symbols
     if len(syms) != 1:
         raise NotImplementedError(
-            "OpSpec->Triton: restickify within-stick axis must carry exactly one "
+            "OpSpec: restickify within-stick axis must carry exactly one "
             f"iteration symbol (got {sorted(map(str, syms))})"
         )
     return next(iter(syms))
@@ -97,7 +97,7 @@ def _restickify_stick_symbol(arg: TensorArg) -> sympy.Symbol:
 def _restickify_axis_role(coord: sympy.Expr) -> tuple[sympy.Symbol, str]:
     """Classify a restickify device axis coordinate as ``(symbol, role)``.
 
-    ``role`` is one of ``full`` (a bare symbol ``s``), ``lo`` (the inner-stick
+    ``role`` is one of ``full`` (a bare symbol ``s``), ``lo`` (the within-stick
     axis ``Mod(s, stick)``), or ``hi`` (the outer-stick axis ``floor(s/stick)``).
     Raises for a constant (broadcast) or multi-symbol axis -- outside the
     bijection this cut supports.
@@ -105,7 +105,7 @@ def _restickify_axis_role(coord: sympy.Expr) -> tuple[sympy.Symbol, str]:
     syms = coord.free_symbols
     if len(syms) != 1:
         raise NotImplementedError(
-            "OpSpec->Triton: restickify device axis must carry exactly one symbol "
+            "OpSpec: restickify device axis must carry exactly one symbol "
             f"(got coord {coord}); broadcast / multi-symbol restickify unsupported"
         )
     s = next(iter(syms))
@@ -131,7 +131,7 @@ def _restickify_operands(
     outputs = [a for a in spec.args if not a.is_input]
     if len(inputs) != 1 or len(outputs) != 1:
         raise NotImplementedError(
-            "OpSpec->Triton: restickify must have exactly one input and one output "
+            "OpSpec: restickify must have exactly one input and one output "
             f"(got {len(inputs)} inputs, {len(outputs)} outputs)"
         )
     in_arg, out = inputs[0], outputs[0]
@@ -141,13 +141,13 @@ def _restickify_operands(
     s_out = _restickify_stick_symbol(out)
     if s_in == s_out:
         raise NotImplementedError(
-            f"OpSpec->Triton: restickify within-stick symbol unchanged ({s_in}); "
+            f"OpSpec: restickify within-stick symbol unchanged ({s_in}); "
             "expected a cross-stick restickify"
         )
     for s in (s_in, s_out):
         if int(spec.iteration_space.get(s, (0, 1))[1]) != 1:
             raise NotImplementedError(
-                "OpSpec->Triton: restickify with a work-divided within-stick "
+                "OpSpec: restickify with a work-divided within-stick "
                 f"symbol ({s}) not supported yet. Retry with fewer SENCORES."
             )
     return in_arg, out, s_in, s_out
@@ -195,7 +195,7 @@ def _restickify_plan(
     stick = int(in_block[-1])
     if int(out_block[-1]) != stick:
         raise NotImplementedError(
-            "OpSpec->Triton: restickify with differing in/out stick sizes "
+            "OpSpec: restickify with differing in/out stick sizes "
             f"({stick} vs {int(out_block[-1])}) not supported"
         )
     s_in = _restickify_stick_symbol(in_arg)
@@ -209,7 +209,7 @@ def _restickify_plan(
     }
     if {(s, p) for s, p, _ in out_atoms} != set(in_index):
         raise NotImplementedError(
-            "OpSpec->Triton: restickify input/output atoms do not match "
+            "OpSpec: restickify input/output atoms do not match "
             f"({sorted((str(s), p) for s, p, _ in in_atoms)} vs "
             f"{sorted((str(s), p) for s, p, _ in out_atoms)})"
         )
@@ -218,7 +218,7 @@ def _restickify_plan(
         i, in_size = in_index[(s, part)]
         if in_size != size:
             raise NotImplementedError(
-                "OpSpec->Triton: restickify atom size mismatch for "
+                "OpSpec: restickify atom size mismatch for "
                 f"{(str(s), part)} ({in_size} vs {size}); likely a work-divided "
                 "stick axis. Retry with fewer SENCORES."
             )

@@ -20,9 +20,9 @@ are reduced, which input device axes carry them, the outer-stick subset Spyre
 actually reduces, and whether the reduced tile reshapes to the output block
 without a permute.
 
-Like ``opspec_utils.py`` this module must stay **Triton-free** (no ``tl.*``,
-no MLIR builder, no live Inductor kernel state) so both OpSpec backends -- the
-Triton source generator and the planned KTIR emitter -- can import it.
+Like ``opspec_utils.py`` this module must stay free of any backend emission
+toolchain (no MLIR builder, no live Inductor kernel state) so any OpSpec
+backend can import it.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def _reduction_axes(in_arg: TensorArg, out_arg: TensorArg) -> tuple[set, list[in
     axes are the input device dimensions whose coordinate references one.
 
     A non-stick reduction (``dim=0`` on ``(128, 256)``) puts the reduced
-    symbol on exactly one input axis -> a single ``tl.sum``.  A stick-dim
+    symbol on exactly one input axis -> a single-axis reduce.  A stick-dim
     reduction (``dim=1``) spreads it across the outer-stick and within-stick
     axes (two axes) -> not yet supported (needs a ``sum_stick`` primitive).
     """
@@ -71,7 +71,7 @@ def _outer_stick_reduce_axes(
     bare symbol) and the within-stick axis (``coord = sym % stick``, a
     ``Mod`` / ``ModularIndexing``).  Spyre reduces only the outer-stick axis;
     the backend implicitly reduces the within-stick (NE) dimension in hardware
-    (see ``2602`` / the retired ``SpyreTritonKernel._get_reduction_axis``).
+    (see ``2602``).
 
     Returns ``(reduced_syms, all_axes, outer_stick_axes)`` where
     ``outer_stick_axes`` excludes any ``Mod`` / ``ModularIndexing`` axis.  A
@@ -104,8 +104,7 @@ def _check_reshape_is_order_preserving(
     and is not supported yet.
 
     The innermost (within-stick) axis is *excluded* from the comparison: under
-    the temporary outer-stick-only reduction (see
-    ``SpyreTritonKernel._emit_reduction``) the reduced input tile still
+    the temporary outer-stick-only reduction the reduced input tile still
     carries the real within-stick coordinate (``Mod(c1, 64)``) while the
     reduction output broadcasts a single value across that axis (coordinate
     ``0``, ``stride -1``).  Those coordinates differ by construction; the axis
@@ -126,6 +125,6 @@ def _check_reshape_is_order_preserving(
     ]
     if surviving != produced_out:
         raise NotImplementedError(
-            "OpSpec->Triton: reduction output layout requires a permute "
+            "OpSpec: reduction output layout requires a permute "
             f"({surviving} -> {produced_out}); permute not supported yet"
         )

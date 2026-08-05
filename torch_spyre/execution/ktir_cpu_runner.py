@@ -72,6 +72,7 @@ logger = get_inductor_logger("ktir_cpu_runner")
 __all__ = [
     "KtirCpuRunner",
     "ktir_empty_with_layout",
+    "ktir_constant_tensor",
     "ktir_stickify",
     "ktir_destickify",
 ]
@@ -174,6 +175,28 @@ def ktir_empty_with_layout(
     return torch.zeros(device_size, dtype=dtype)
 
 
+def ktir_constant_tensor(
+    value: float, device_layout: Any, dtype: torch.dtype = torch.float16
+) -> torch.Tensor:
+    """Physical-layout host buffer for a constant fill (drop-in for the device
+    path's ``spyre_constant_tensor``).
+
+    A ``spyre_constant_tensor`` is a rank-0 scalar whose device ``.to(device)``
+    copy stickifies it into a full, value-replicated stick.  The device-free
+    ktir-cpu path has no such copy, so a rank-0 host tensor would under-fill the
+    ``device_size`` descriptor the kernel reads (e.g. a ``[1, 64]`` stick backed
+    by a single element), leaving the trailing within-stick lanes uninitialized.
+
+    A constant fill sets *every* logical element to ``value``, so every physical
+    lane -- data and padding alike -- is ``value`` too.  Materialize the whole
+    physical stick directly with ``torch.full(device_size, value)``; no gather /
+    reorder is needed (unlike ``ktir_stickify``).  Returns a CPU ``torch.Tensor``;
+    the runner converts it to NumPy for ktir-cpu.
+    """
+    device_size = [int(d) for d in device_layout.device_size]
+    return torch.full(device_size if device_size else (), value, dtype=dtype)
+
+
 def ktir_stickify(logical: torch.Tensor, device_layout: Any) -> torch.Tensor:
     """Convert a logical PyTorch tensor to its physical (sticked) layout tensor."""
     device_size = [int(d) for d in device_layout.device_size]
@@ -236,12 +259,12 @@ class KtirCpuRunner:
     Args:
         kernel_name: The KTIR function name (matches the ``@name`` in the KTIR
             module and the wrapper's kernel object name).
-        ktir_text: The textual KTIR (KTDP-dialect MLIR) module.
+        ktir_path: Path to the emitted KTIR (KTDP-dialect MLIR) text file.
     """
 
-    def __init__(self, kernel_name: str, ktir_text: str) -> None:
+    def __init__(self, kernel_name: str, ktir_path: str) -> None:
         self.kernel_name = kernel_name
-        self.ktir_text = ktir_text
+        self.ktir_path = ktir_path
         self._interp: Any = None
         self._arg_names: list[str] | None = None
 
@@ -255,7 +278,7 @@ class KtirCpuRunner:
             # mis-parses per-argument ``loc(...)`` attributes and reports only
             # the first function parameter.
             interp = KTIRInterpreter(parser=MLIRFrontendParser())
-            interp.load(self.ktir_text)
+            interp.load(self.ktir_path)
             self._interp = interp
             self._arg_names = list(interp.arg_names(self.kernel_name))
             logger.debug(

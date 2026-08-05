@@ -207,10 +207,30 @@ def _autoload():
 
         import os
 
-        if os.getenv("TORCH_SPYRE_TRITON") == "1":
-            # OpSpec -> Triton *source generator* path (DESIGN-OpSpecToTriton.md).
-            # Reuses the SDSC frontend and projects the finished op_specs to
-            # Triton source.
+        if os.getenv("TORCH_SPYRE_KTIR") == "1":
+            # OpSpec -> KTIR emitter path.  Reuses the SuperDSC frontend (its
+            # define_kernel emits the finished op_specs verbatim) and emits
+            # KTDP-dialect MLIR directly.
+            from .scheduler import SuperDSCScheduling
+
+            if os.getenv("TORCH_SPYRE_KTIR_CPU", "0") != "0":
+                # Host (ktir-cpu) execution: needs the tiled-layout stickify /
+                # destickify wrapper overrides.
+                from .ktir_cpu_wrapper import KtirCpuWrapperCodegen
+
+                wrapper_cls = KtirCpuWrapperCodegen
+            else:
+                wrapper_cls = SpyrePythonWrapperCodegen
+
+            register_backend_for_device(
+                DEVICE_NAME,
+                SuperDSCScheduling,
+                wrapper_cls,
+                device_custom_config=config,
+            )
+        elif os.getenv("TORCH_SPYRE_TRITON") == "1":
+            # OpSpec -> Triton *source generator* path.  Reuses the SDSC
+            # frontend and projects the finished op_specs to Triton source.
             from torch_spyre._triton_kernel import (
                 SpyreTritonScheduling,
                 SpyreTritonPythonWrapperCodegen,
