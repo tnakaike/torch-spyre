@@ -113,6 +113,22 @@ class KtirCpuWrapperCodegen(SpyrePythonWrapperCodegen):
                 f"{name} = ktir_stickify({name}, get_spyre_tensor_layout({name}))"
             )
 
+    def codegen_input_size_asserts(self) -> None:
+        """Suppress logical-shape ``assert_size_stride`` checks on the ktir-cpu path.
+
+        Upstream defers these asserts (queued here, emitted by the scheduler via
+        ``codegen_deferred_input_asserts``) to just before the first kernel that
+        uses each input -- i.e. *after* ``codegen_input_size_and_nan_asserts``
+        has stickified inputs to their physical (tiled, higher-rank) layout. A
+        logical-shape assert against a stickified tensor always fails on rank
+        ("wrong number of dimensions"), and it validates nothing about the
+        physical layout the kernel actually reads, so skip queuing it here. The
+        device path (no stickify) keeps the base behavior.
+        """
+        if _ktir_cpu_mode():
+            return
+        super().codegen_input_size_asserts()
+
     def generate_return(self, output_refs) -> None:
         """Destickify tiled outputs (physical -> logical) before returning."""
         if _ktir_cpu_mode():

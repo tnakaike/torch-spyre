@@ -21,7 +21,6 @@ from torch._inductor.runtime.runtime_utils import cache_dir
 from torch._inductor.runtime.triton_compat import (
     ASTSource,
     GPUTarget,
-    cc_warp_size,
     triton,
 )
 
@@ -107,7 +106,7 @@ class SpyreTritonAsyncCompile:
         target = GPUTarget(
             compile_meta["device_type"],
             compile_meta["cc"],
-            cc_warp_size(compile_meta["cc"]),
+            cat.device_props.warp_size_or_default,
         )
         # spyre_grid is injected by the OpSpec->Triton generator and carries the
         # per-axis program count for SpyreOptions.grid.  The DistributeWork MLIR
