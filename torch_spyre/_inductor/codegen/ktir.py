@@ -40,8 +40,13 @@ from torch_spyre._inductor.codegen.opspec_utils import (
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
-# Pointwise op name -> the ``arith`` float builder that implements it.
-_ARITH_FLOAT_OP = {"add": "AddFOp", "mul": "MulFOp"}
+# Pointwise op name -> the ``linalg`` named op that implements it.
+# TENTATIVE (dbo workaround): dbo-opt's construct-three-stage-pipeline
+# requires linalg named ops (linalg.add / linalg.mul) rather than
+# arith scalar-on-tensor ops (arith.addf / arith.mulf).  The test
+# fixtures under dataflow-scheduler/test/.../ConstructThreeStagePipeline/
+# all use linalg ops; arith.addf on tensors is not handled.
+_LINALG_OP = {"add": "add", "mul": "mul"}
 
 
 def _val(x):
@@ -95,7 +100,7 @@ def generate_ktir(
     # ``mlir_ktdp`` is imported lazily so the module stays importable (and the
     # golden test can skip) where the dialect-packaged mlir_ktdp is not built.
     from mlir_ktdp import ir
-    from mlir_ktdp.dialects import arith, func, ktdp
+    from mlir_ktdp.dialects import arith, func, ktdp, linalg, tensor
 
     # Fused ops must share one iteration space (same grid / work-division); the
     # register-threaded intermediate between them has the same extents as the
@@ -182,6 +187,8 @@ def generate_ktir(
                         ir,
                         ktdp,
                         arith,
+                        linalg,
+                        tensor,
                         spec,
                         memory_views,
                         produced,
@@ -218,10 +225,10 @@ def _collect_pointwise_op_specs(
             )
         if entry.is_reduction:
             raise NotImplementedError("OpSpec->KTIR: reductions are not supported yet")
-        if entry.op not in _ARITH_FLOAT_OP:
+        if entry.op not in _LINALG_OP:
             raise NotImplementedError(
                 f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
-                f"(only pointwise {sorted(_ARITH_FLOAT_OP)})"
+                f"(only pointwise {sorted(_LINALG_OP)})"
             )
         op_specs.append(entry)
     if not op_specs:
@@ -256,6 +263,8 @@ def _emit_pointwise_op(
     ir,
     ktdp,
     arith,
+    linalg,
+    tensor,
     spec: OpSpec,
     memory_views,
     produced,
@@ -332,8 +341,15 @@ def _emit_pointwise_op(
                 "(cross-group HBM intermediates are not supported yet)"
             )
 
-    builder = getattr(arith, _ARITH_FLOAT_OP[spec.op])
-    result = _val(builder(loaded[0], loaded[1]))
+    # TENTATIVE: emit linalg named op + tensor.empty() outs, matching the
+    # pattern the dataflow-scheduler test fixtures use.
+    block = _device_block_shape(out, divisor_of)
+    elt_t = _mlir_elt_type(ir, out.device_dtype)
+    tensor_t = ir.RankedTensorType.get(block, elt_t)
+    empty = _val(tensor.EmptyOp(block, elt_t))
+    linalg_op_name = _LINALG_OP[spec.op]
+    linalg_builder = getattr(linalg, linalg_op_name)
+    result = _val(linalg_builder(*loaded, outs=[empty], result_tensors=[tensor_t]))
 
     out_bid = _buf_id(out)
     if out_bid in memory_views:

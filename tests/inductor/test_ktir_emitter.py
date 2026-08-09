@@ -30,10 +30,17 @@ from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg
 
 
 def _mlir_ktdp_available() -> bool:
-    """True when mlir_ktdp is built with the func/arith dialect Python bindings."""
+    """True when mlir_ktdp is built with the dialect Python bindings the emitter
+    needs (func/arith/ktdp plus linalg/tensor for the pointwise named ops)."""
     try:
         from mlir_ktdp import ir  # noqa: F401
-        from mlir_ktdp.dialects import arith, func, ktdp  # noqa: F401
+        from mlir_ktdp.dialects import (  # noqa: F401
+            arith,
+            func,
+            ktdp,
+            linalg,
+            tensor,
+        )
     except ImportError:
         return False
     return True
@@ -183,17 +190,18 @@ module {
     %4 = ktdp.load %3 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %5 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %6 = ktdp.load %5 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %7 = arith.addf %4, %6 : tensor<16x512x64xf16>
-    %8 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %7, %8 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %7 = tensor.empty() : tensor<16x512x64xf16>
+    %8 = linalg.add ins(%4, %6 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%7 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %9 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %8, %9 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
   }
 }
 """
 
 
-# ``(a + b) + c``: buf0 threads from the first addf straight into the second
-# (%8 feeds %11) -- no memory view / access tile / load / store for it.
+# ``(a + b) + c``: buf0 threads from the first linalg.add straight into the
+# second (%9 feeds %13) -- no memory view / access tile / load / store for it.
 _EXPECTED_FUSED_CHAIN_KTIR = """\
 #map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
@@ -208,20 +216,22 @@ module {
     %5 = ktdp.load %4 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %6 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %7 = ktdp.load %6 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %8 = arith.addf %5, %7 : tensor<16x512x64xf16>
-    %9 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %10 = ktdp.load %9 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %11 = arith.addf %8, %10 : tensor<16x512x64xf16>
-    %12 = ktdp.construct_access_tile %3[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %11, %12 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %8 = tensor.empty() : tensor<16x512x64xf16>
+    %9 = linalg.add ins(%5, %7 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%8 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %10 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %11 = ktdp.load %10 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %12 = tensor.empty() : tensor<16x512x64xf16>
+    %13 = linalg.add ins(%9, %11 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%12 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %14 = ktdp.construct_access_tile %3[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %13, %14 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
   }
 }
 """
 
 
-# ``(a + b) * (c + d)``: buf0 (%9) and buf1 (%14) both thread into the mulf
-# (%15) with no materialization; only buf2 (%arg4) is stored.
+# ``(a + b) * (c + d)``: buf0 (%10) and buf1 (%16) both thread into the
+# linalg.mul (%18) with no materialization; only buf2 (%arg4) is stored.
 _EXPECTED_FUSED_ADD_MUL_KTIR = """\
 #map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
@@ -237,15 +247,18 @@ module {
     %6 = ktdp.load %5 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %7 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %8 = ktdp.load %7 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %9 = arith.addf %6, %8 : tensor<16x512x64xf16>
-    %10 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %11 = ktdp.load %10 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %12 = ktdp.construct_access_tile %3[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %13 = ktdp.load %12 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %14 = arith.addf %11, %13 : tensor<16x512x64xf16>
-    %15 = arith.mulf %9, %14 : tensor<16x512x64xf16>
-    %16 = ktdp.construct_access_tile %4[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %15, %16 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %9 = tensor.empty() : tensor<16x512x64xf16>
+    %10 = linalg.add ins(%6, %8 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%9 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %11 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %12 = ktdp.load %11 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %13 = ktdp.construct_access_tile %3[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %14 = ktdp.load %13 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %15 = tensor.empty() : tensor<16x512x64xf16>
+    %16 = linalg.add ins(%12, %14 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%15 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %17 = tensor.empty() : tensor<16x512x64xf16>
+    %18 = linalg.mul ins(%10, %16 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%17 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %19 = ktdp.construct_access_tile %4[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %18, %19 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
   }
 }
@@ -274,11 +287,12 @@ module {
     %7 = arith.muli %3, %c16_0 : index
     %8 = ktdp.construct_access_tile %1[%c0, %7, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
     %9 = ktdp.load %8 : <16x16x64xindex> -> tensor<16x16x64xf16>
-    %10 = arith.addf %6, %9 : tensor<16x16x64xf16>
+    %10 = tensor.empty() : tensor<16x16x64xf16>
+    %11 = linalg.add ins(%6, %9 : tensor<16x16x64xf16>, tensor<16x16x64xf16>) outs(%10 : tensor<16x16x64xf16>) -> tensor<16x16x64xf16>
     %c16_1 = arith.constant 16 : index
-    %11 = arith.muli %3, %c16_1 : index
-    %12 = ktdp.construct_access_tile %2[%c0, %11, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
-    ktdp.store %10, %12 : tensor<16x16x64xf16>, <16x16x64xindex>
+    %12 = arith.muli %3, %c16_1 : index
+    %13 = ktdp.construct_access_tile %2[%c0, %12, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
+    ktdp.store %11, %13 : tensor<16x16x64xf16>, <16x16x64xindex>
     return
   }
 }
