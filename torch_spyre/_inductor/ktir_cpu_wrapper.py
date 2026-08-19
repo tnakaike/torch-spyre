@@ -27,7 +27,6 @@ inherited ``write_header`` binds ``SpyreAsyncCompile``, which carries the
 ``ktir`` method).
 """
 
-import os
 from typing import Optional
 
 import sympy
@@ -35,16 +34,12 @@ from torch._inductor.codegen.wrapper import SubgraphPythonWrapperCodegen
 from torch._inductor.ir import GraphPartitionSignature
 from torch._inductor.virtualized import V
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.wrapper import (
     PythonWrapperCodegen,
     SpyrePythonWrapperCodegen,
 )
-
-
-def _ktir_cpu_mode() -> bool:
-    """Whether buffers should be allocated for the device-free ktir-cpu path."""
-    return os.getenv("TORCH_SPYRE_KTIR_CPU", "0") != "0"
 
 
 def _tiled_layout(node) -> Optional[FixedTiledLayout]:
@@ -84,7 +79,7 @@ class KtirCpuWrapperCodegen(SpyrePythonWrapperCodegen):
 
     def write_header(self) -> None:
         super().write_header()
-        if _ktir_cpu_mode():
+        if config.ktir_cpu:
             self.header.writeline(
                 "from torch_spyre.execution.ktir_cpu_runner import "
                 "ktir_empty_with_layout, ktir_constant_tensor, ktir_stickify, "
@@ -104,7 +99,7 @@ class KtirCpuWrapperCodegen(SpyrePythonWrapperCodegen):
         ordering and indentation correct.
         """
         super().codegen_input_size_and_nan_asserts()
-        if not _ktir_cpu_mode():
+        if not config.ktir_cpu:
             return
         for name, box in V.graph.graph_inputs.items():
             if isinstance(box, sympy.Expr):
@@ -125,13 +120,13 @@ class KtirCpuWrapperCodegen(SpyrePythonWrapperCodegen):
         physical layout the kernel actually reads, so skip queuing it here. The
         device path (no stickify) keeps the base behavior.
         """
-        if _ktir_cpu_mode():
+        if config.ktir_cpu:
             return
         super().codegen_input_size_asserts()
 
     def generate_return(self, output_refs) -> None:
         """Destickify tiled outputs (physical -> logical) before returning."""
-        if _ktir_cpu_mode():
+        if config.ktir_cpu:
             wrapped = []
             for ref in output_refs:
                 layout = _tiled_layout(V.graph.get_buffer(ref))
@@ -157,7 +152,7 @@ class KtirCpuWrapperCodegen(SpyrePythonWrapperCodegen):
         ``device_size`` buffer with the value replicated across every lane.
         """
         layout = _tiled_layout(node)
-        if not _ktir_cpu_mode() or layout is None:
+        if not config.ktir_cpu or layout is None:
             return super().generate_const_tensor_fallback(node)
         value = node.constant_args[0]
         self.writeline(
@@ -174,6 +169,6 @@ class KtirCpuWrapperCodegen(SpyrePythonWrapperCodegen):
         just swaps the allocator name, so the layout logic stays in one place.
         """
         line = super().make_buffer_allocation(buffer)
-        if _ktir_cpu_mode() and isinstance(line, str):
+        if config.ktir_cpu and isinstance(line, str):
             line = line.replace("spyre_empty_with_layout(", "ktir_empty_with_layout(")
         return line

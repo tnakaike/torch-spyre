@@ -116,6 +116,14 @@ triton_emitter: bool = os.environ.get("TORCH_SPYRE_TRITON", "0") == "1"
 #     logically instead.
 kernel_emitter: bool = ktir_emitter or triton_emitter
 
+# Opt-in device-free execution of emitted KTIR on the host ``ktir-cpu`` package
+# (TORCH_SPYRE_KTIR_CPU), instead of launching a jobplan on a Spyre device.
+# Applies to both emitter paths: the direct-KTIR emitter and the Triton source
+# emitter each hand their KTIR text to ``KtirCpuRunner`` rather than to
+# ``dbo-opt`` + the device runtime. Any non-``0`` value enables it (kept from
+# the original ``getenv(...) != "0"`` predicate, not narrowed to ``== "1"``).
+ktir_cpu: bool = os.environ.get("TORCH_SPYRE_KTIR_CPU", "0") != "0"
+
 # Settings for device execution over the KTIR path. What is required is checked
 # upfront by ``_check_ktir_device_prerequisites`` in ``execution/async_compile``,
 # which names anything missing.

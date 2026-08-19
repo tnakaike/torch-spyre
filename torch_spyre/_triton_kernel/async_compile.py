@@ -24,14 +24,10 @@ from torch._inductor.runtime.triton_compat import (
     triton,
 )
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("async_compile")
-
-
-def _ktir_cpu_enabled() -> bool:
-    """Whether to run emitted KTIR on ktir-cpu instead of a Spyre device."""
-    return os.getenv("TORCH_SPYRE_KTIR_CPU", "0") != "0"
 
 
 def _asm_text(compiled: Any, ext: str) -> Optional[str]:
@@ -123,7 +119,7 @@ class SpyreTritonAsyncCompile:
 
         # Device-free path: run the emitted KTIR on ktir-cpu instead of a Spyre
         # device. Gated so the default (device) path is unchanged.
-        if _ktir_cpu_enabled():
+        if config.ktir_cpu:
             ktir_text = _extract_ktir(compiled)
             if ktir_text is None:
                 logger.warning(
