@@ -234,10 +234,8 @@ def _autoload():
 
         from .wrapper import SpyrePythonWrapperCodegen
 
-        import os
-
-        if os.getenv("TORCH_SPYRE_TRITON") == "1":
-            # OpSpec -> Triton *source generator* path.  Reuses the SDSC
+        if config.triton_emitter:
+            # OpSpec -> Triton *source emitter* path.  Reuses the SDSC
             # frontend and projects the finished op_specs to Triton source.
             # (KTIR direct emission stays gated by config.ktir_emitter inside
             # the SuperDSC scheduling backend below.)

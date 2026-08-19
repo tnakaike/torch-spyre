@@ -487,11 +487,9 @@ def _maybe_enforce_indirect_access_layout(graph: GraphLowering) -> None:
     sits and ``_prepare_gather`` permutes it to the front of the operand's
     ``make_tensor_descriptor``.  The physical permute is therefore redundant
     for those paths (it only adds a full-tensor restickify copy), so it is
-    skipped when an OpSpec backend is active.
+    skipped when a kernel emitter is active.
     """
-    from .decompositions import _is_ktir_path
-
-    if _is_ktir_path():
+    if config.kernel_emitter:
         return
     enforce_indirect_access_layout(graph)
 

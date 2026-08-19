@@ -27,7 +27,6 @@ registry; Spyre never mutates the global table.
 
 import dataclasses
 import math
-import os
 import threading
 from typing import Any, Callable, Optional, Sequence, Union
 
@@ -55,25 +54,6 @@ from torch_spyre._C import DataFormats, get_device_dtype, get_elem_in_stick
 import torch_spyre._inductor.customops  # noqa: F401
 
 logger = get_inductor_logger("decompositions")
-
-
-def _is_ktir_path() -> bool:
-    """True when an OpSpec-based backend (Triton source generator or KTIR
-    emitter) is selected.
-
-    The OpSpec backends cannot consume the SDSC fused hardware ops
-    (``spyre.exx2`` / ``layernormscale`` / ``layernormnorm``) nor the
-    ``mean`` / ``welford`` reduction kinds.  When either backend is active we
-    decompose normalization ops into sum-based + pointwise primitives that the
-    generators can emit.  Otherwise the original SDSC forms are kept.
-
-    TODO(consolidate): fold this env-gate check into ``config.py`` (alongside
-    ``config.ktir_emitter``) so the OpSpec-backend predicate lives in one place
-    rather than being re-derived from ``os.getenv`` here and in ``passes.py``.
-    """
-    return (
-        os.getenv("TORCH_SPYRE_TRITON") == "1" or os.getenv("TORCH_SPYRE_KTIR") == "1"
-    )
 
 
 _SDPA_MAX_SEQUENCE_TILE_SIZE = 512
@@ -1673,8 +1653,8 @@ def spyre_rms_norm(
             f"got device={input.device.type}, normalized_shape={normalized_shape}"
         )
 
-    if _is_ktir_path():
-        # OpSpec backends cannot emit the fused ``mean`` reduction kind, so
+    if config.kernel_emitter:
+        # The kernel emitters cannot emit the fused ``mean`` reduction kind, so
         # express the mean as an explicit ``sum`` reduction plus a pointwise
         # divide.
         n = normalized_shape[0]
@@ -1707,8 +1687,8 @@ def spyre_layer_norm(
         weight = input.new_ones(normalized_shape)
     if bias is None:
         bias = input.new_zeros(normalized_shape)
-    if _is_ktir_path():
-        # OpSpec backends cannot emit the fused SDSC ops
+    if config.kernel_emitter:
+        # The kernel emitters cannot emit the fused SDSC ops
         # (exx2 / layernormscale / layernormnorm), so express layer norm with
         # explicit sum-based reductions plus pointwise ops.
         n = normalized_shape[0]
@@ -1744,9 +1724,9 @@ def spyre_var_mean(input, dim=None, *, correction=None, keepdim=False):
     return var, mean
 
 
-# ``var_mean`` is only intercepted for the OpSpec backends; the SDSC path keeps
+# ``var_mean`` is only intercepted for the kernel emitters; the SDSC path keeps
 # PyTorch's default handling untouched.
-if _is_ktir_path():
+if config.kernel_emitter:
     spyre_var_mean = register_spyre_decompositions(
         [torch.ops.aten.var_mean.correction]
     )(spyre_var_mean)

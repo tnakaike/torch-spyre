@@ -96,6 +96,26 @@ disable_conv2d_spatial_split: bool = (
 # stable per-buffer identity. Inert by default: the SDSC/flex path is unchanged.
 ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 
+# Opt-in OpSpec->Triton *source emitter* path (TORCH_SPYRE_TRITON=1). Like
+# ktir_emitter it walks the finished op_specs, but it projects them to Triton
+# source (-> KTDP -> KTIR) rather than emitting KTIR directly. The backend swap
+# itself is wired in ``__init__.py``.
+triton_emitter: bool = os.environ.get("TORCH_SPYRE_TRITON", "0") == "1"
+
+# True when a kernel-emitting backend (direct KTIR emitter or Triton source
+# emitter) is active, as opposed to the SDSC bundle path. (SDSC is also an
+# OpSpec-based backend -- all three consume op_specs -- but it does not emit a
+# standalone kernel, so the name keys on the emit distinction, not on op_specs.)
+# The single predicate the rest of the compiler consults to take the emitter
+# path rather than the SDSC/flex path:
+#   * normalization ops decompose into sum-based + pointwise primitives -- the
+#     emitters cannot consume the SDSC fused hardware ops (spyre.exx2 /
+#     layernormscale / layernormnorm) nor the mean / welford reduction kinds; and
+#   * the redundant physical indexed-dim permute (a full-tensor restickify copy)
+#     is skipped, since the emitters bring the indexed axis to descriptor dim 0
+#     logically instead.
+kernel_emitter: bool = ktir_emitter or triton_emitter
+
 # Settings for device execution over the KTIR path. What is required is checked
 # upfront by ``_check_ktir_device_prerequisites`` in ``execution/async_compile``,
 # which names anything missing.
