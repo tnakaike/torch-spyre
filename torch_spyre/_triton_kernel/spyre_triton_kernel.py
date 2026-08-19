@@ -35,12 +35,14 @@ OpSpec symbols by construction:
 This cut covers pointwise ops (``add.py``), counted loops over a pointwise body
 (``add_mul_coarse.py``), non-stick ``sum`` reductions (``sum.py`` with
 ``dim=0``), and 2D / batched matmul (``matmul.py`` / ``bmm.py``, via ``tl.dot``).
-A reduction whose reduced dim is the within-stick axis (``dim=1``), spans
-multiple device axes, or is work-divided across cores raises
-``NotImplementedError`` (needs a ``sum_stick`` primitive or the inter-core
-reduce ring, respectively).  Matmul supports a single (non-work-divided)
-contraction dim and at most one batch dim; more than one batch dim, a
-work-divided K, degenerate ``K == 1``, and fp8 matmul each raise
+A reduction whose reduced dim is the within-stick axis (``dim=1``) or spans
+multiple device axes raises ``NotImplementedError`` (needs a ``sum_stick``
+primitive).  A reduction or matmul whose reduced / contraction dim is
+work-divided across cores is combined by the inter-core reduce ring
+(``tl.inter_tile``; see ``2607-InterCoreReduction.md``), for a single split
+axis that must be the innermost work-divided symbol.  Matmul additionally
+supports a single contraction dim and at most one batch dim; more than one
+batch dim, degenerate ``K == 1``, and fp8 matmul each raise
 ``NotImplementedError`` (see ``_validate_matmul``).
 
 Counted loops
@@ -557,13 +559,84 @@ class SpyreTritonKernel(SpyreKernel):
                 f"outer-stick axes {outer}); a pure within-stick reduce needs a "
                 "sum_stick primitive"
             )
-        for sym in reduced:
-            if int(spec.iteration_space.get(sym, (0, 1))[1]) != 1:
+        # A reduction dim work-divided across cores is combined by the HW
+        # inter-core reduce ring (``tl.inter_tile``; see
+        # ``2607-InterCoreReduction.md``): each core reduces its own shard, then
+        # the ring sums the partials and delivers the result to the shard whose
+        # reduced slice index is 0 (``reduce_to_one`` pick0).  Supported for
+        # exactly one split reduced symbol, and it must be the innermost
+        # work-divided symbol so a cooperating group (cores sharing every
+        # spatial slice, varying only on the reduced axis) is a contiguous
+        # tile-id range -- the backend's ``LowerInterTile.buildGroupSets`` is
+        # contiguous-only (Option A: no C++ change).
+        split = [s for s in reduced if int(spec.iteration_space.get(s, (0, 1))[1]) != 1]
+        if len(split) > 1:
+            raise NotImplementedError(
+                "OpSpec->Triton: more than one reduction dim work-divided across "
+                "cores; the inter-core reduce ring groups by a single reduced "
+                "axis (see 2607-InterCoreReduction.md). Retry with fewer SENCORES."
+            )
+        if split:
+            split_syms = [s for s, (_r, d) in spec.iteration_space.items() if d > 1]
+            if not split_syms or split_syms[-1] != split[0]:
                 raise NotImplementedError(
-                    "OpSpec->Triton: reduction dim is work-divided across cores "
-                    "(inter-core reduce ring not implemented; see "
-                    "2607-InterCoreReduction.md). Retry with fewer SENCORES."
+                    "OpSpec->Triton: inter-core reduce requires the split "
+                    "reduction axis to be the innermost work-divided symbol so "
+                    "cooperating cores form contiguous tile groups; got split "
+                    f"order {split_syms} with reduced axis {split[0]}."
                 )
+
+    @staticmethod
+    def _reduced_split_syms(spec: OpSpec) -> list:
+        """Reduced symbols work-divided across cores (``iteration-space div>1``).
+
+        A supported inter-core reduce has exactly one (guaranteed by
+        ``_validate_reduction``); an on-core reduction returns ``[]``.
+        """
+        if spec.op != "sum" or not spec.is_reduction:
+            return []
+        inputs = [a for a in spec.args if a.is_input]
+        outputs = [a for a in spec.args if not a.is_input]
+        if len(inputs) != 1 or len(outputs) != 1:
+            return []
+        reduced, _axes, _outer = _outer_stick_reduce_axes(inputs[0], outputs[0])
+        return [s for s in reduced if int(spec.iteration_space.get(s, (0, 1))[1]) > 1]
+
+    @classmethod
+    def _is_inter_core_reduction(cls, spec: OpSpec) -> bool:
+        """True when a reduction's reduced axis is split across cores."""
+        return bool(cls._reduced_split_syms(spec))
+
+    @classmethod
+    def _matmul_split_k_sym(cls, spec: OpSpec) -> str | None:
+        """Name of the matmul contraction sym K when work-divided across cores.
+
+        Each core's ``tl.dot`` then produces only a partial over its K-shard,
+        combined via the inter-core reduce ring in ``_emit_matmul`` (mirroring
+        the ``sum`` path).  Returns ``None`` for a non-matmul spec or a whole
+        (unsplit) K.  ``_validate_matmul`` guarantees a single K.
+        """
+        if spec.op not in _MATMUL_OPS or not spec.is_reduction:
+            return None
+        _x, _y, _out, k_syms, _n, _m, _batch = cls._matmul_operands(spec)
+        if len(k_syms) != 1:
+            return None
+        k_sym = next(iter(k_syms))
+        if int(spec.iteration_space.get(k_sym, (0, 1))[1]) <= 1:
+            return None
+        return str(k_sym)
+
+    @classmethod
+    def _needs_inter_core_ring(cls, spec: OpSpec) -> bool:
+        """True when the spec bakes a ``work_slices`` constexpr and rings.
+
+        Either a ``sum`` whose reduced axis is split, or a matmul whose K is
+        split -- both combine per-core partials via ``tl.inter_tile``.
+        """
+        return (
+            cls._is_inter_core_reduction(spec)
+            or cls._matmul_split_k_sym(spec) is not None
+        )
 
     @staticmethod
     def _matmul_operands(spec: OpSpec):
@@ -621,9 +694,13 @@ class SpyreTritonKernel(SpyreKernel):
         cases each need machinery that does not exist yet:
 
         - more than one batch dim -> multi-dim batched ``tl.dot``;
-        - K work-divided across cores -> the HW inter-core reduce ring;
         - degenerate ``K == 1`` -> pointwise-mul lowering (retired to patches);
         - fp8 matmul (``batchmatmulfp8``).
+
+        A K work-divided across cores IS supported: ``_emit_matmul`` combines
+        the per-core partials via the inter-core reduce ring (``tl.inter_tile``;
+        see ``2607-InterCoreReduction.md``), guarded to a single K that is the
+        innermost work-divided symbol.
         """
         _x, _y, _out, k_syms, _n, _m, batch_syms = SpyreTritonKernel._matmul_operands(
             spec
@@ -641,12 +718,25 @@ class SpyreTritonKernel(SpyreKernel):
             )
         k_sym = next(iter(k_syms))
         k_range, k_div = spec.iteration_space.get(k_sym, (0, 1))
+        # A work-divided K is combined by the HW inter-core reduce ring
+        # (``tl.inter_tile``; see ``2607-InterCoreReduction.md``): each core runs
+        # ``tl.dot`` over its K-shard, then the ring sums the partials and every
+        # core receives the total (``all_reduce``); a pick0 store guard on K
+        # dedups the identical writes.  Supported for a single split K that is
+        # the innermost work-divided symbol, so a cooperating group (cores
+        # sharing every spatial slice, varying only on K) is a contiguous
+        # tile-id range -- ``LowerInterTile.buildGroupSets`` is contiguous-only
+        # (Option A: no C++ change).  Emitted in ``_emit_matmul``.
         if int(k_div) != 1:
-            raise NotImplementedError(
-                "OpSpec->Triton: matmul contraction dim is work-divided across "
-                "cores (inter-core reduce ring not implemented; see "
-                "2607-InterCoreReduction.md). Retry with fewer SENCORES."
-            )
+            split_syms = [s for s, (_r, d) in spec.iteration_space.items() if d > 1]
+            if not split_syms or split_syms[-1] != k_sym:
+                raise NotImplementedError(
+                    "OpSpec->Triton: inter-core matmul reduce requires the split "
+                    "contraction dim K to be the innermost work-divided symbol "
+                    "so cooperating cores form contiguous tile groups; got split "
+                    f"order {split_syms} with K axis {k_sym}. Retry with fewer "
+                    "SENCORES."
+                )
         if _size_hint(k_range) <= 1:
             raise NotImplementedError(
                 "OpSpec->Triton: degenerate K==1 matmul not supported yet "
@@ -758,6 +848,12 @@ class SpyreTritonKernel(SpyreKernel):
         for _rng, div in it_space.values():
             grid *= int(div)
 
+        # An inter-core reduction combines per-core partial sums over a
+        # work-divided reduction axis via ``tl.inter_tile``; the ring reads a
+        # module-level ``work_slices`` constexpr (baked in ``_emit_header``) and
+        # ``_emit_reduction`` emits the collective + pick0 store guard.
+        inter_core_reduce = any(self._needs_inter_core_ring(s) for s in group)
+
         # Per-core block_shape per tensor arg, computed once and shared by the
         # descriptor emission and the reduction reshape (which must target the
         # output's block_shape).  Depends only on arg + work division + loop_ctx,
@@ -840,7 +936,16 @@ class SpyreTritonKernel(SpyreKernel):
                 )
 
         signature = ", ".join(param_names[i] for i in used)
-        header = self._emit_header(grid, used)
+        # A ``@triton.jit`` body may only read a module-level global if it is a
+        # ``tl.constexpr`` (a bare literal raises "Cannot access global variable
+        # ... instantiated as constexpr"); bake the ring's per-tile work_slices
+        # that way so ``tl.inter_tile`` / ``tl.wk_slice_coord`` can read it.
+        module_preamble = ""
+        if inter_core_reduce:
+            module_preamble = (
+                f"work_slices = tl.constexpr({self._work_slices(it_space)!r})"
+            )
+        header = self._emit_header(grid, used, module_preamble)
         buf = IndentedBuffer()
         buf.splice(header)
         buf.writeline(f"def {KERNEL_NAME_PLACEHOLDER}({signature}):")
@@ -860,6 +965,32 @@ class SpyreTritonKernel(SpyreKernel):
                 call_args.append(name)
 
         return _KernelPlan(source=buf.getvalue(), call_args=call_args)
+
+    @staticmethod
+    def _work_slices(
+        it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
+    ) -> list[dict[str, int]]:
+        """Per-tile ``{str(sym): slice_index}`` list for the inter-core ring.
+
+        Ordering mirrors ``_emit_logical_offsets``' mixed-radix program-id decode
+        exactly (the innermost work-divided symbol varies fastest), so a tile's
+        ``work_slices[program_id]`` entry agrees with the ``c0``/``c1`` bases
+        emitted there and cooperating groups are contiguous tile-id ranges.
+        ``prod(grid) == len(work_slices)``.
+        """
+        split = [(s, int(div)) for s, (_rng, div) in it_space.items() if div > 1]
+        total = 1
+        for _s, div in split:
+            total *= div
+        out: list[dict[str, int]] = []
+        for tile_id in range(total):
+            slot: dict[str, int] = {}
+            inner = 1
+            for sym, div in reversed(split):  # innermost first (fastest)
+                slot[str(sym)] = (tile_id // inner) % div
+                inner *= div
+            out.append(slot)
+        return out
 
     def _emit_logical_offsets(
         self,
@@ -1040,14 +1171,26 @@ class SpyreTritonKernel(SpyreKernel):
             produced[key] = var
             return var
 
-        def _store(out: TensorArg, var: str) -> None:
+        def _store(out: TensorArg, var: str, pick0_axis: str | None = None) -> None:
             # Write HBM for any output with a slot (a real output or a
             # materialized cross-group pool buffer); a register-threaded
             # intermediate (no slot) is consumed from the register in a later op.
+            # ``pick0_axis`` (inter-core reduce ``reduce_to_one``) guards the
+            # store so only the shard whose reduced-axis slice index is 0 writes:
+            # the ring delivers the combined sum there, the other shards hold
+            # stale partials and must not write.
             slot = self._slot(out)
             if slot >= 0:
                 offsets = ", ".join(dims_of[slot])
-                body.writeline(f"{desc_of[slot]}.store([{offsets}], {var})")
+                store_line = f"{desc_of[slot]}.store([{offsets}], {var})"
+                if pick0_axis is not None:
+                    body.writeline(
+                        f'if tl.wk_slice_coord(work_slices, "{pick0_axis}") == 0:'
+                    )
+                    with body.indent():
+                        body.writeline(store_line)
+                else:
+                    body.writeline(store_line)
             produced[buf_id(out)] = var
 
         for spec in specs:
@@ -1216,23 +1359,63 @@ class SpyreTritonKernel(SpyreKernel):
             in_var = up_var
         red_var = _fresh()
         body.writeline(f"{red_var} = tl.sum({in_var}, {axis})")
+
+        # Shape of the tile after tl.sum drops ``axis``, vs. the output block
+        # shape (which may add/remove unit axes relative to the reduced input).
+        in_block = block_of[in_slot]
+        reduced_shape = [s for k, s in enumerate(in_block) if k != axis]
+
+        # Inter-core reduce: when the reduced axis is work-divided, ``red_var``
+        # is only this core's partial sum over its shard.  Combine the partials
+        # across the cooperating group via the HW reduce ring *before* the
+        # downcast (the ring / KTIR reduce accumulate in fp32; summing fp16
+        # partials would lose precision).  ``tl.inter_tile`` needs a unit leading
+        # dim and returns rank-1-lower, so reshape ``[*reduced_shape]`` ->
+        # ``[1, *reduced_shape]``, reduce, and the result carries
+        # ``reduced_shape`` again.  ``axis=`` is the reduced symbol (the dim that
+        # varies *within* a group -- ``LowerInterTile`` groups tiles agreeing on
+        # every other slice index and sums over this one).
+        #
+        # Mode is ``all_reduce`` (not ``reduce_to_one``): every core in the group
+        # becomes a consumer and receives the combined sum, so the downcast /
+        # reshape / store that follow run on a *defined* value on every core (a
+        # ``reduce_to_one`` result is delivered only to the slice-0 shard, so the
+        # others would carry an unbound tile -- see ktir-cpu ``ReduceBackend``,
+        # which returns ``None`` to non-consumers).  Since every core then holds
+        # the same output, the store is still pick0-guarded on the reduced symbol
+        # so exactly one core per group writes (dedup, not correctness).
+        split_reduced = self._reduced_split_syms(spec)
+        pick0_axis: str | None = None
+        if split_reduced:
+            reduced_name = str(split_reduced[0])
+            shape_str = ", ".join(str(s) for s in reduced_shape)
+            body.writeline(
+                f"# {reduced_name} is the split reduction axis (varies within a "
+                "cooperating inter-tile group)."
+            )
+            part_var = _fresh()
+            body.writeline(f"{part_var} = tl.reshape({red_var}, [1, {shape_str}])")
+            ring_var = _fresh()
+            body.writeline(
+                f'{ring_var} = tl.inter_tile({part_var}, axis="{reduced_name}", '
+                'combiner="add", mode="all_reduce", work_slices=work_slices)'
+            )
+            red_var = ring_var
+            pick0_axis = reduced_name
+
         if tl_ty:
             down_var = _fresh()
             body.writeline(f"{down_var} = {red_var}.to({tl_ty})")
             red_var = down_var
         out_var = red_var
 
-        # Shape of the tile after tl.sum drops ``axis``, vs. the output block
-        # shape (which may add/remove unit axes relative to the reduced input).
-        in_block = block_of[in_slot]
-        reduced_shape = [s for k, s in enumerate(in_block) if k != axis]
         out_slot = self._slot(out)
         out_block = block_of.get(out_slot) if out_slot >= 0 else None
         if out_block is not None and out_block != reduced_shape:
             _check_reshape_is_order_preserving(in_arg, out, axis, in_block, out_block)
             out_var = _fresh()
             body.writeline(f"{out_var} = tl.reshape({red_var}, {out_block})")
-        _store(out, out_var)
+        _store(out, out_var, pick0_axis=pick0_axis)
 
     def _emit_matmul(
         self,
@@ -1291,9 +1474,60 @@ class SpyreTritonKernel(SpyreKernel):
 
         out_slot = self._slot(out)
         out_block = [block_of[out_slot][p] for p in perm_of[out_slot]]
+
+        # Inter-core reduce: when the contraction dim K is work-divided, each
+        # core's ``tl.dot`` is only a partial over its K-shard.  Combine the
+        # partials across the cooperating group via the HW reduce ring *before*
+        # the downcast (the ring / KTIR reduce accumulate in fp32; summing fp16
+        # partials loses precision).  The dot result is ``[batch?, M, N]``;
+        # ``tl.inter_tile`` needs a unit leading dim and returns rank-1-lower, so
+        # reshape to ``[1, batch?, M, N]``, reduce over K, and the result carries
+        # ``[batch?, M, N]`` again.  ``axis=`` is the K symbol (the dim that
+        # varies *within* a cooperating group -- ``LowerInterTile`` groups tiles
+        # agreeing on every other slice index and sums over this one).  Mode is
+        # ``all_reduce`` (not ``reduce_to_one``): every core becomes a consumer
+        # and receives the combined result, so the downcast / reshape / store
+        # that follow run on a *defined* value on every core (a ``reduce_to_one``
+        # result is delivered only to the slice-0 shard -- see ktir-cpu
+        # ``ReduceBackend``, which returns ``None`` to non-consumers).  The store
+        # is then pick0-guarded on K so exactly one core per group writes (dedup,
+        # not correctness).
+        k_sym = self._matmul_split_k_sym(spec)
+        pick0_axis: str | None = None
+        if k_sym is not None:
+            # ``tl.dot`` output shape ``[batch?, M, N]``: the trailing out-block
+            # sticks collapse to the single matrix column dim N.
+            n_total = 1
+            for s in out_block[n_batch + 1 :]:
+                n_total *= s
+            dot_shape = out_block[: n_batch + 1] + [n_total]
+            tl_ty = _LOW_PREC_FLOAT_FORMATS.get(out.device_dtype)
+            if tl_ty:
+                up_var = _fresh()
+                body.writeline(f"{up_var} = {dot_var}.to(tl.float32)")
+                dot_var = up_var
+            body.writeline(
+                f"# {k_sym} is the split contraction axis (varies within a "
+                "cooperating inter-tile group)."
+            )
+            shape_str = ", ".join(str(s) for s in dot_shape)
+            part_var = _fresh()
+            body.writeline(f"{part_var} = tl.reshape({dot_var}, [1, {shape_str}])")
+            ring_var = _fresh()
+            body.writeline(
+                f'{ring_var} = tl.inter_tile({part_var}, axis="{k_sym}", '
+                'combiner="add", mode="all_reduce", work_slices=work_slices)'
+            )
+            dot_var = ring_var
+            if tl_ty:
+                down_var = _fresh()
+                body.writeline(f"{down_var} = {dot_var}.to({tl_ty})")
+                dot_var = down_var
+            pick0_axis = k_sym
+
         out_var = _fresh()
         body.writeline(f"{out_var} = tl.reshape({dot_var}, {out_block})")
-        _store(out, out_var)
+        _store(out, out_var, pick0_axis=pick0_axis)
 
     def _emit_restickify(
         self,
@@ -1398,19 +1632,26 @@ class SpyreTritonKernel(SpyreKernel):
 
     # -- preamble -----------------------------------------------------------
 
-    def _emit_header(self, grid: int, used: list[int]) -> str:
-        """Imports + ``@triton.jit`` decorator preamble.
+    def _emit_header(
+        self, grid: int, used: list[int], module_preamble: str = ""
+    ) -> str:
+        """Imports + optional module-level preamble + ``@triton.jit`` decorator.
 
         A ``@triton_heuristics.fixed_config`` decorator (with real
         ``triton_meta`` restricted to this group's ``used`` args) is attempted so
         ``output_code.py`` is structurally a Spyre Triton kernel; if any metadata
         helper is unavailable it falls back to a plain ``@triton.jit`` so source
         is always emitted (execution may still fail at ``.run`` — expected for
-        this source-only cut).
+        this source-only cut).  ``module_preamble`` (e.g. the inter-core ring's
+        ``work_slices`` constexpr) is emitted at module scope after the imports
+        and before the decorator, which must stay adjacent to ``def``.
         """
         buf = IndentedBuffer()
         buf.splice(TritonKernel.gen_common_triton_imports())
         buf.writeline("")
+        if module_preamble:
+            buf.writeline(module_preamble)
+            buf.writeline("")
         decorator = self._fixed_config_decorator(grid, used)
         if decorator is not None:
             buf.splice(decorator)
