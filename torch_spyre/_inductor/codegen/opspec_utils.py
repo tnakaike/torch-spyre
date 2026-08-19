@@ -578,18 +578,22 @@ def _device_block_shape(
     In a counted loop, a full-size operand's ``device_size`` on the tiled dim
     spans the whole tensor (``count`` tiles), but each iteration loads only
     one tile, so that dim is first divided by ``count``.  An operand that does
-    *not* advance per iteration -- a ``per_tile_fixed`` scratch tile or a
+    *not* advance per iteration -- a per-tile-fixed scratch tile or a
     register-threaded intermediate whose ``device_size`` is already per-tile --
     carries no ``device_tile_advance_expr`` and holds one tile already, so it is
     left alone.  ``device_tile_advance_expr is not None`` is the precise signal
     (post-WSR ``tiled_symbols`` name minted symbols, so ``per_tile_fixed`` alone
     no longer distinguishes a full-size operand from a per-tile pool).
 
-    TODO(consolidate): the per-core divisor math here overlaps
-    ``per_core_extent`` above; a later cleanup could delegate the divisor step
-    to it, leaving this helper to add only the counted-loop ``loop_ctx`` layer.
-    Kept standalone in the forward-port to preserve the generator's exact
-    (test-verified) behavior.
+    The per-dim divisor math mirrors ``per_core_extent`` above, but this stays
+    standalone on purpose: it must accept the ``IndirectAccess`` coordinate a
+    gather value arg carries, whereas ``per_core_extent`` classifies every
+    coordinate through ``_dim_info``, which rejects any non-bare / non-stick
+    form by design (an indirect axis is not an ordinary work-divisible device
+    axis; here it falls out as divisor 1, since ``IndirectAccess``'s free symbol
+    is the index *tensor name*, never an iteration symbol).  TODO(consolidate):
+    fold this into ``per_core_extent`` once indirect work-division is designed
+    upstream -- at that point this collapses to a thin ``count``-layer wrapper.
     """
     device_size = [int(s) for s in arg.device_size]
     coords = arg.device_coordinates
@@ -747,10 +751,14 @@ def _reduction_axes(in_arg: TensorArg, out_arg: TensorArg) -> tuple[set, list[in
     reduction (``dim=1``) spreads it across the outer-stick and within-stick
     axes (two axes) -> not yet supported (needs a ``sum_stick`` primitive).
 
-    TODO(consolidate): overlaps main's public ``reduced_axes`` (which returns
-    reduced / placeholder *axis indices* via ``_dim_info`` coordinate matching);
-    this returns the reduced-*symbol* set that ``_outer_stick_reduce_axes``
-    needs, so it is kept distinct for the forward-port.
+    Distinct from the public ``reduced_axes`` by design, not duplication:
+    ``reduced_axes`` returns reduced / placeholder *axis indices* under the
+    projection convention (the output keeps each reduced axis as a unit-extent
+    placeholder, same rank as the input) and raises on a permuted or resized
+    surviving axis; this returns the reduced-*symbol set* from a free-symbol
+    difference, which ``_outer_stick_reduce_axes`` needs to split the reduced
+    axes into their outer-stick and within-stick halves and is robust to
+    whether the output carries the placeholder or drops it.
     """
     out_syms: set = set()
     for coord in out_arg.device_coordinates:
