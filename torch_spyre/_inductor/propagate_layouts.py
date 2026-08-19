@@ -66,6 +66,7 @@ from .constants import (
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
+    DOT_REDUCTION_OP,
     ELIDED_COPY_BACK_ATTR,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
@@ -2049,6 +2050,7 @@ def compute_layouts(
     if isinstance(data, Reduction) and data.reduction_type in [
         BATCH_MATMUL_OP,
         BATCH_MATMUL_FP8_OP,
+        DOT_REDUCTION_OP,
     ]:
         return _matmul_layouts(op, output, output_dep, args)
 

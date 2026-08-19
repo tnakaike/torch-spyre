@@ -27,6 +27,7 @@ registry; Spyre never mutates the global table.
 
 import dataclasses
 import math
+import os
 import threading
 from typing import Any, Callable, Optional, Sequence, Union
 
@@ -54,6 +55,25 @@ from torch_spyre._C import DataFormats, get_device_dtype, get_elem_in_stick
 import torch_spyre._inductor.customops  # noqa: F401
 
 logger = get_inductor_logger("decompositions")
+
+
+def _is_ktir_path() -> bool:
+    """True when an OpSpec-based backend (Triton source generator or KTIR
+    emitter) is selected.
+
+    The OpSpec backends cannot consume the SDSC fused hardware ops
+    (``spyre.exx2`` / ``layernormscale`` / ``layernormnorm``) nor the
+    ``mean`` / ``welford`` reduction kinds.  When either backend is active we
+    decompose normalization ops into sum-based + pointwise primitives that the
+    generators can emit.  Otherwise the original SDSC forms are kept.
+
+    TODO(consolidate): fold this env-gate check into ``config.py`` (alongside
+    ``config.ktir_emitter``) so the OpSpec-backend predicate lives in one place
+    rather than being re-derived from ``os.getenv`` here and in ``passes.py``.
+    """
+    return (
+        os.getenv("TORCH_SPYRE_TRITON") == "1" or os.getenv("TORCH_SPYRE_KTIR") == "1"
+    )
 
 
 _SDPA_MAX_SEQUENCE_TILE_SIZE = 512
@@ -1653,7 +1673,14 @@ def spyre_rms_norm(
             f"got device={input.device.type}, normalized_shape={normalized_shape}"
         )
 
-    mean = torch.mean(input * input, dim=-1, keepdim=True)
+    if _is_ktir_path():
+        # OpSpec backends cannot emit the fused ``mean`` reduction kind, so
+        # express the mean as an explicit ``sum`` reduction plus a pointwise
+        # divide.
+        n = normalized_shape[0]
+        mean = torch.sum(input * input, dim=-1, keepdim=True) / n
+    else:
+        mean = torch.mean(input * input, dim=-1, keepdim=True)
     rsqrt_inp = torch.rsqrt(mean + eps)
     output = input * rsqrt_inp
     if weight is not None:
@@ -1680,9 +1707,49 @@ def spyre_layer_norm(
         weight = input.new_ones(normalized_shape)
     if bias is None:
         bias = input.new_zeros(normalized_shape)
+    if _is_ktir_path():
+        # OpSpec backends cannot emit the fused SDSC ops
+        # (exx2 / layernormscale / layernormnorm), so express layer norm with
+        # explicit sum-based reductions plus pointwise ops.
+        n = normalized_shape[0]
+        mean = torch.sum(input, dim=-1, keepdim=True) / n
+        centered = input - mean
+        var = torch.sum(centered * centered, dim=-1, keepdim=True) / n
+        rstd = torch.rsqrt(var + eps)
+        return centered * rstd * weight + bias
     mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
     norm_mean = torch.ops.spyre.layernormscale(mean, eps)
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
+
+
+def spyre_var_mean(input, dim=None, *, correction=None, keepdim=False):
+    """Sum-based ``var_mean`` for the OpSpec backends.
+
+    Splits ``var_mean`` into two single-output ``sum`` reductions plus
+    pointwise ops so the OpSpec generators need not emit the fused
+    ``welford`` reduction kind.
+    """
+    if correction is None:
+        correction = 1
+    dims = list(range(input.dim())) if dim is None else list(dim)
+    n = 1
+    for d in dims:
+        n *= input.size(d)
+    mean = torch.sum(input, dim=dims, keepdim=True) / n
+    centered = input - mean
+    var = torch.sum(centered * centered, dim=dims, keepdim=True) / (n - correction)
+    if not keepdim:
+        var = torch.squeeze(var, tuple(dims))
+        mean = torch.squeeze(mean, tuple(dims))
+    return var, mean
+
+
+# ``var_mean`` is only intercepted for the OpSpec backends; the SDSC path keeps
+# PyTorch's default handling untouched.
+if _is_ktir_path():
+    spyre_var_mean = register_spyre_decompositions(
+        [torch.ops.aten.var_mean.correction]
+    )(spyre_var_mean)
 
 
 @register_spyre_decompositions([torch.ops.aten.silu.default])

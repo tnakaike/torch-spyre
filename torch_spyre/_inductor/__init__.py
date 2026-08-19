@@ -232,14 +232,34 @@ def _autoload():
             device=DEVICE_NAME, device_op_overrides=SpyreDeviceOpOverrides()
         )
 
-        from .scheduler import SuperDSCScheduling
         from .wrapper import SpyrePythonWrapperCodegen
 
-        register_backend_for_device(
-            DEVICE_NAME,
-            SuperDSCScheduling,
-            SpyrePythonWrapperCodegen,
-            device_custom_config=config,
-        )
+        import os
+
+        if os.getenv("TORCH_SPYRE_TRITON") == "1":
+            # OpSpec -> Triton *source generator* path.  Reuses the SDSC
+            # frontend and projects the finished op_specs to Triton source.
+            # (KTIR direct emission stays gated by config.ktir_emitter inside
+            # the SuperDSC scheduling backend below.)
+            from torch_spyre._triton_kernel import (
+                SpyreTritonScheduling,
+                SpyreTritonPythonWrapperCodegen,
+            )
+
+            register_backend_for_device(
+                DEVICE_NAME,
+                SpyreTritonScheduling,
+                SpyreTritonPythonWrapperCodegen,
+                device_custom_config=config,
+            )
+        else:
+            from .scheduler import SuperDSCScheduling
+
+            register_backend_for_device(
+                DEVICE_NAME,
+                SuperDSCScheduling,
+                SpyrePythonWrapperCodegen,
+                device_custom_config=config,
+            )
 
         _autoload._ran = True
