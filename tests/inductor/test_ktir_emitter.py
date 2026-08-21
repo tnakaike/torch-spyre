@@ -499,10 +499,11 @@ module {
 class TestOpaqueEmission(unittest.TestCase):
     """A unary ``spyreop`` intrinsic (``sqrt``) over the whole [16, 512, 64] tile.
 
-    The one emission shape the ``OPAQUE`` family adds is a ``linalg.generic``
-    whose body is a single ``spyreop`` scalar op: identity ``indexing_maps``,
-    all-``parallel`` iterators, and a ``^bb0`` that applies the intrinsic and
-    ``linalg.yield``s it.  The intrinsic owns its own f16->f32->approx->f16, so
+    A ``spyreop`` intrinsic emits the same one pointwise shape as every other
+    pointwise op: a ``linalg.generic`` whose body is a single ``spyreop`` scalar
+    op (the payload), with identity ``indexing_maps``, all-``parallel``
+    iterators, and a ``^bb0`` that applies the intrinsic and ``linalg.yield``s
+    it.  The intrinsic owns its own f16->f32->approx->f16, so
     there is no fp32 precision bracket (dataflow-scheduler#36).  The dataflow
     either side of the compute -- view, tile, load, store -- is exactly the
     pointwise form; only the compute lines differ from ``EXPECTED_ADD_KTIR``.
