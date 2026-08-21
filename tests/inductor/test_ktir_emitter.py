@@ -66,7 +66,11 @@ module {
     %5 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %6 = ktdp.load %5 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %7 = tensor.empty() : tensor<16x512x64xf16>
-    %8 = linalg.add ins(%4, %6 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%7 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %8 = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%4, %6 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%7 : tensor<16x512x64xf16>) {
+    ^bb0(%in: f16, %in_0: f16, %out: f16):
+      %10 = arith.addf %in, %in_0 : f16
+      linalg.yield %10 : f16
+    } -> tensor<16x512x64xf16>
     %9 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     ktdp.store %8, %9 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
@@ -81,19 +85,20 @@ module {
         self.assertEqual(emitted, self.EXPECTED_ADD_KTIR)
 
     def test_registered_ops_reach_their_own_binding(self):
-        """A second op costs one recipe: same shape, different linalg builder.
+        """A second op costs one recipe: same shape, different payload builder.
 
-        Asserted as a delta against the golden rather than a second copy of it --
-        only the compute line differs.
+        Asserted as a delta against the golden rather than a second copy of it.
+        The emission is one shape for every pointwise op, so the delta is the
+        body's single line -- the generic's maps, iterators and operands do not
+        move.
         """
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir("ktir_fused_mul_0", [make_op_spec("mul")])
-        self.assertIn("linalg.mul ins(", emitted)
-        self.assertNotIn("linalg.add", emitted)
-        # Everything either side of the compute op is unchanged by the op name.
+        self.assertIn("arith.mulf", emitted)
+        self.assertNotIn("arith.addf", emitted)
         self.assertEqual(
-            emitted.replace("linalg.mul", "linalg.add").replace(
+            emitted.replace("arith.mulf", "arith.addf").replace(
                 "@ktir_fused_mul_0", "@ktir_fused_add_0"
             ),
             self.EXPECTED_ADD_KTIR,
@@ -165,11 +170,19 @@ module {
     %6 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %7 = ktdp.load %6 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %8 = tensor.empty() : tensor<16x512x64xf16>
-    %9 = linalg.add ins(%5, %7 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%8 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %9 = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%5, %7 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%8 : tensor<16x512x64xf16>) {
+    ^bb0(%in: f16, %in_0: f16, %out: f16):
+      %15 = arith.addf %in, %in_0 : f16
+      linalg.yield %15 : f16
+    } -> tensor<16x512x64xf16>
     %10 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %11 = ktdp.load %10 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %12 = tensor.empty() : tensor<16x512x64xf16>
-    %13 = linalg.mul ins(%9, %11 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%12 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %13 = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%9, %11 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%12 : tensor<16x512x64xf16>) {
+    ^bb0(%in: f16, %in_0: f16, %out: f16):
+      %15 = arith.mulf %in, %in_0 : f16
+      linalg.yield %15 : f16
+    } -> tensor<16x512x64xf16>
     %14 = ktdp.construct_access_tile %3[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     ktdp.store %13, %14 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
@@ -200,9 +213,12 @@ module {
         self.assertEqual(emitted.count("ktdp.load"), 3)  # a, b, c -- not buf0
         self.assertEqual(emitted.count("ktdp.store"), 1)  # buf1 only
         self.assertEqual(emitted.count("ktdp.construct_memory_view"), 4)
-        [add] = [ln for ln in emitted.splitlines() if "linalg.add ins(" in ln]
-        [mul] = [ln for ln in emitted.splitlines() if "linalg.mul ins(" in ln]
-        self.assertIn(f"ins({add.split('=')[0].strip()},", mul)
+        # The threading itself: the second generic's first operand is the first
+        # generic's result, so buf0 never becomes a view or a load.
+        generics = [ln for ln in emitted.splitlines() if "linalg.generic" in ln]
+        self.assertEqual(len(generics), 2)
+        threaded = generics[0].split("=")[0].strip()
+        self.assertIn(f"ins({threaded},", generics[1])
 
 
 @unittest.skipUnless(
@@ -238,7 +254,11 @@ module {
     %8 = ktdp.construct_access_tile %2[%c0, %7, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
     %9 = ktdp.load %8 : <16x16x64xindex> -> tensor<16x16x64xf16>
     %10 = tensor.empty() : tensor<16x16x64xf16>
-    %11 = linalg.add ins(%6, %9 : tensor<16x16x64xf16>, tensor<16x16x64xf16>) outs(%10 : tensor<16x16x64xf16>) -> tensor<16x16x64xf16>
+    %11 = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%6, %9 : tensor<16x16x64xf16>, tensor<16x16x64xf16>) outs(%10 : tensor<16x16x64xf16>) {
+    ^bb0(%in: f16, %in_2: f16, %out: f16):
+      %14 = arith.addf %in, %in_2 : f16
+      linalg.yield %14 : f16
+    } -> tensor<16x16x64xf16>
     %c16_1 = arith.constant 16 : index
     %12 = arith.muli %0, %c16_1 : index
     %13 = ktdp.construct_access_tile %3[%c0, %12, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
@@ -404,7 +424,11 @@ module {
         %5 = ktdp.construct_access_tile %1[%arg3, %arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x256x64xf16> -> !ktdp.access_tile<1x1x64xindex>
         %6 = ktdp.load %5 : <1x1x64xindex> -> tensor<1x1x64xf16>
         %7 = tensor.empty() : tensor<1x1x64xf16>
-        %8 = linalg.add ins(%4, %6 : tensor<1x1x64xf16>, tensor<1x1x64xf16>) outs(%7 : tensor<1x1x64xf16>) -> tensor<1x1x64xf16>
+        %8 = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%4, %6 : tensor<1x1x64xf16>, tensor<1x1x64xf16>) outs(%7 : tensor<1x1x64xf16>) {
+        ^bb0(%in: f16, %in_3: f16, %out: f16):
+          %10 = arith.addf %in, %in_3 : f16
+          linalg.yield %10 : f16
+        } -> tensor<1x1x64xf16>
         %9 = ktdp.construct_access_tile %2[%arg3, %arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x256x64xf16> -> !ktdp.access_tile<1x1x64xindex>
         ktdp.store %8, %9 : tensor<1x1x64xf16>, <1x1x64xindex>
       }

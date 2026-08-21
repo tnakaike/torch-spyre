@@ -1161,26 +1161,22 @@ class Family(enum.Enum):
 
     ELEMENTWISE = enum.auto()
     REDUCTION = enum.auto()
-    OPAQUE = enum.auto()
 
     @classmethod
     def of(cls, spec: OpSpec) -> Family:
-        """The family ``spec`` asks for.
+        """The family ``spec`` asks for, read from the spec and nothing else.
 
-        The reduction-vs-pointwise choice is the spec's, read from
-        ``is_reduction`` rather than the op name: the same binding (``arith.addf``)
-        is a pointwise ``add`` or the combiner of a ``sum``.  Within the pointwise
-        shapes, ELEMENTWISE (a ``linalg`` named op) vs OPAQUE (a ``linalg.generic``
-        whose body is a single ``spyreop`` scalar intrinsic) is instead a property
-        of the op -- ``sqrt`` is never anything but opaque -- so it is read from
-        the recipe.
+        The choice is reduction-vs-pointwise, and it is the spec's, taken from
+        ``is_reduction`` rather than from the op name: one binding
+        (``arith.addf``) is a pointwise ``add`` or the combiner of a ``sum``.
+
+        *How* to build the payload is not a second family: every op's payload is
+        a scalar builder that goes in a region, so ``linalg.add`` and
+        ``spyreop.sqrt`` reach the same emission.  That keeps this a pure
+        function of the spec, which is what lets the recipe-vs-spec check in
+        ``_compute_step`` mean something.
         """
-        if spec.is_reduction:
-            return cls.REDUCTION
-        recipe = KtirBuilder.RECIPES.get(spec.op)
-        if recipe is not None and recipe.family is cls.OPAQUE:
-            return cls.OPAQUE
-        return cls.ELEMENTWISE
+        return cls.REDUCTION if spec.is_reduction else cls.ELEMENTWISE
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1580,34 +1576,40 @@ class KtirBuilder:
     #
     # A repeated key here is ruff F601, so an op cannot be declared twice.
     RECIPES: ClassVar[dict[str, Recipe]] = {
-        "add": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: linalg.add),
-        "mul": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: linalg.mul),
+        # Every binding is a *scalar* builder: what goes in the payload region,
+        # not a whole-op builder.  ``arith.addf`` is the pointwise add's payload
+        # and the sum's combiner -- the same function in both families.
+        "add": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: arith.addf),
+        "mul": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: arith.mulf),
         "sum": Recipe(arity=1, family=Family.REDUCTION, binding=lambda: arith.addf),
-        # Opaque unary ops: each maps directly to one ``spyreop`` scalar
-        # intrinsic, emitted as the body of a ``linalg.generic`` (see ``opaque``).
-        # The intrinsic owns its own f16->f32->approx->f16, so there is no fp32
-        # bracket.  Only the unary ``spyreop`` float ops live here; the
+        # Unary ops whose payload is one ``spyreop`` scalar intrinsic rather than
+        # an ``arith`` op.  That is the only difference from ``add``/``mul``: same
+        # family, same emission, different payload builder.  The intrinsic owns
+        # its own f16->f32->approx->f16, so there is no fp32 bracket.  The
         # pointwise-handler name is the key, the ``spyreop`` op the binding (they
         # differ for ``gelufwd`` -> ``spyreop.gelu``).  ``softplus`` also carries
-        # two scalar attributes, read from its ``op_info`` by ``attrs``.  Binary
-        # ops (realdiv) do not fit this unary shape yet, and ops with no
-        # ``spyreop`` equivalent (log, rsqrt, tanh, erf, silu, relufwd) are not
+        # two scalar attributes, read from its ``op_info`` by ``attrs``.  Ops with
+        # no ``spyreop`` equivalent (log, rsqrt, tanh, erf, silu, relufwd) are not
         # supported on this path.
-        "exp": Recipe(arity=1, family=Family.OPAQUE, binding=lambda: spyreop.exp),
-        "sqrt": Recipe(arity=1, family=Family.OPAQUE, binding=lambda: spyreop.sqrt),
+        "exp": Recipe(arity=1, family=Family.ELEMENTWISE, binding=lambda: spyreop.exp),
+        "sqrt": Recipe(
+            arity=1, family=Family.ELEMENTWISE, binding=lambda: spyreop.sqrt
+        ),
         "sigmoid": Recipe(
-            arity=1, family=Family.OPAQUE, binding=lambda: spyreop.sigmoid
+            arity=1, family=Family.ELEMENTWISE, binding=lambda: spyreop.sigmoid
         ),
         "reciprocal": Recipe(
-            arity=1, family=Family.OPAQUE, binding=lambda: spyreop.reciprocal
+            arity=1, family=Family.ELEMENTWISE, binding=lambda: spyreop.reciprocal
         ),
-        "gelufwd": Recipe(arity=1, family=Family.OPAQUE, binding=lambda: spyreop.gelu),
+        "gelufwd": Recipe(
+            arity=1, family=Family.ELEMENTWISE, binding=lambda: spyreop.gelu
+        ),
         "layernormscale": Recipe(
-            arity=1, family=Family.OPAQUE, binding=lambda: spyreop.layernormscale
+            arity=1, family=Family.ELEMENTWISE, binding=lambda: spyreop.layernormscale
         ),
         "softplus": Recipe(
             arity=1,
-            family=Family.OPAQUE,
+            family=Family.ELEMENTWISE,
             binding=lambda: spyreop.softplus,
             attrs=lambda info: {
                 "beta": float(info["constants"]["softplusBeta"]),
@@ -1617,64 +1619,51 @@ class KtirBuilder:
     }
 
     def elementwise(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
-        """Apply ``recipe``'s builder to ``ins``, shaped by the result's tile.
+        """``recipe``'s scalar payload in an all-parallel ``linalg.generic``.
 
-        Returns the result value; what becomes of it is the caller's decision.
-        Every operand and the result share the result tile's extents.
+        One shape for every pointwise op, whatever its payload is: identity
+        ``indexing_maps`` and ``"parallel"`` iterators, so the generic walks every
+        element once and the body computes one output element from one element of
+        each operand.  Every operand and the result share the result tile's
+        extents and element type.
 
-        The destination is an uninitialised ``tensor.empty``, valid because an
-        elementwise op writes every element of it.
-        """
-        extents = list(step.out.extent)
-        elt_t = self.named_type(step.out.elems.value)
-        dest = self.val(tensor.EmptyOp(extents, elt_t))
-        return recipe.binding()(
-            *ins,
-            outs=[dest],
-            result_tensors=[ir.RankedTensorType.get(extents, elt_t)],
-        )
+        A ``linalg`` named op is not used even where one exists (``linalg.add``),
+        because the consumer generalizes named ops to exactly this form anyway --
+        ``ConstructThreeStagePipeline`` runs ``mlir::linalg::generalizeNamedOp``
+        over them -- and emitting it directly is byte-for-byte identical in the
+        compiled binary.  One shape means an op that has no named equivalent
+        (``spyreop.sqrt``) is not a second emission path, only a second payload.
 
-    def opaque(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
-        """A unary ``spyreop`` scalar intrinsic as a ``linalg.generic`` body.
-
-        The op maps to one ``spyreop`` intrinsic (``recipe.binding()``), emitted
-        as the single-op body of an all-parallel ``linalg.generic`` over the
-        result tile: identity ``indexing_maps`` and ``"parallel"`` iterators, so
-        the generic walks every element once and the body computes one output
-        from one input.  The intrinsic owns its own f16->f32->approx->f16, so
-        there is no fp32 precision bracket (dataflow-scheduler#36); the operand,
-        the body value and the result all share the result tile's element type
-        and extents.
-
-        Any scalar attributes the intrinsic takes beyond its operand
-        (softplus's ``beta``/``threshold``) ride on ``step.attrs``, read from the
-        spec's ``op_info`` when the step was planned, and are passed through as
-        keyword arguments to the builder.
+        Any scalar attributes the payload takes beyond its operands (softplus's
+        ``beta``/``threshold``) ride on ``step.attrs``, read from the spec's
+        ``op_info`` when the step was planned, and are passed through as keyword
+        arguments.
 
         The destination is an uninitialised ``tensor.empty``, valid because the
-        generic writes every element of it (the mirror of ``elementwise``).
+        generic writes every element of it.  Returns the result value; what
+        becomes of it is the caller's decision.
         """
-        [source] = ins
         extents = list(step.out.extent)
         elt_t = self.named_type(step.out.elems.value)
         dest = self.val(tensor.EmptyOp(extents, elt_t))
         identity = ir.AffineMap.get_identity(len(extents))
-        intrinsic = recipe.binding()
+        payload = recipe.binding()
         attrs = dict(step.attrs)
+        arity = len(ins)
 
         # ``linalg.generic`` is a region op: the decorated function's return is
-        # yielded as the body terminator, and the block arguments (one per input,
-        # one per output; ``out`` is the unwritten accumulator) arrive
-        # positionally.  The decorator evaluates here and binds the op's single
-        # result value to ``body``.
+        # yielded as the body terminator, and the block arguments arrive
+        # positionally -- one per input, then the output (the unwritten
+        # accumulator, which a pointwise body ignores).  The decorator evaluates
+        # here and binds the op's single result value to ``body``.
         @linalg.generic(
-            inputs=[source],
+            inputs=list(ins),
             outputs=[dest],
-            indexing_maps=[identity, identity],
+            indexing_maps=[identity] * (arity + 1),
             iterator_types=["parallel"] * len(extents),
         )
-        def body(in_, out_):
-            return intrinsic(in_, **attrs)
+        def body(*args):
+            return payload(*args[:arity], **attrs)
 
         return body
 
