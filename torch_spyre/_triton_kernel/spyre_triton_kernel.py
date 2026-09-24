@@ -77,6 +77,7 @@ only holds within a single kernel.
 
 import dataclasses
 import os
+from collections.abc import Sequence
 
 import sympy
 import torch
@@ -86,7 +87,7 @@ from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import FloorDiv
 
 from torch_spyre._C import DataFormats
-from torch_spyre._inductor import constants
+from torch_spyre._inductor import config, constants
 from torch_spyre._inductor.codegen.opspec_utils import (
     _check_reshape_is_order_preserving,
     _device_block_shape,
@@ -102,8 +103,10 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _restickify_plan,
     _size_hint,
     align_reshape_plan,
+    ArgLayout,
     buf_id,
     coarse_loop_subs,
+    logical_layout_plan,
     row_major_strides,
 )
 from torch_spyre._inductor.constants import IDENTITY_OP
@@ -287,6 +290,24 @@ def _arg_free_symbols(arg: TensorArg) -> set:
 def _coord_str(coord: sympy.Expr) -> str:
     """Render a device coordinate expression as Triton scalar-index source."""
     return texpr(_normalize_floor_div(coord))
+
+
+def _layout_arg_str(entries: Sequence[int | tuple[int, str, int]]) -> str:
+    """Render a ``tl.spyre_tensor_layout`` entry list as Triton source.
+
+    One entry per physical dim: a bare ``int`` for an identity dim, and a
+    ``(src, "op", arg)`` tuple for a split half.  Rendered by hand rather than
+    with ``repr`` so the op keyword is double-quoted to match the fixtures and
+    the file's own style.
+    """
+    parts = []
+    for entry in entries:
+        if isinstance(entry, tuple):
+            src, op, arg = entry
+            parts.append(f'({int(src)}, "{op}", {int(arg)})')
+        else:
+            parts.append(str(int(entry)))
+    return "[" + ", ".join(parts) + "]"
 
 
 class SpyreTritonKernel(SpyreKernel):
@@ -908,6 +929,24 @@ class SpyreTritonKernel(SpyreKernel):
             _idx, value_arg, _out, _k, _row = _gather_operands(group[0])
             dim_skip = {self._slot(value_arg)}
 
+        # Logical descriptors + a tl.spyre_tensor_layout marker, when opted in and
+        # the group is expressible that way.  One decision for the whole group:
+        # annotating some descriptors and not others is refused downstream, and a
+        # None plan means every descriptor keeps the physical form.  The
+        # permutation cases are excluded here rather than in the predicate because
+        # a permuted descriptor is a transpose of the physical buffer, which has
+        # no logical spelling.
+        layout_of = None
+        if (
+            config.triton_logical_descriptors
+            and not is_matmul
+            and not is_gather
+            and not inter_core_reduce
+        ):
+            layout_of = logical_layout_plan(
+                group, tensor_args, it_space, divisor_of, loop_ctx
+            )
+
         # Build the body at column 0; buf.indent() re-indents it under `def`.
         # Program-id bases and descriptors are loop-invariant (they address the
         # full HBM buffer), so they stay above the loop; only the device-dim
@@ -915,22 +954,30 @@ class SpyreTritonKernel(SpyreKernel):
         body = IndentedBuffer()
         self._emit_logical_offsets(body, it_space)
         if loop_ctx is None:
-            dims_of = self._emit_dim_vars(body, tensor_args, None, perm_of, dim_skip)
+            if layout_of is not None:
+                dims_of = self._logical_offsets_of(tensor_args, layout_of, None)
+            else:
+                dims_of = self._emit_dim_vars(
+                    body, tensor_args, None, perm_of, dim_skip
+                )
             desc_of = self._emit_descriptors(
-                body, tensor_args, param_names, block_of, perm_of
+                body, tensor_args, param_names, block_of, perm_of, layout_of
             )
             self._emit_ops(
                 body, group, desc_of, dims_of, block_of, perm_of, block_by_buf
             )
         else:
             desc_of = self._emit_descriptors(
-                body, tensor_args, param_names, block_of, perm_of
+                body, tensor_args, param_names, block_of, perm_of, layout_of
             )
             body.writeline(f"for {loop_ctx.var} in range({loop_ctx.count}):")
             with body.indent():
-                dims_of = self._emit_dim_vars(
-                    body, tensor_args, loop_ctx, perm_of, dim_skip
-                )
+                if layout_of is not None:
+                    dims_of = self._logical_offsets_of(tensor_args, layout_of, loop_ctx)
+                else:
+                    dims_of = self._emit_dim_vars(
+                        body, tensor_args, loop_ctx, perm_of, dim_skip
+                    )
                 self._emit_ops(
                     body, group, desc_of, dims_of, block_of, perm_of, block_by_buf
                 )
@@ -944,6 +991,16 @@ class SpyreTritonKernel(SpyreKernel):
         if inter_core_reduce:
             module_preamble = (
                 f"work_slices = tl.constexpr({self._work_slices(it_space)!r})"
+            )
+        if layout_of is not None:
+            # One ``_layout_<arg>`` constexpr per annotated descriptor, for the
+            # same reason work_slices is baked this way.
+            module_preamble = "\n".join(
+                [module_preamble] * bool(module_preamble)
+                + [
+                    f"_layout_{i} = tl.constexpr({_layout_arg_str(lay.entries)})"
+                    for i, lay in sorted(layout_of.items())
+                ]
             )
         header = self._emit_header(grid, used, module_preamble)
         buf = IndentedBuffer()
@@ -1027,6 +1084,42 @@ class SpyreTritonKernel(SpyreKernel):
         for sym in it_space:
             body.writeline(f"{sym} = {bases.get(sym, '0')}")
 
+    def _logical_offsets_of(
+        self,
+        tensor_args: dict[int, TensorArg],
+        layout_of: "dict[int, ArgLayout]",
+        loop_ctx: "_LoopCtx | None",
+    ) -> dict[int, list[str]]:
+        """``dims_of`` for the logical-descriptor form: the offsets are the symbols.
+
+        With the layout stated on the descriptor, the kernel indexes its tensors
+        in logical coordinates and ``RewriteDescriptorLayoutGeneric`` emits the
+        ``divsi`` / ``remsi`` delinearization -- so there is nothing to compute
+        here and no ``dimK`` line to emit.  The offset for a logical dim is the
+        program-id base ``_emit_logical_offsets`` already wrote, advanced by
+        ``loop_ctx.subs`` when a coarse loop tiles that dim (``c0 + 2048*loop0``).
+        The substitution is keyed by the real iteration symbol and its value is
+        already a logical per-tile row count, so it applies here unchanged.
+        """
+        offsets_of: dict[int, list[str]] = {}
+        for arg_index, lay in layout_of.items():
+            # Same "advancing vs. pinned" test ``_emit_dim_vars`` makes: only an
+            # operand that carries a ``device_tile_advance_expr`` walks the buffer
+            # per iteration.  A pinned one (LX scratch, or an intermediate already
+            # holding one tile) keeps the un-advanced offset.
+            subs = (
+                loop_ctx.subs
+                if loop_ctx is not None
+                and tensor_args[arg_index].device_tile_advance_expr is not None
+                else None
+            )
+            names = []
+            for sym in lay.dims:
+                expr = sym if subs is None else sym.subs(subs)
+                names.append(_coord_str(expr))
+            offsets_of[arg_index] = names
+        return offsets_of
+
     def _emit_dim_vars(
         self,
         body: IndentedBuffer,
@@ -1090,6 +1183,7 @@ class SpyreTritonKernel(SpyreKernel):
         param_names: list[str],
         block_of: dict[int, list[int]],
         perm_of: dict[int, list[int]],
+        layout_of: "dict[int, ArgLayout] | None" = None,
     ) -> dict[int, str]:
         """Emit one ``tl.make_tensor_descriptor`` per tensor arg.
 
@@ -1103,11 +1197,42 @@ class SpyreTritonKernel(SpyreKernel):
         way -- i.e. the physical HBM tensor viewed under a reordered axis basis --
         so a permuted descriptor is a genuine transpose of the same buffer, not a
         re-layout.
+
+        ``layout_of``, when given, switches every descriptor in the kernel to the
+        LOGICAL form plus a ``tl.spyre_tensor_layout`` marker (see
+        ``logical_layout_plan``).  It is all-or-nothing per kernel: a mix is
+        refused downstream, so the caller passes either a plan covering every arg
+        or None.
         """
         desc_of: dict[int, str] = {}
         for arg_index in sorted(tensor_args):
             arg = tensor_args[arg_index]
             perm = perm_of[arg_index]
+            if layout_of is not None:
+                # Logical form: state the tensor as the kernel sees it and let
+                # ``tl.spyre_tensor_layout`` say how it is stick-tiled on the
+                # device.  ``RewriteDescriptorLayoutGeneric`` rebuilds the view,
+                # the access tile and the subscripts from the marker, and it
+                # synthesizes row-major-over-physical strides itself -- so the
+                # strides written here are never read, and are the logical ones
+                # purely so the descriptor reads as the tensor it names.
+                lay = layout_of[arg_index]
+                desc = f"desc_{arg_index}"
+                body.writeline(
+                    f"{desc} = tl.make_tensor_descriptor("
+                    f"{param_names[arg_index]}, "
+                    f"shape={list(lay.extents)}, "
+                    f"strides={row_major_strides(lay.extents)}, "
+                    f"block_shape={list(lay.block)})"
+                )
+                # The entry list is read from a module-level ``tl.constexpr``, not
+                # written inline: an inline list literal is not constexpr in a jit
+                # body, and its tuple entries reach ``_parse_coord_entry`` as
+                # runtime values ("int() argument must be ... not 'tuple'").  Same
+                # mechanism the ring's ``work_slices`` uses.
+                body.writeline(f"tl.spyre_tensor_layout({desc}, _layout_{arg_index})")
+                desc_of[arg_index] = desc
+                continue
             # Physical extents come straight from ``device_size``: a genuine
             # scalar's degenerate outer axes are already reported as 1, and the
             # within-stick axis stays at full stick width (physically a

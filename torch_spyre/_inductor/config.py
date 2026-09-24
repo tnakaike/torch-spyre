@@ -102,6 +102,23 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # itself is wired in ``__init__.py``.
 triton_emitter: bool = os.environ.get("TORCH_SPYRE_TRITON", "0") == "1"
 
+# Opt-in: have the Triton source emitter declare LOGICAL tensor descriptors plus
+# a ``tl.spyre_tensor_layout`` marker, instead of baking the physical stick-tiled
+# extents into ``tl.make_tensor_descriptor`` and emitting the logical->physical
+# stick arithmetic by hand. The marker is the form the Triton fork's own kernels
+# are authored in: ``RewriteDescriptorLayoutGeneric`` physicalizes the view, the
+# access tile and the subscripts from it, and it is what populates
+# ``metadata["device_layouts"]`` (the launcher's out-of-bounds check).
+#
+# The two spellings are mutually exclusive -- a marker on an already-physical
+# descriptor would split twice -- so this switches shape, strides, block_shape
+# and the load/store offsets together, per kernel. Off by default, and honoured
+# only for kernels ``logical_layout_plan`` finds eligible (pointwise today);
+# anything else keeps the physical form whether or not this is set.
+triton_logical_descriptors: bool = (
+    os.environ.get("TORCH_SPYRE_TRITON_LOGICAL", "0") == "1"
+)
+
 # True when a kernel-emitting backend (direct KTIR emitter or Triton source
 # emitter) is active, as opposed to the SDSC bundle path. (SDSC is also an
 # OpSpec-based backend -- all three consume op_specs -- but it does not emit a

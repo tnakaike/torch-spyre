@@ -41,16 +41,18 @@ import sympy
 from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
-from torch_spyre._inductor.constants import RESTICKIFY_OP
+from torch_spyre._inductor.constants import BATCH_MATMUL_OP, RESTICKIFY_OP
 from torch_spyre._inductor.op_spec import IndirectAccess, OpSpec, TensorArg
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
 __all__ = [
     "PARALLEL",
     "REDUCTION",
+    "ArgLayout",
     "align_reshape_plan",
     "buf_id",
     "core_divisions",
+    "logical_layout_plan",
     "per_core_extent",
     "placeholder_axes",
     "reduction_indexing",
@@ -171,6 +173,203 @@ def _dim_info(coord: sympy.Expr) -> tuple[str, sympy.Symbol | None]:
         "bare symbol, within-stick (Mod/ModularIndexing), or outer-stick "
         "(FloorDiv) form; classification is not implemented"
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class ArgLayout:
+    """One tensor arg's *logical* descriptor, plus the layout map to its physical.
+
+    The physical form the generator would otherwise bake into
+    ``tl.make_tensor_descriptor`` restated as what
+    ``tl.spyre_tensor_layout`` contracts for:
+
+    - ``dims``: the arg's logical dims, in descriptor-axis order.  Derived from
+      the iteration symbols its ``device_coordinates`` mention, so a broadcast
+      arg has fewer dims than the op's iteration space.
+    - ``extents`` / ``block``: logical whole-tensor and per-core-per-iteration
+      extents, one per entry of ``dims``.
+    - ``entries``: one entry per *physical* dim, in ``device_coordinates`` order,
+      in the marker's vocabulary -- ``src`` for identity, ``(src, "floordiv", S)``
+      and ``(src, "mod", S)`` for the two halves of a stick split, where ``src``
+      indexes ``dims``.
+    """
+
+    dims: tuple[sympy.Symbol, ...]
+    extents: tuple[int, ...]
+    block: tuple[int, ...]
+    entries: tuple[int | tuple[int, str, int], ...]
+
+
+def _logical_dims(arg: TensorArg, it_space: dict) -> list[sympy.Symbol] | None:
+    """The arg's logical dims, in the op's iteration order, or None if inexpressible.
+
+    Ordered by position in ``it_space``, NOT by first appearance across
+    ``device_coordinates``: the stick split puts ``floor(s/S)`` at physical dim 0,
+    so walking the coordinates would discover the split dim first and describe the
+    tensor transposed.  The iteration order is the tensor's own logical dim order,
+    which is what makes the declared shape and strides true of the host buffer --
+    and the physical layout the marker derives is the same either way, so this is
+    about the descriptor telling the truth rather than about correctness of the
+    split.
+
+    A ``const`` axis carries no symbol and cannot be named by a marker entry, so
+    it rules the arg out rather than being dropped -- an entry list that omits a
+    physical dim is refused by the consumer ("its extent would be dropped from
+    the physical layout").
+    """
+    named: set = set()
+    for coord in arg.device_coordinates:
+        kind, sym = _dim_info(coord)
+        if kind == _DIM_CONST:
+            return None
+        named.add(sym)
+    return [sym for sym in it_space if sym in named]
+
+
+def _marker_entries(
+    arg: TensorArg, dims: Sequence[sympy.Symbol]
+) -> list[int | tuple[int, str, int]] | None:
+    """The marker's per-physical-dim entry list, or None if inexpressible.
+
+    The stick size is read from the *coordinate*, not assumed: an entry is built
+    only when the coordinate is structurally the form it claims to be -- exactly
+    ``floor(s/S)`` / ``FloorDiv(s, S)`` or ``Mod(s, S)`` for the arg's own stick
+    width ``device_size[-1]``.  Anything else (a different modulus, a
+    ``ModularIndexing`` with a divisor, a folded axis) returns None so the caller
+    falls back to the physical form, rather than emitting a map that claims a
+    split the coordinates do not perform.
+    """
+    stick = int(arg.device_size[-1])
+    entries: list[int | tuple[int, str, int]] = []
+    for coord in arg.device_coordinates:
+        kind, sym = _dim_info(coord)
+        if sym is None:
+            # A const axis; ``_logical_dims`` has already refused this arg, so
+            # reaching here means the two disagree.  Refuse rather than index by
+            # None.
+            return None
+        src = dims.index(sym)
+        if kind == _DIM_BARE:
+            entries.append(src)
+        elif kind == _DIM_OUTER_STICK:
+            if coord not in (sympy.floor(sym / stick), FloorDiv(sym, stick)):
+                return None
+            entries.append((src, "floordiv", stick))
+        elif kind == _DIM_WITHIN_STICK:
+            if coord != sympy.Mod(sym, stick):
+                return None
+            entries.append((src, "mod", stick))
+        else:
+            return None
+    return entries
+
+
+def _logical_block(
+    dims: Sequence[sympy.Symbol],
+    it_space: dict,
+    divisor_of: dict,
+) -> list[int]:
+    """Per-core, per-iteration logical extents -- the descriptor's block shape.
+
+    The same arithmetic ``_emit_logical_offsets`` uses for the program-id bases:
+    ``range // div``.  The trip count is deliberately NOT divided out again --
+    inside a ``LoopSpec`` body the iteration-space range is already one tile's
+    worth, because the coarse-tiling pass divides the tiled dim by K when it
+    stamps the loop (see ``coarse_tile_pre_stickify``/``_apply_plan``).  Dividing
+    twice would declare a block a whole trip count too small.
+    """
+    block: list[int] = []
+    for sym in dims:
+        rng, _div = it_space[sym]
+        block.append(max(1, _size_hint(rng) // int(divisor_of.get(sym, 1))))
+    return block
+
+
+def _logical_extents(
+    dims: Sequence[sympy.Symbol],
+    it_space: dict,
+    loop_ctx: "_LoopCtx | None",
+) -> list[int]:
+    """Whole-tensor logical extents, one per logical dim.
+
+    The iteration-space range is the whole logical extent for an untiled dim, and
+    one tile's worth for a dim a coarse loop tiles -- so the tiled dim is scaled
+    back up by the trip count to recover the tensor.  Derived this way rather
+    than back out of ``device_size``, which would round a non-multiple extent up
+    to whole sticks (``ceil(N/S) * S``) and declare a tensor larger than the one
+    the kernel was handed.
+
+    Note the work-division divisor is NOT applied: this is the whole tensor the
+    descriptor addresses, not the slice one core reads (that is the block shape).
+    """
+    extents: list[int] = []
+    for sym in dims:
+        rng, _div = it_space[sym]
+        extent = max(1, _size_hint(rng))
+        if loop_ctx is not None and sym in loop_ctx.tiled:
+            extent *= int(loop_ctx.count)
+        extents.append(extent)
+    return extents
+
+
+def logical_layout_plan(
+    group: list[OpSpec],
+    tensor_args: dict[int, TensorArg],
+    it_space: dict,
+    divisor_of: dict,
+    loop_ctx: "_LoopCtx | None",
+) -> dict[int, ArgLayout] | None:
+    """Per-arg ``ArgLayout`` for the group, or None to keep the physical form.
+
+    None means "not expressible as a layout marker", and the caller must then
+    fall back for the WHOLE group: a kernel that annotates some descriptors and
+    not others is refused downstream ("a one-sided annotation has no vehicle for
+    the shape change"), so eligibility is a property of the group, never of one
+    arg.
+
+    Eligible today: a pointwise group whose every arg names each of its physical
+    dims with a bare symbol or a complete floordiv+mod stick-split pair.  A
+    reduction, matmul, gather or restickify is excluded because its emission
+    reasons about the stick split as an explicit physical tile axis (the
+    outer-stick reduce axis, the matmul stick-pair collapse, the gather's
+    indirect axis) -- moving those to logical terms is separate work, not a
+    predicate change.
+    """
+    for spec in group:
+        # ``BATCH_MATMUL_OP`` covers mm/bmm (the generator projects both through
+        # it); a reduction, a restickify and an indirect access are the other
+        # three emissions that address a physical axis directly.
+        if spec.is_reduction or spec.op in (BATCH_MATMUL_OP, RESTICKIFY_OP):
+            return None
+        if any(isinstance(a, IndirectAccess) for a in spec.args):
+            return None
+
+    plan: dict[int, ArgLayout] = {}
+    for arg_index, arg in tensor_args.items():
+        dims = _logical_dims(arg, it_space)
+        if dims is None:
+            return None
+        entries = _marker_entries(arg, dims)
+        if entries is None:
+            return None
+        block = _logical_block(dims, it_space, divisor_of)
+        extents = _logical_extents(dims, it_space, loop_ctx)
+        # The consumer refuses a sub-stick block on a mod dim: it physicalizes
+        # that dim to the full stick width, so a block narrower than one stick
+        # has no physical form to take.  Indexed by ``entry[0]`` (a LOGICAL dim)
+        # rather than positionally -- ``entries`` is per physical dim and
+        # ``block`` per logical one, and a stick split makes those lengths differ.
+        for entry in entries:
+            if isinstance(entry, tuple) and entry[1] == "mod":
+                if block[entry[0]] < int(entry[2]):
+                    return None
+        plan[arg_index] = ArgLayout(
+            dims=tuple(dims),
+            extents=tuple(extents),
+            block=tuple(block),
+            entries=tuple(entries),
+        )
+    return plan
 
 
 def align_reshape_plan(
