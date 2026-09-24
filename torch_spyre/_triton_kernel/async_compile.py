@@ -81,6 +81,59 @@ def _dump_ttir_ktir(kernel_name: str, compiled: Any) -> None:
         )
 
 
+def _export_dir(compiled: Any) -> Optional[str]:
+    """Unpack the compiled artifact and return dbo-opt's export directory.
+
+    ``SpyreDriver.load_binary`` extracts the ``.spyrecode`` ZIP
+    content-addressed under the Triton cache and returns the directory that
+    *holds* ``spyreCodeDir/`` -- which is exactly what
+    ``SpyreSDSCKernelRunner`` takes as its ``code_dir``, since it appends
+    ``/spyreCodeDir`` itself.
+
+    ``load_binary`` is called directly rather than through
+    ``CompiledKernel._init_handles``, which would also build a launcher this
+    path never uses.  It deliberately does not call ``prepare_kernel``: that
+    needs an initialized Spyre runtime, so it is left to the runner's lazy
+    ``jobplan`` on the launch path, after a device tensor has started the
+    runtime.
+    """
+    from triton.runtime import driver
+
+    # (module, function, n_regs, n_spills, n_max_threads).  On Spyre the program
+    # *is* the directory, so module and function are the same path; the backend
+    # ignores every argument but the artifact bytes.
+    handles = driver.active.utils.load_binary(
+        compiled.name, compiled.kernel, compiled.metadata.shared, 0
+    )
+    if not handles or handles[0] is None:
+        return None
+    return str(handles[0])
+
+
+def _address_symbol_kinds(signature: Any) -> list:
+    """One address symbol per pointer argument, keyed by its launch position.
+
+    The KTIR entry function takes its base addresses as ``index`` arguments
+    (``MaterializeBaseAddresses`` bakes them into constants only when the
+    ``spyrecode`` stage is given ``base_addresses``, which this path does not
+    do), so the runner has to bind one address per pointer argument.
+
+    ``ConvertFunctions`` retypes only ``!tt.ptr`` arguments to ``index`` and
+    leaves every other type alone, so the entry function's ``index`` arguments
+    are the pointer arguments in signature order.  ``SymbolKind.arg_index`` is
+    a position in the tuple handed to ``run()``, so an interleaved signature
+    such as ``(ptr, i32, ptr)`` has to keep positions 0 and 2 rather than
+    renumbering them to 0 and 1.
+    """
+    from torch_spyre._inductor.codegen.compute_ops import SymbolKind
+
+    return [
+        SymbolKind.kernel(pos)
+        for pos, ty in enumerate(signature.values())
+        if str(ty).startswith("*")
+    ]
+
+
 class SpyreTritonAsyncCompile:
     """Async compilation interface for Spyre Triton kernels."""
 
@@ -132,7 +185,30 @@ class SpyreTritonAsyncCompile:
 
             return KtirCpuRunner(kernel_name, ktir_text)
 
-        return None
+        # Device path.  The backend's ``spyrecode`` stage has already run the
+        # dataflow scheduler over the emitted KTIR and produced a loadable
+        # program, so there is no dbo-opt call to make here -- unlike the
+        # OpSpec->KTIR emitter path, which invokes dbo-opt itself on a .ktir
+        # file.  All that is left is to bind the launch arguments to the
+        # program, which is what SpyreSDSCKernelRunner already does for the
+        # SDSC bundle path; nothing in it is SDSC-specific.
+        code_dir = _export_dir(compiled)
+        if code_dir is None:
+            logger.warning(
+                "no Spyre program was unpacked for kernel %s; not returning a "
+                "device runner.",
+                kernel_name,
+            )
+            return None
+
+        from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
+
+        logger.debug("SpyreTriton: device runner for %s over %s", kernel_name, code_dir)
+        return SpyreSDSCKernelRunner(
+            kernel_name,
+            code_dir,
+            symbol_kinds=_address_symbol_kinds(compile_meta["signature"]),
+        )
 
     def wait(self, scope: dict[str, Any]) -> None:
         pass
