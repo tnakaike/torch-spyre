@@ -77,11 +77,10 @@ class SpyreTritonScheduling(SuperDSCScheduling):
             return
 
         kernel = SpyreTritonKernel()
-        all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
-            self._codegen_into_kernel(nodes, kernel, all_schedule_nodes)
+            self._codegen_into_kernel(nodes, kernel)
 
-        self._emit_kernels(kernel, all_schedule_nodes)
+        self._emit_kernels(kernel, kernel.scheduled_nodes)
 
     def _codegen_counted_loop(self, node: CountedLoopSchedulerNode) -> None:
         """Generate a kernel for a counted loop group.
@@ -99,13 +98,12 @@ class SpyreTritonScheduling(SuperDSCScheduling):
             return
 
         kernel = SpyreTritonKernel()
-        all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
-            self._codegen_into_kernel(inner_nodes, kernel, all_schedule_nodes)
+            self._codegen_into_kernel(inner_nodes, kernel)
 
         kernel.wrap_op_specs_in_loop(node.loop_count)
 
-        self._emit_kernels(kernel, all_schedule_nodes)
+        self._emit_kernels(kernel, kernel.scheduled_nodes)
 
     def _emit_kernels(
         self,
