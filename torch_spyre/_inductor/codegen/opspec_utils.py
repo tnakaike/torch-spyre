@@ -41,6 +41,7 @@ import sympy
 from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP, RESTICKIFY_OP
 from torch_spyre._inductor.op_spec import IndirectAccess, OpSpec, TensorArg
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -327,19 +328,35 @@ def logical_layout_plan(
     the shape change"), so eligibility is a property of the group, never of one
     arg.
 
-    Eligible today: a pointwise group whose every arg names each of its physical
-    dims with a bare symbol or a complete floordiv+mod stick-split pair.  A
-    reduction, matmul, gather or restickify is excluded because its emission
-    reasons about the stick split as an explicit physical tile axis (the
-    outer-stick reduce axis, the matmul stick-pair collapse, the gather's
-    indirect axis) -- moving those to logical terms is separate work, not a
-    predicate change.
+    Eligible today: a pointwise group, or (under ``config.triton_dist``) one that
+    also contains a matmul, whose every arg names each of its physical dims with a
+    bare symbol or a complete floordiv+mod stick-split pair.  A reduction, gather or
+    restickify is excluded because its emission reasons about the stick split as an
+    explicit physical tile axis (the outer-stick reduce axis, the gather's indirect
+    axis) -- moving those to logical terms is separate work, not a predicate change.
+
+    **Matmul is NOT one of those.** Its physical emission collapses a stick pair
+    (``[B?, M, K_out, K_in] -> [B?, M, K]``) only because the descriptor handed it a
+    physical block; a logical descriptor yields ``[M, K]`` already, so the logical
+    path has nothing to collapse and does not reach ``_collapse``. The exclusion was
+    scope, not a wall, and ``pytorch-conf-2026/shuffle_relayout_triton.py`` is the
+    worked kernel that shows the logical spelling contracting with ``tl.dot``
+    directly.
     """
     for spec in group:
-        # ``BATCH_MATMUL_OP`` covers mm/bmm (the generator projects both through
-        # it); a reduction, a restickify and an indirect access are the other
-        # three emissions that address a physical axis directly.
-        if spec.is_reduction or spec.op in (BATCH_MATMUL_OP, RESTICKIFY_OP):
+        # A reduction, a restickify and an indirect access address a physical axis
+        # directly.  ``BATCH_MATMUL_OP`` covers mm/bmm (the generator projects both
+        # through it) and is admitted only under the gate, so the existing logical
+        # path for pointwise groups is unchanged.
+        is_bmm = spec.op == BATCH_MATMUL_OP
+        # ``batchmatmul`` carries ``is_reduction`` -- it contracts K -- but that
+        # reduction is ``tl.dot``'s own and addresses no physical axis. The
+        # exclusion is about an emission that reasons about the stick split as a
+        # tile axis, which is the OUTER-STICK reduce axis, so test for a reduction
+        # that is not the matmul's.
+        if (spec.is_reduction and not is_bmm) or spec.op == RESTICKIFY_OP:
+            return None
+        if is_bmm and not config.triton_dist:
             return None
         if any(isinstance(a, IndirectAccess) for a in spec.args):
             return None

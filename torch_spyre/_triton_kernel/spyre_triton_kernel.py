@@ -116,6 +116,7 @@ from torch_spyre._inductor.op_spec import (
     LoopSpec,
     OpSpec,
     TensorArg,
+    is_lx_relayout_identity,
 )
 from torch_spyre._inductor.spyre_kernel import SpyreKernel, _codegen_op_spec_list
 
@@ -200,6 +201,19 @@ def _tl_unary(fn: str, x: str, device_dtype) -> str:
 # Reduction op names lowered via ``tl.dot`` (matmul) rather than ``tl.sum``.
 # Only plain fp16 matmul is emitted so far; ``batchmatmulfp8`` is deferred.
 _MATMUL_OPS = {constants.BATCH_MATMUL_OP}
+
+
+def _lx_resident(arg: TensorArg) -> bool:
+    """Whether the LX planner placed this operand in the scratchpad.
+
+    An operand with an ``lx`` allocation is handed over through the scratchpad, so
+    it is neither register-threaded nor HBM-resident -- which is the third option
+    ``_consumes_registers`` was written without. ``tl.spyre_pin`` is what states
+    that placement, and ``MaterializePinnedBuffers`` turns the pin into the buffer
+    plus the store and the per-use loads, so the hand-over happens in LX even
+    though the generated Triton still passes the value by name.
+    """
+    return isinstance(arg, TensorArg) and "lx" in (arg.allocation or {})
 
 
 def _consumes_registers(spec: OpSpec) -> bool:
@@ -471,8 +485,26 @@ class SpyreTritonKernel(SpyreKernel):
             reads_produced = any(
                 a.is_input and buf_id(a) in produced for a in spec.args
             )
-            needs_split = reads_produced and not _consumes_registers(spec)
-            if not groups or key != prev_key or needs_split:
+            # An operand the LX planner placed in the scratchpad is handed over
+            # there, so neither of the two reasons to split applies to it: it is
+            # not register-threaded (the pin's store/load carries it) and it must
+            # NOT be pushed to HBM. Honouring that is what puts ops with different
+            # work divisions in one kernel, which is the point of the relayout.
+            lx_handover = config.triton_dist and any(
+                a.is_input and buf_id(a) in produced and _lx_resident(a)
+                for a in spec.args
+            )
+            needs_split = (
+                reads_produced and not _consumes_registers(spec) and not lx_handover
+            )
+            # A certified LX relayout EXISTS to join two work divisions, so the
+            # iteration-space boundary is exactly what it must cross. Same for the
+            # op that consumes its output: splitting there would spill the
+            # relayout's landing to HBM, undoing it.
+            joins_divisions = config.triton_dist and (
+                is_lx_relayout_identity(spec.op, spec.args, spec.op_info) or lx_handover
+            )
+            if not groups or (key != prev_key and not joins_divisions) or needs_split:
                 groups.append([spec])
                 produced = set()
             else:
@@ -863,11 +895,23 @@ class SpyreTritonKernel(SpyreKernel):
                     tensor_args[slot] = a
         used = sorted(tensor_args)
 
-        # Every op in a group shares one iteration space (grouping invariant).
+        # One iteration space per group was the invariant until ``triton_dist``:
+        # honouring ``allocation["lx"]`` puts ops with DIFFERENT work divisions in one
+        # kernel, which is the whole point of a relayout. So the group's divisions are
+        # a LIST now, and ``it_space`` below is only the first op's -- every use of it
+        # that depends on a division goes through ``_divisors_of(spec)``.
         it_space = group[0].iteration_space
+        # The grid is the widest division in the group: a kernel launches once, and an
+        # op dividing fewer ways is replicated across the cores the widest one uses.
+        # shuffle_relayout is the case -- the relayout's {c0: 8} is 8 blocks over 32
+        # cores, so each block lands on four of them, which is a broadcast and is what
+        # ``owner_slots`` already reports as 32 entries.
         grid = 1
-        for _rng, div in it_space.values():
-            grid *= int(div)
+        for spec in group:
+            n = 1
+            for _rng, div in spec.iteration_space.values():
+                n *= int(div)
+            grid = max(grid, n)
 
         # An inter-core reduction combines per-core partial sums over a
         # work-divided reduction axis via ``tl.inter_tile``; the ring reads a
@@ -879,9 +923,24 @@ class SpyreTritonKernel(SpyreKernel):
         # descriptor emission and the reduction reshape (which must target the
         # output's block_shape).  Depends only on arg + work division + loop_ctx,
         # not on the loop variable, so it is loop-invariant.
-        divisor_of = {sym: int(div) for sym, (_rng, div) in it_space.items()}
+        def _divisors_of(spec: OpSpec) -> dict:
+            return {sym: int(div) for sym, (_rng, div) in spec.iteration_space.items()}
+
+        divisor_of = _divisors_of(group[0])
+        # Each arg belongs to one op, so its block comes from THAT op's divisions.
+        divisor_by_slot: dict[int, dict] = {}
+        for spec in group:
+            d = _divisors_of(spec)
+            for a in spec.args:
+                if isinstance(a, TensorArg):
+                    slot = self._slot(a)
+                    if slot >= 0:
+                        divisor_by_slot.setdefault(slot, d)
         block_of = {
-            i: _device_block_shape(tensor_args[i], divisor_of, loop_ctx) for i in used
+            i: _device_block_shape(
+                tensor_args[i], divisor_by_slot.get(i, divisor_of), loop_ctx
+            )
+            for i in used
         }
         # Per-core block_shape keyed by buffer id, covering register-threaded
         # intermediates (arg_index < 0, absent from block_of) as well as slotted
@@ -894,7 +953,9 @@ class SpyreTritonKernel(SpyreKernel):
                     continue
                 bid = buf_id(a)
                 if bid not in block_by_buf:
-                    block_by_buf[bid] = _device_block_shape(a, divisor_of, loop_ctx)
+                    block_by_buf[bid] = _device_block_shape(
+                        a, _divisors_of(spec), loop_ctx
+                    )
 
         # Matmul operands are addressed through a *permuted* tensor descriptor so
         # the sticked matrix dim's [outer_stick, within_stick] pair is innermost
@@ -937,15 +998,37 @@ class SpyreTritonKernel(SpyreKernel):
         # a permuted descriptor is a transpose of the physical buffer, which has
         # no logical spelling.
         layout_of = None
+        # ``not is_matmul`` is lifted under ``triton_dist``: the logical form is what
+        # lets a matmul take the relayout's output, because the composed descriptor's
+        # ``.load()`` already returns the logical ``[M, K]`` that ``tl.dot`` wants.
         if (
-            config.triton_logical_descriptors
-            and not is_matmul
+            (config.triton_logical_descriptors or config.triton_dist)
+            and (not is_matmul or config.triton_dist)
             and not is_gather
             and not inter_core_reduce
         ):
-            layout_of = logical_layout_plan(
-                group, tensor_args, it_space, divisor_of, loop_ctx
-            )
+            # Per spec, because a group may now hold several work divisions; merged
+            # by arg_index, which is unique per arg, so a slot's descriptor has one
+            # layout whichever op owns it. Any spec returning None fails the whole
+            # group, as before -- a half-annotated kernel is refused downstream.
+            merged: dict[int, ArgLayout] = {}
+            for spec in group:
+                part = logical_layout_plan(
+                    [spec],
+                    {
+                        self._slot(a): a
+                        for a in spec.args
+                        if isinstance(a, TensorArg) and self._slot(a) >= 0
+                    },
+                    spec.iteration_space,
+                    _divisors_of(spec),
+                    loop_ctx,
+                )
+                if part is None:
+                    merged = {}
+                    break
+                merged.update(part)
+            layout_of = merged or None
 
         # Build the body at column 0; buf.indent() re-indents it under `def`.
         # Program-id bases and descriptors are loop-invariant (they address the
@@ -964,7 +1047,14 @@ class SpyreTritonKernel(SpyreKernel):
                 body, tensor_args, param_names, block_of, perm_of, layout_of
             )
             self._emit_ops(
-                body, group, desc_of, dims_of, block_of, perm_of, block_by_buf
+                body,
+                group,
+                desc_of,
+                dims_of,
+                block_of,
+                perm_of,
+                block_by_buf,
+                layout_of,
             )
         else:
             desc_of = self._emit_descriptors(
@@ -979,7 +1069,14 @@ class SpyreTritonKernel(SpyreKernel):
                         body, tensor_args, loop_ctx, perm_of, dim_skip
                     )
                 self._emit_ops(
-                    body, group, desc_of, dims_of, block_of, perm_of, block_by_buf
+                    body,
+                    group,
+                    desc_of,
+                    dims_of,
+                    block_of,
+                    perm_of,
+                    block_by_buf,
+                    layout_of,
                 )
 
         signature = ", ".join(param_names[i] for i in used)
@@ -1263,6 +1360,7 @@ class SpyreTritonKernel(SpyreKernel):
         block_of: dict[int, list[int]],
         perm_of: dict[int, list[int]],
         block_by_buf: dict[object, list[int]],
+        layout_of: "dict[int, ArgLayout] | None" = None,
     ) -> None:
         """Emit load / compute / store for each op (pointwise or reduction).
 
@@ -1334,7 +1432,9 @@ class SpyreTritonKernel(SpyreKernel):
                 continue
 
             if spec.op in _MATMUL_OPS:
-                self._emit_matmul(body, spec, _load, _fresh, _store, block_of, perm_of)
+                self._emit_matmul(
+                    body, spec, _load, _fresh, _store, block_of, perm_of, layout_of
+                )
                 continue
 
             if spec.is_reduction:
@@ -1551,6 +1651,7 @@ class SpyreTritonKernel(SpyreKernel):
         _store,
         block_of: dict[int, list[int]],
         perm_of: dict[int, list[int]],
+        layout_of: "dict[int, ArgLayout] | None" = None,
     ) -> None:
         """Emit ``tl.dot`` for a 2D or batched matmul (``batchmatmul``).
 
@@ -1592,13 +1693,22 @@ class SpyreTritonKernel(SpyreKernel):
             body.writeline(f"{flat} = tl.reshape({var}, {batch + [rows, cols]})")
             return flat
 
-        a2d = _collapse(x, _load(x))
-        b2d = _collapse(y, _load(y))
+        # LOGICAL form: the descriptor already yields ``[B?, M, K]`` / ``[B?, K, N]``,
+        # so there is no stick pair to collapse and no permutation to undo -- the
+        # marker states both.  ``out_block`` is then the logical out block, and the
+        # ``tl.dot`` result already has that shape, so the closing reshape is a no-op
+        # and is skipped.  The physical branch below is untouched.
+        logical = layout_of is not None
+        if layout_of is not None:
+            a2d, b2d = _load(x), _load(y)
+            out_block = [int(b) for b in layout_of[out.arg_index].block]
+        else:
+            a2d = _collapse(x, _load(x))
+            b2d = _collapse(y, _load(y))
+            out_slot = self._slot(out)
+            out_block = [block_of[out_slot][p] for p in perm_of[out_slot]]
         dot_var = _fresh()
         body.writeline(f'{dot_var} = tl.dot({a2d}, {b2d}, input_precision="ieee")')
-
-        out_slot = self._slot(out)
-        out_block = [block_of[out_slot][p] for p in perm_of[out_slot]]
 
         # Inter-core reduce: when the contraction dim K is work-divided, each
         # core's ``tl.dot`` is only a partial over its K-shard.  Combine the
@@ -1650,8 +1760,10 @@ class SpyreTritonKernel(SpyreKernel):
                 dot_var = down_var
             pick0_axis = k_sym
 
-        out_var = _fresh()
-        body.writeline(f"{out_var} = tl.reshape({dot_var}, {out_block})")
+        out_var = dot_var
+        if not logical:
+            out_var = _fresh()
+            body.writeline(f"{out_var} = tl.reshape({dot_var}, {out_block})")
         _store(out, out_var, pick0_axis=pick0_axis)
 
     def _emit_restickify(

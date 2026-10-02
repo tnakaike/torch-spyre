@@ -119,6 +119,25 @@ triton_logical_descriptors: bool = (
     os.environ.get("TORCH_SPYRE_TRITON_LOGICAL", "0") == "1"
 )
 
+# Honour ``allocation["lx"]`` in the OpSpec -> Triton generator: an intermediate
+# that the LX planner placed in the scratchpad is declared there with
+# ``tl.spyre_pin`` instead of being threaded through a register or spilled to HBM,
+# and a certified LX relayout is emitted as ``tl.make_distributed_descriptor``.
+#
+# This is what lets ops with DIFFERENT work divisions share one kernel with no HBM
+# round trip, which is the whole point: the SDSC path already hands every
+# intermediate over through its ``allocation``, one opfunc per OpSpec, and nothing
+# there passes a value in a register. The generator's register threading is its own
+# optimisation, invisible to the OpSpec -- and where a register WOULD do, the
+# decision belongs to the frontend as an ``allocation["register"]`` the LX planner
+# makes, because that is what lets it charge less LX. No such allocation exists
+# today (SDSC could not consume one), so honouring ``lx`` is the whole of it here.
+#
+# Gated rather than default: it changes how every LX-allocated intermediate is
+# handed over, so the existing suite keeps the register/HBM behaviour until the
+# relayout path is verified end to end.
+triton_dist: bool = os.environ.get("TORCH_SPYRE_TRITON_DIST", "0") == "1"
+
 # True when a kernel-emitting backend (direct KTIR emitter or Triton source
 # emitter) is active, as opposed to the SDSC bundle path. (SDSC is also an
 # OpSpec-based backend -- all three consume op_specs -- but it does not emit a
