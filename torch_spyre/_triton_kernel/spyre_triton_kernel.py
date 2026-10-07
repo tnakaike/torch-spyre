@@ -110,6 +110,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     row_major_strides,
 )
 from torch_spyre._inductor.constants import IDENTITY_OP
+from torch_spyre._inductor.core_mapping import owner_slots
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     IndirectAccess,
@@ -864,6 +865,14 @@ class SpyreTritonKernel(SpyreKernel):
         and ops are emitted inside a ``for loop0 in range(count):`` block while
         the program-id bases and descriptors (loop-invariant) stay above it.
         """
+        # Module-level constexprs this kernel needs, filled in while the body is
+        # emitted and read below when the preamble is assembled -- which is after
+        # the body, since emitting an offset is what discovers that a table is
+        # wanted. ``_ws_tables`` holds every ``work_slices`` table, deduped by
+        # content and shared between the offsets and a relayout's compose;
+        # ``_dist_axes`` holds one axis list per composed view.
+        self._ws_tables: list[tuple[str, str]] = []
+        self._dist_axes: list[tuple[str, list]] = []
         # Kernel parameter names / caller buffer names, in arg_index order
         # (in_ptr0, in_ptr1, ..., out_ptr0).  TensorArg.arg_index indexes into
         # these parallel lists (assigned by super().codegen_kernel()).
@@ -1035,10 +1044,22 @@ class SpyreTritonKernel(SpyreKernel):
         # full HBM buffer), so they stay above the loop; only the device-dim
         # offsets (which carry loop0) and the ops go inside it.
         body = IndentedBuffer()
-        self._emit_logical_offsets(body, it_space)
+        var_of_spec = self._emit_logical_offsets(body, group, grid)
+        # Slot -> the variable names of the op that owns it, the same
+        # first-writer-wins rule ``divisor_by_slot`` uses: each arg belongs to one
+        # op, so its offsets come from THAT op's division.
+        var_of_slot: dict[int, dict[sympy.Symbol, str]] = {}
+        for index, spec in enumerate(group):
+            for a in spec.args:
+                if isinstance(a, TensorArg):
+                    slot = self._slot(a)
+                    if slot >= 0:
+                        var_of_slot.setdefault(slot, var_of_spec[index])
         if loop_ctx is None:
             if layout_of is not None:
-                dims_of = self._logical_offsets_of(tensor_args, layout_of, None)
+                dims_of = self._logical_offsets_of(
+                    tensor_args, layout_of, None, var_of_slot
+                )
             else:
                 dims_of = self._emit_dim_vars(
                     body, tensor_args, None, perm_of, dim_skip
@@ -1055,6 +1076,8 @@ class SpyreTritonKernel(SpyreKernel):
                 perm_of,
                 block_by_buf,
                 layout_of,
+                loop_ctx,
+                var_of_spec,
             )
         else:
             desc_of = self._emit_descriptors(
@@ -1063,7 +1086,9 @@ class SpyreTritonKernel(SpyreKernel):
             body.writeline(f"for {loop_ctx.var} in range({loop_ctx.count}):")
             with body.indent():
                 if layout_of is not None:
-                    dims_of = self._logical_offsets_of(tensor_args, layout_of, loop_ctx)
+                    dims_of = self._logical_offsets_of(
+                        tensor_args, layout_of, loop_ctx, var_of_slot
+                    )
                 else:
                     dims_of = self._emit_dim_vars(
                         body, tensor_args, loop_ctx, perm_of, dim_skip
@@ -1077,6 +1102,8 @@ class SpyreTritonKernel(SpyreKernel):
                     perm_of,
                     block_by_buf,
                     layout_of,
+                    loop_ctx,
+                    var_of_spec,
                 )
 
         signature = ", ".join(param_names[i] for i in used)
@@ -1098,6 +1125,15 @@ class SpyreTritonKernel(SpyreKernel):
                     f"_layout_{i} = tl.constexpr({_layout_arg_str(lay.entries)})"
                     for i, lay in sorted(layout_of.items())
                 ]
+            )
+        if self._ws_tables or self._dist_axes:
+            # The work_slices tables every offset reads, and a composed view's
+            # per-dimension axis keys, for the same reason again: an inline list
+            # literal in a jit body is not a constexpr.
+            module_preamble = "\n".join(
+                [module_preamble] * bool(module_preamble)
+                + [f"{name} = tl.constexpr({table})" for name, table in self._ws_tables]
+                + [f"{name} = tl.constexpr({axes!r})" for name, axes in self._dist_axes]
             )
         header = self._emit_header(grid, used, module_preamble)
         buf = IndentedBuffer()
@@ -1149,43 +1185,126 @@ class SpyreTritonKernel(SpyreKernel):
     def _emit_logical_offsets(
         self,
         body: IndentedBuffer,
-        it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
-    ) -> None:
-        """Emit ``# Triton -> Logical layouts``: c0/c1/... program-id bases.
+        group: list[OpSpec],
+        grid_total: int,
+    ) -> list[dict[sympy.Symbol, str]]:
+        """Emit ``# Triton -> Logical layouts``: one base per symbol per OpSpec.
 
-        The Spyre grid is 1D (``program_id(0)`` = flattened core index).  Each
-        work-divided symbol owns one ``range // div`` slice; the flat program id
-        is decomposed mixed-radix with the innermost split symbol varying
-        fastest, matching the SDSC device-space split.
+        **Every division goes through a ``work_slices`` table**, read with
+        ``tl.wk_slice_coord``, rather than through index arithmetic on the
+        program id. The user's call, and it removes a whole class of bug rather
+        than fixing one: a decode has to decide which symbol varies fastest, and
+        getting that backwards is invisible in a kernel with ONE division --
+        every descriptor then reads the same variable, so any bijection of cores
+        to slices is self-consistent and the result is right -- while being
+        wrong the moment two divisions have to agree with each other. Which is
+        exactly a relayout: the destination lands rows under its division and
+        the matmul reads them under its own.
+
+        A table cannot be got backwards. It is ``owner_slots`` over the
+        frontend's own ``core_id_to_work_slice``, so the kernel reads the
+        ownership the planner committed instead of re-deriving it. This is the
+        same argument the conference poster's row 2 records for preferring
+        ``tl.wk_slice_coord(WORK_SLICES, "K")`` to ``pid % 8``: the arithmetic
+        was correct only because 8 happened to be both divisors, and nothing in
+        the line said which division it belonged to.
+
+        **ONE SET PER OPSPEC**, because the same symbol means two things when a
+        group holds two divisions: ``add``'s ``c0`` is not the matmul's. A group
+        with one division emits the bare ``c0`` / ``c1`` it always did, so a
+        simple kernel's source keeps its shape.
+
+        The table is evaluated over the GRID, not over the division's own slice
+        count: ``tl.wk_slice_coord``'s contract is
+        ``prod(grid) == len(work_slices)``, and a replicated division (8 slices
+        on 32 cores) has fewer slices than instances.
         """
+        divisions: list[tuple[str, dict[sympy.Symbol, int]]] = []
+        names: list[dict[sympy.Symbol, str]] = []
+        suffixed = len({self._division_key(spec, grid_total) for spec in group}) > 1
+        emitted: dict[str, str] = {}
+
         body.writeline("# Triton -> Logical layouts")
+        for index, spec in enumerate(group):
+            table = self._slice_table(spec, grid_total)
+            ws_name = self._ws_table_name(table)
+            mine: dict[sympy.Symbol, str] = {}
+            for sym, (rng, div) in spec.iteration_space.items():
+                name = f"{sym}_{index}" if suffixed else f"{sym}"
+                div = int(div)
+                if div <= 1 or ws_name is None:
+                    value = "0"
+                else:
+                    extent = max(1, int(_size_hint(rng)) // div)
+                    read = f'tl.wk_slice_coord({ws_name}, "{sym}")'
+                    value = read if extent == 1 else f"{read} * {extent}"
+                if emitted.get(name) != value:
+                    body.writeline(f"{name} = {value}")
+                    emitted[name] = value
+                mine[sym] = name
+            names.append(mine)
+        del divisions
+        return names
 
-        # Split symbols (div > 1) in iteration order (outermost first).
-        split = [(s, rng, div) for s, (rng, div) in it_space.items() if div > 1]
-        total_cores = 1
-        for _s, _rng, div in split:
-            total_cores *= div
+    @staticmethod
+    def _division_key(spec: OpSpec, grid_total: int) -> tuple:
+        """What makes two specs' bases identical: the splits and the ownership."""
+        return (
+            tuple(
+                sorted((str(s), int(d)) for s, (_r, d) in spec.iteration_space.items())
+            ),
+            tuple(
+                sorted(
+                    (str(k), str(v))
+                    for k, v in (spec.core_id_to_work_slice or {}).items()
+                )
+            ),
+        )
 
-        bases: dict[sympy.Symbol, str] = {}
-        inner_cores = 1
-        for sym, rng, div in reversed(split):  # innermost first
-            extent = max(1, int(_size_hint(rng)) // div)
-            idx = "tl.program_id(0)"
-            if inner_cores > 1:
-                idx = f"({idx} // {inner_cores})"
-            if inner_cores * div != total_cores:
-                idx = f"({idx} % {div})"
-            bases[sym] = idx if extent == 1 else f"({idx}) * {extent}"
-            inner_cores *= div
+    @staticmethod
+    def _slice_table(spec: OpSpec, grid_total: int) -> list[dict[str, int]]:
+        """The per-instance ``work_slices`` table for one spec's division.
 
-        for sym in it_space:
-            body.writeline(f"{sym} = {bases.get(sym, '0')}")
+        ``owner_slots`` over the spec's own ``core_id_to_work_slice``, evaluated
+        on every grid instance. Only the symbols the ownership map names take
+        part: a symbol the division does not split has no owner formula and its
+        slice is always 0, which the caller emits as a literal.
+        """
+        owners = spec.core_id_to_work_slice or {}
+        if not owners:
+            return []
+        splits = {
+            sym: int(spec.iteration_space[sym][1])
+            for sym in owners
+            if sym in spec.iteration_space
+        }
+        if set(splits) != set(owners):
+            return []
+        rows = owner_slots({k: owners[k] for k in splits}, splits, int(grid_total))
+        return [{str(k): int(v) for k, v in row.items()} for row in rows]
+
+    def _ws_table_name(self, table: list[dict[str, int]]) -> str | None:
+        """Name of the module-level constexpr holding ``table``, baking it once.
+
+        Keyed by the table itself, so two specs sharing a division share the
+        constexpr and a kernel never carries the same 32 rows twice.
+        """
+        if not table:
+            return None
+        key = repr(table)
+        for name, baked in self._ws_tables:
+            if baked == key:
+                return name
+        name = f"_ws_{len(self._ws_tables)}"
+        self._ws_tables.append((name, key))
+        return name
 
     def _logical_offsets_of(
         self,
         tensor_args: dict[int, TensorArg],
         layout_of: "dict[int, ArgLayout]",
         loop_ctx: "_LoopCtx | None",
+        var_of_slot: "dict[int, dict[sympy.Symbol, str]] | None" = None,
     ) -> dict[int, list[str]]:
         """``dims_of`` for the logical-descriptor form: the offsets are the symbols.
 
@@ -1210,9 +1329,15 @@ class SpyreTritonKernel(SpyreKernel):
                 and tensor_args[arg_index].device_tile_advance_expr is not None
                 else None
             )
+            # Which op's base this slot reads, when the group holds several
+            # divisions: the symbol is the same, the variable is not.
+            mine = (var_of_slot or {}).get(arg_index, {})
             names = []
             for sym in lay.dims:
                 expr = sym if subs is None else sym.subs(subs)
+                var = mine.get(sym)
+                if var is not None and var != str(sym):
+                    expr = expr.subs(sym, sympy.Symbol(var))
                 names.append(_coord_str(expr))
             offsets_of[arg_index] = names
         return offsets_of
@@ -1361,6 +1486,8 @@ class SpyreTritonKernel(SpyreKernel):
         perm_of: dict[int, list[int]],
         block_by_buf: dict[object, list[int]],
         layout_of: "dict[int, ArgLayout] | None" = None,
+        loop_ctx: "_LoopCtx | None" = None,
+        var_of_spec: "list[dict] | None" = None,
     ) -> None:
         """Emit load / compute / store for each op (pointwise or reduction).
 
@@ -1416,7 +1543,7 @@ class SpyreTritonKernel(SpyreKernel):
                     body.writeline(store_line)
             produced[buf_id(out)] = var
 
-        for spec in specs:
+        for index, spec in enumerate(specs):
             inputs = [a for a in spec.args if a.is_input]
             outputs = [a for a in spec.args if not a.is_input]
             assert len(outputs) == 1, "op must have exactly one output"
@@ -1429,6 +1556,27 @@ class SpyreTritonKernel(SpyreKernel):
 
             if _is_restickify_spec(spec) or _is_axis_permute_copy(spec):
                 self._emit_restickify(body, spec, _load, _fresh, _store, block_of)
+                continue
+
+            if config.triton_dist and is_lx_relayout_identity(
+                spec.op, spec.args, spec.op_info
+            ):
+                # Ahead of _UNARY_EXPR_OPS, which is where a certified relayout
+                # lands otherwise: IDENTITY_OP is in that table, so the move is
+                # taken for a pointwise copy and _emit_aligned_load asks for the
+                # PHYSICAL block -- the "Cannot broadcast, rank mismatch" this
+                # replaces.
+                self._emit_relayout(
+                    body,
+                    spec,
+                    inputs,
+                    outputs[0],
+                    _load,
+                    _fresh,
+                    _store,
+                    loop_ctx,
+                    (var_of_spec or [{}] * len(specs))[index],
+                )
                 continue
 
             if spec.op in _MATMUL_OPS:
@@ -1447,6 +1595,136 @@ class SpyreTritonKernel(SpyreKernel):
                 spec, inputs, outputs[0], _load, _fresh, body, block_by_buf
             )
             _store(outputs[0], out_var)
+
+    @staticmethod
+    def _lx_element_offset(arg: TensorArg) -> int:
+        """``allocation["lx"]`` as the ELEMENT index ``tl.spyre_pin`` takes.
+
+        The allocator works in bytes throughout and writes the byte figure into
+        ``allocation["lx"]``; a pin's offset is an element index, because that is
+        what ``ktdp.construct_memory_view``'s ``$offset`` feeds. The byte figure
+        is an ABSOLUTE per-core scratchpad address -- nothing adds a base
+        anywhere -- so the conversion is the whole of it. ``elems_per_stick`` is
+        dtype-aware (64 at fp16, 32 at fp32) and a stick is 128 bytes.
+        """
+        stick_bytes = 128
+        elem_bytes = stick_bytes // int(arg.device_dtype.elems_per_stick())
+        lx_bytes = int(arg.allocation["lx"])
+        assert lx_bytes % elem_bytes == 0, (
+            f"LX byte address {lx_bytes} is not an element multiple at "
+            f"{elem_bytes} bytes/element"
+        )
+        return lx_bytes // elem_bytes
+
+    def _emit_relayout(
+        self,
+        body: IndentedBuffer,
+        spec: OpSpec,
+        inputs: list[TensorArg],
+        out: TensorArg,
+        _load,
+        _fresh,
+        _store,
+        loop_ctx: "_LoopCtx | None",
+        dst_vars: dict,
+    ) -> None:
+        """Emit a planner-certified LX relayout as a distributed descriptor.
+
+        The shape, and it is the worked kernel's
+        (``pytorch-conf-2026/shuffle_relayout_triton.py``) verbatim::
+
+            tl.spyre_pin(share, "ct_local", offset=SRC)
+            whole = tl.make_distributed_descriptor(share, WS, AXES, DST_BLOCK)
+            mine = whole.load([<destination offsets>])
+            tl.spyre_pin(mine, "ct_local", offset=DST)
+
+        **Both pins are load-bearing** (triton#207): the first is what gives a
+        partition an offset at all, and the compose refuses a share nothing
+        pinned; the second is the landing a received tile needs.
+
+        Everything is LOGICAL. The share's descriptor carries its layout as a
+        marker, so the composed read is in logical coordinates and
+        ``_collapse`` / ``perm_of`` -- which exist to fold a physical
+        ``[B?, M, K_out, K_in]`` -- are not reached. That is also why the
+        ``KeyError: -1`` this path used to raise does not arise: there is no
+        descriptor for the relayout's output to look up.
+
+        Three facts the surface's own contract fixes, each of which the plan and
+        the worked kernel's comments state too loosely to implement from:
+
+        - ``axes`` is **one entry per tensor dimension**, naming the partition
+          key that dimension is divided along and ``None`` where the work was
+          not divided (``tl.make_distributed_descriptor``'s docstring, whose own
+          example is ``axes=[None, "n"]``). "One key per divided dimension"
+          happens to agree only when every dimension is divided, which is true
+          of the worked example and not in general.
+        - ``work_slices`` is the **partition** table, one entry per region the
+          view is composed from, with the holder being the entry's own index --
+          so it is ``owner_slots`` evaluated over the SOURCE's ownership, not
+          the per-tile table the inter-tile ring bakes. The two coincide only
+          when the source has one owner per region, which is what the capture
+          shows and what a certified relayout's source side is.
+        - ``block_shape`` is the DESTINATION's logical block, bounded by the
+          composed extent rather than by the share's.
+        """
+        source = inputs[0]
+        src_var = _load(source)
+
+        division = source.work_division
+        assert division is not None, "certified LX relayout lost its work division"
+
+        # The two args' logical dims and blocks. Taken from a plan built HERE and
+        # not from the group's ``layout_of``, which is keyed by slot and holds
+        # only args that have one -- a relayout moves between two LX
+        # intermediates, so neither side is in it.
+        plan = logical_layout_plan(
+            [spec],
+            {0: source, 1: out},
+            spec.iteration_space,
+            {sym: int(div) for sym, (_rng, div) in spec.iteration_space.items()},
+            loop_ctx,
+        )
+        assert plan is not None and 0 in plan and 1 in plan, (
+            "certified LX relayout is not expressible as a layout marker"
+        )
+        src_lay, dst_lay = plan[0], plan[1]
+
+        rows = owner_slots(
+            division.core_id_to_work_slice,
+            division.work_slices,
+            division.physical_core_count,
+        )
+        table = [{str(key): int(val) for key, val in row.items()} for row in rows]
+        axes = [
+            str(sym) if int(division.work_slices.get(sym, 1)) > 1 else None
+            for sym in src_lay.dims
+        ]
+        block = [int(extent) for extent in dst_lay.block]
+
+        # The destination's offsets, under the destination division rather than
+        # the group's: the same symbol has a different base on each side, which
+        # is what ``_emit_logical_offsets`` emits one variable set per spec for.
+        offsets = [str(dst_vars.get(sym, "0")) for sym in dst_lay.dims]
+
+        ws_name = self._ws_table_name(table)
+        axes_name = f"_axes_{len(self._dist_axes)}"
+        self._dist_axes.append((axes_name, axes))
+
+        body.writeline(
+            f'tl.spyre_pin({src_var}, "ct_local", '
+            f"offset={self._lx_element_offset(source)})"
+        )
+        whole = _fresh()
+        body.writeline(
+            f"{whole} = tl.make_distributed_descriptor("
+            f"{src_var}, {ws_name}, {axes_name}, {block})"
+        )
+        landed = _fresh()
+        body.writeline(f"{landed} = {whole}.load([{', '.join(offsets)}])")
+        body.writeline(
+            f'tl.spyre_pin({landed}, "ct_local", offset={self._lx_element_offset(out)})'
+        )
+        _store(out, landed)
 
     def _emit_aligned_load(
         self, arg: TensorArg, out: TensorArg, _load, _fresh, body, block_by_buf
