@@ -202,29 +202,56 @@ class ArgLayout:
 
 
 def _logical_dims(arg: TensorArg, it_space: dict) -> list[sympy.Symbol] | None:
-    """The arg's logical dims, in the op's iteration order, or None if inexpressible.
+    """The arg's logical dims, or None if inexpressible.
 
-    Ordered by position in ``it_space``, NOT by first appearance across
-    ``device_coordinates``: the stick split puts ``floor(s/S)`` at physical dim 0,
-    so walking the coordinates would discover the split dim first and describe the
-    tensor transposed.  The iteration order is the tensor's own logical dim order,
-    which is what makes the declared shape and strides true of the host buffer --
-    and the physical layout the marker derives is the same either way, so this is
-    about the descriptor telling the truth rather than about correctness of the
-    split.
+    Ordered by the physical position of each symbol's **LAST** occurrence in
+    ``device_coordinates``, which derives the logical order from the arg's own
+    layout rather than from anything outside it.  Two orders were tried first and
+    both describe some tensor transposed:
+
+    - **first** appearance walks into the stick split's ``floor(s/S)`` at physical
+      dim 0 and so discovers the split dim first;
+    - the op's **iteration order** (``it_space``) is right only when the loop
+      order happens to agree.  It does not for a matmul's right operand: with
+      ``c0`` = M, ``c1`` = N, ``c2`` = K the contraction symbol sorts last, which
+      is what ``tl.dot`` wants of the LEFT operand ``[M, K]`` and the transpose of
+      what it wants of the right one, ``[K, N]``.
+
+    Last occurrence gets all of them, and for one reason: **a stick split puts the
+    lane half (``Mod``) at the innermost physical dim**, so the split symbol sorts
+    last and the un-split ones keep their physical order ahead of it -- which is
+    the Spyre convention that a tensor sticks its LAST logical dimension. On the
+    relayout example the three matmul args then read
+
+        [floor(c2/64), c0, Mod(c2,64)]  ->  (c0, c2)  [64, 512]   the left operand
+        [floor(c1/64), c2, Mod(c1,64)]  ->  (c2, c1)  [512, 256]  the right one
+        [floor(c1/64), c0, Mod(c1,64)]  ->  (c0, c1)  [64, 256]   the output
+
+    and all three carry the SAME marker, ``[(1, floordiv, S), 0, (1, mod, S)]``,
+    which is what the hand-written reference kernel says they should
+    (``pytorch-conf-2026/shuffle_relayout_triton.py``: "All three tensors stick
+    their LAST logical dimension, so all three read the same").
+
+    Everything downstream is keyed off this order -- ``_marker_entries`` renumbers
+    against it, ``_logical_block`` and ``_logical_extents`` are indexed by it --
+    so the order is the whole of the change.
 
     A ``const`` axis carries no symbol and cannot be named by a marker entry, so
     it rules the arg out rather than being dropped -- an entry list that omits a
     physical dim is refused by the consumer ("its extent would be dropped from
     the physical layout").
     """
-    named: set = set()
-    for coord in arg.device_coordinates:
+    last_at: dict = {}
+    for position, coord in enumerate(arg.device_coordinates):
         kind, sym = _dim_info(coord)
         if kind == _DIM_CONST:
             return None
-        named.add(sym)
-    return [sym for sym in it_space if sym in named]
+        last_at[sym] = position
+    # Restricted to the op's own symbols, as before: one that is not in the
+    # iteration space is not a logical dim of this op.
+    return sorted(
+        (sym for sym in last_at if sym in it_space), key=lambda sym: last_at[sym]
+    )
 
 
 def _marker_entries(
