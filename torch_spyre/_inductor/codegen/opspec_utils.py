@@ -202,56 +202,75 @@ class ArgLayout:
 
 
 def _logical_dims(arg: TensorArg, it_space: dict) -> list[sympy.Symbol] | None:
-    """The arg's logical dims, or None if inexpressible.
+    """The arg's logical dims, in the op's iteration order, or None if inexpressible.
 
-    Ordered by the physical position of each symbol's **LAST** occurrence in
-    ``device_coordinates``, which derives the logical order from the arg's own
-    layout rather than from anything outside it.  Two orders were tried first and
-    both describe some tensor transposed:
+    Ordered by position in ``it_space``, NOT by appearance across
+    ``device_coordinates``: the stick split puts ``floor(s/S)`` at physical dim 0
+    and ``Mod(s, S)`` at the innermost, so neither first nor last appearance
+    recovers a logical order -- the physical layout is SYMMETRIC between a
+    tensor and its transpose, since swapping two logical dims and swapping the
+    marker entries that name them describe the same physical shape. On ``bmm``'s
+    left operand both orders give physical ``[128, 4, 4, 64]``. So the order
+    cannot be read off the layout and has to come from the op.
 
-    - **first** appearance walks into the stick split's ``floor(s/S)`` at physical
-      dim 0 and so discovers the split dim first;
-    - the op's **iteration order** (``it_space``) is right only when the loop
-      order happens to agree.  It does not for a matmul's right operand: with
-      ``c0`` = M, ``c1`` = N, ``c2`` = K the contraction symbol sorts last, which
-      is what ``tl.dot`` wants of the LEFT operand ``[M, K]`` and the transpose of
-      what it wants of the right one, ``[K, N]``.
-
-    Last occurrence gets all of them, and for one reason: **a stick split puts the
-    lane half (``Mod``) at the innermost physical dim**, so the split symbol sorts
-    last and the un-split ones keep their physical order ahead of it -- which is
-    the Spyre convention that a tensor sticks its LAST logical dimension. On the
-    relayout example the three matmul args then read
-
-        [floor(c2/64), c0, Mod(c2,64)]  ->  (c0, c2)  [64, 512]   the left operand
-        [floor(c1/64), c2, Mod(c1,64)]  ->  (c2, c1)  [512, 256]  the right one
-        [floor(c1/64), c0, Mod(c1,64)]  ->  (c0, c1)  [64, 256]   the output
-
-    and all three carry the SAME marker, ``[(1, floordiv, S), 0, (1, mod, S)]``,
-    which is what the hand-written reference kernel says they should
-    (``pytorch-conf-2026/shuffle_relayout_triton.py``: "All three tensors stick
-    their LAST logical dimension, so all three read the same").
-
-    Everything downstream is keyed off this order -- ``_marker_entries`` renumbers
-    against it, ``_logical_block`` and ``_logical_extents`` are indexed by it --
-    so the order is the whole of the change.
+    The iteration order is the tensor's own logical order for every arg but one,
+    and ``_matmul_dim_order`` is that exception.
 
     A ``const`` axis carries no symbol and cannot be named by a marker entry, so
     it rules the arg out rather than being dropped -- an entry list that omits a
     physical dim is refused by the consumer ("its extent would be dropped from
     the physical layout").
     """
-    last_at: dict = {}
-    for position, coord in enumerate(arg.device_coordinates):
+    named: set = set()
+    for coord in arg.device_coordinates:
         kind, sym = _dim_info(coord)
         if kind == _DIM_CONST:
             return None
-        last_at[sym] = position
-    # Restricted to the op's own symbols, as before: one that is not in the
-    # iteration space is not a logical dim of this op.
-    return sorted(
-        (sym for sym in last_at if sym in it_space), key=lambda sym: last_at[sym]
-    )
+        named.add(sym)
+    return [sym for sym in it_space if sym in named]
+
+
+def _matmul_dim_order(
+    dims: list[sympy.Symbol], spec: OpSpec, arg: TensorArg
+) -> list[sympy.Symbol]:
+    """``dims`` reordered for a matmul operand, which ``tl.dot`` constrains.
+
+    ``tl.dot`` reads its operands as ``[B..., M, K] @ [B..., K, N]``, so the
+    contraction dim is LAST on the left operand and SECOND TO LAST on the right.
+    The iteration order gives the left one for free -- the contraction symbol is
+    the innermost loop -- and the transpose of the right one, because the
+    iteration space orders ``N`` before ``K``:
+
+        bmm   a (4,128,256)  (c0, c1, c3)  (B, M, K)  iteration order, correct
+              b (4,256,512)  (c0, c2, c3)  (B, N, K)  WRONG, torch has (B, K, N)
+        mm    w (1024,512)   (c1, c2)      (N, K)     WRONG, torch has (K, N)
+
+    So the right operand moves its contraction symbol to position -2, which is
+    the torch order in both ranks and therefore what makes the declared shape
+    true of the host buffer as well as acceptable to ``tl.dot``.
+
+    The contraction symbols are the ones the inputs name and the output does not
+    -- the same derivation ``WorkDivisionContext.reduction_vars`` documents --
+    and this touches nothing when the arg is not the right operand or when the
+    order already holds, so an operand whose contraction is already at -2 is
+    returned unchanged.
+    """
+    inputs = [a for a in spec.args if isinstance(a, TensorArg) and a.is_input]
+    outputs = [a for a in spec.args if isinstance(a, TensorArg) and not a.is_input]
+    if len(inputs) != 2 or len(outputs) != 1 or arg is not inputs[1]:
+        return dims
+    out_syms: set = set()
+    for coord in outputs[0].device_coordinates:
+        _kind, sym = _dim_info(coord)
+        out_syms.add(sym)
+    contraction = [sym for sym in dims if sym not in out_syms]
+    if len(contraction) != 1 or len(dims) < 2:
+        return dims
+    sym = contraction[0]
+    if dims[-2] is sym:
+        return dims
+    rest = [other for other in dims if other is not sym]
+    return rest[:-1] + [sym] + rest[-1:]
 
 
 def _marker_entries(
@@ -388,11 +407,25 @@ def logical_layout_plan(
         if any(isinstance(a, IndirectAccess) for a in spec.args):
             return None
 
+    # Which spec an arg belongs to, for the one rule that is the op's and not the
+    # arg's: a matmul operand's logical dim order (see ``_matmul_dim_order``).
+    spec_of_arg: dict = {}
+    for spec in group:
+        for a in spec.args:
+            if isinstance(a, TensorArg):
+                for key, candidate in tensor_args.items():
+                    if candidate is a:
+                        spec_of_arg.setdefault(key, spec)
+
     plan: dict[int, ArgLayout] = {}
     for arg_index, arg in tensor_args.items():
         dims = _logical_dims(arg, it_space)
         if dims is None:
             return None
+        if spec_of_arg.get(arg_index) is not None and (
+            spec_of_arg[arg_index].op == BATCH_MATMUL_OP
+        ):
+            dims = _matmul_dim_order(dims, spec_of_arg[arg_index], arg)
         entries = _marker_entries(arg, dims)
         if entries is None:
             return None
